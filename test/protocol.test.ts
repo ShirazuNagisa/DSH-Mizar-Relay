@@ -11,7 +11,7 @@ import { parseHostFrame, splitRoomPath } from '../src/protocol.js'
  * artifact is what holds the contract; a shared import would only hold a build.
  */
 const FIXTURE = JSON.parse(
-  readFileSync(new URL('../../protocol/relay/fixture.json', import.meta.url), 'utf8'),
+  readFileSync(new URL('../protocol/relay/fixture.json', import.meta.url), 'utf8'),
 ) as { relayToHost: unknown[]; hostToRelay: unknown[] }
 
 describe('splitRoomPath', () => {

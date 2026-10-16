@@ -52,6 +52,9 @@ say "staging $STAGE"
 
 cp -R "$ROOT/lib" "$STAGE/app/lib"
 cp "$ROOT/package.json" "$STAGE/app/package.json"
+# The example deliberately has no `apns` block: it used to carry a placeholder
+# PEM, and the relay tried to parse it at start-up, so a fresh install following
+# the deployment notes never listened at all. Push is opt-in.
 cp "$ROOT/relay.config.example.json" "$STAGE/app/relay.config.json"
 cp "$HERE/selftest.js" "$STAGE/app/selftest.js"
 # The one runtime dependency, carried rather than installed.

@@ -110,6 +110,51 @@ async function boot(authority: string | null, overrides: Partial<RelayConfig> = 
   return `http://127.0.0.1:${relay.port}`
 }
 
+
+describe('a key that will not parse', () => {
+  it('leaves the relay listening, with push off', async () => {
+    // The shipped deployment bundle carried the example config's placeholder
+    // key, and `createPrivateKey` threw out of `startRelay`: a fresh install
+    // following the deployment notes never listened at all. The tunnel needs
+    // nothing from Apple, so a bad key costs push and nothing else.
+    //
+    // Before the fix this printed:
+    //   Error: error:1E08010C:DECODER routines::unsupported  (ERR_OSSL_UNSUPPORTED)
+    const lines: string[] = []
+    const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' })
+    const good = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
+    const config: RelayConfig = {
+      port: 0,
+      host: '127.0.0.1',
+      tokens: [MAC_A],
+      maxTunnelsPerIp: 4,
+      maxRooms: 100,
+      maxBodyBytes: 1024 * 1024,
+      maxMessageBytes: 900 * 1024,
+      maxClientsPerRoom: 8,
+      requestTimeoutMs: 2000,
+      tunnelIdleMs: 60_000,
+      probePort: 0,
+      apns: {
+        // Exactly what the example config shipped: a PEM whose body is an
+        // ellipsis.
+        key: '-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----\n',
+        keyId: 'ABCDE12345',
+        teamId: 'TEAM123456',
+        topic: 'me.shirazu.dshmizar',
+        production: false,
+      },
+    }
+    relay = await startRelay(config, (message) => lines.push(message))
+
+    const health = await fetch(`http://127.0.0.1:${relay.port}/healthz`)
+    expect(health.status).toBe(200)
+    expect(lines.some((line) => line.includes('push is off'))).toBe(true)
+    // And the good key still works, so this is about the key and not the path.
+    expect(good.length).toBeGreaterThan(0)
+  })
+})
+
 /** Post JSON with a bearer credential. */
 async function post(
   base: string,

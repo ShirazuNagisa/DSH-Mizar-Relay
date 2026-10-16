@@ -101,6 +101,29 @@ function bearerToken(request: IncomingMessage): string | null {
 }
 
 /**
+ * Build the APNs client, or say why push is off.
+ *
+ * @param config - the `apns` block, which is present but may be unusable.
+ * @param log - where to report.
+ * @returns the client, or `null` when its key could not be read.
+ */
+function createApnsOrWarn(
+  config: NonNullable<RelayConfig['apns']>,
+  log: (message: string) => void,
+): ApnsClient | null {
+  try {
+    return new ApnsClient(config, log)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log(
+      `relay: push is off — the configured Apple key could not be read (${message}). ` +
+        'Replace apns.key in relay.config.json with the .p8 Apple gave you, or remove the apns block.',
+    )
+    return null
+  }
+}
+
+/**
  * Start the relay.
  *
  * @param config - the resolved configuration.
@@ -117,7 +140,16 @@ export async function startRelay(
   const wss = new WebSocketServer({ noServer: true })
   /** Every room's notification endpoints. See `push.ts` for why this is memory. */
   const pushRegistry = new PushRegistry()
-  const apns = config.apns === null ? null : new ApnsClient(config.apns, log)
+  // A key that will not parse is a configuration mistake, not a reason for the
+  // tunnel to be down: the relay's whole job -- letting a phone reach a Mac --
+  // needs nothing from Apple, and an operator who pasted a key with the wrong
+  // newlines in it should be told so, not given a service that exits at start-up.
+  //
+  // Measured on the shipped bundle: the example config's placeholder key made
+  // `createPrivateKey` throw `ERR_OSSL_UNSUPPORTED` out of `startRelay`, so a
+  // fresh install following the deployment notes never listened at all.
+  const apns =
+    config.apns === null ? null : createApnsOrWarn(config.apns, log)
   /** Phone sockets waiting for the Mac to accept their upgrade. */
   // The upgrade socket is a Duplex, not a net.Socket: `ws` accepts whatever the
   // HTTP server hands over, and typing it as a Socket made every use of it an error.

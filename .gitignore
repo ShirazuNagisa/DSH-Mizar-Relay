@@ -1,0 +1,10 @@
+# Built output. The relay is deployed by packing it (deploy/pack.sh), which
+# builds first, so lib/ never belongs in the repository.
+lib/
+
+# --- Node ---
+node_modules/
+*.log
+
+# --- macOS ---
+.DS_Store

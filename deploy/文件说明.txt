@@ -1,0 +1,52 @@
+DSH-Mizar 中继服务器 v0.0.0 — 文件说明
+========================================
+
+先读 README.md，三步就装完。
+
+  README.md              部署步骤（从这份开始）
+  install.sh             一键安装：装成 systemd 服务并启动
+  nginx-websocket.conf   宝塔反向代理里要粘贴的片段（不粘贴就连不上）
+  DEPLOYMENT-FULL.md     完整参考：配置项全表、systemd 细节、排错手册
+
+  app/selftest.js        自检：不用 Mac 也能验中继是否正常
+
+  app/                   服务端本体
+    lib/                 已经编译好，服务器上不需要 TypeScript
+    node_modules/ws/     唯一的依赖，已内置
+    relay.config.json    配置（含隧道 token，权限已设为 600）
+    package.json         仅作参考
+
+不需要 npm install，不需要联网，不需要编译。
+
+
+部署完在 Mac 上要改的（~/.dsh/profiles/<profile>/cordis.patch.yml）:
+
+  - id: mizar
+    config:
+      relay:
+        enabled: true
+        url: "https://你的域名"
+        token: "<install.sh 打印的那串 token>"
+      bind:
+        mode: loopback
+
+然后重启 DSH，手机重新扫码配对。
+
+
+装完先自检
+----------
+  cd /www/wwwroot/dsh-mizar-relay
+  /www/server/nodejs/<版本>/bin/node selftest.js
+
+通过了说明中继没问题，后面连不上就是 DNS / 证书 / 反向代理的事。
+token 是安装时在你的服务器上现场生成的，每台机器不同。
+
+
+一个容易踩的坑
+--------------
+宝塔的「网站」只负责域名、证书和反向代理——它不会启动任何程序。
+
+  「网站」      = nginx，负责 TLS 和转发
+  「Node 服务」 = install.sh 装的那个 systemd 服务，负责真正干活
+
+两个都要做。只加网站的话，访问域名会得到 502。

@@ -332,6 +332,81 @@ describe('relay WebSocket bridging', () => {
     })
     expect(status).toBe(404)
   })
+
+  it('holds a room to its concurrent phone limit, and frees the slot', async () => {
+    // `maxClientsPerRoom` is a documented knob and the only bound on how many
+    // sockets one room can hold; nothing else in the relay counts them.
+    relay = await startRelay(config({ maxClientsPerRoom: 1 }), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
+    mac.echoStreams()
+    const url = `ws://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/ws`
+
+    const first = new WebSocket(url)
+    await new Promise<void>((resolve, reject) => {
+      first.once('open', () => resolve())
+      first.once('error', reject)
+    })
+
+    const second = new WebSocket(url)
+    const refused = await new Promise<number>((resolve, reject) => {
+      second.once('open', () => reject(new Error('the second socket should not have been accepted')))
+      second.once('unexpected-response', (_request, response) => resolve(response.statusCode))
+      second.once('error', () => undefined)
+    })
+    expect(refused).toBe(429)
+
+    // The slot is a resource, not a permanent ban: closing the first phone must
+    // let the next one in, or a relay would slowly refuse everybody.
+    await new Promise<void>((resolve) => {
+      first.once('close', () => resolve())
+      first.close()
+    })
+    const third = new WebSocket(url)
+    await new Promise<void>((resolve, reject) => {
+      third.once('open', () => resolve())
+      third.once('error', reject)
+    })
+    third.close()
+  })
+})
+
+describe('relay limits on what comes back', () => {
+  it('refuses to carry a response body past the body cap', async () => {
+    // The cap used to apply to the phone's request only, so a Mac -- and in open
+    // registration anybody may be one -- could make the relay allocate and write
+    // an answer of any size.
+    relay = await startRelay(config({ maxBodyBytes: 1024 }), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
+    mac.respondWith(200, 'x'.repeat(4096))
+
+    const response = await fetch(`http://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/hello`)
+    expect(response.status).toBe(502)
+    // Still serving: the cap refuses one answer, it does not unroute the room.
+    mac.respondWith(200, '{"hostId":"abc"}')
+    const after = await fetch(`http://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/hello`)
+    expect(after.status).toBe(200)
+  })
+
+  it('shuts down even while a phone is waiting for the Mac to answer', async () => {
+    // A deferred upgrade leaves a raw socket parked with no answer. Draining
+    // waits for it, so shutdown used to stall for the whole request timeout --
+    // thirty seconds by default -- on every restart.
+    const local = await startRelay(config({ requestTimeoutMs: 30_000 }), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${local.port}`)
+    mac.goSilent()
+
+    const phone = new WebSocket(`ws://127.0.0.1:${local.port}/r/${mac.room}/mizar/v1/ws`)
+    phone.on('error', () => undefined)
+    // Long enough for the upgrade to have reached the relay and been parked.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    const outcome = await Promise.race([
+      local.close().then(() => 'closed'),
+      new Promise((resolve) => setTimeout(() => resolve('still open'), 1000)),
+    ])
+    expect(outcome).toBe('closed')
+    phone.terminate()
+  })
 })
 
 describe('open registration', () => {

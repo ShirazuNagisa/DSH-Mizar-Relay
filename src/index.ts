@@ -122,6 +122,8 @@ export async function startRelay(
   // The upgrade socket is a Duplex, not a net.Socket: `ws` accepts whatever the
   // HTTP server hands over, and typing it as a Socket made every use of it an error.
   const waiting = new Set<{ socket: Duplex; timer: NodeJS.Timeout }>()
+  /** Phone sockets (or in-flight upgrades) held by each room, for the per-room cap. */
+  const phoneSlots = new Map<string, number>()
 
   const server: Server = createServer((request, response) => {
     void handleHttp(request, response).catch(() => {
@@ -180,6 +182,21 @@ export async function startRelay(
         forwardableHeaders(request),
         body.length === 0 ? null : body.toString('base64'),
       )
+      // The cap is on the wire in both directions. It used to bound the phone's
+      // request only, so whatever a Mac answered was allocated and written
+      // through unmeasured -- and in open-registration mode anybody may be a Mac.
+      const carried = result.body === null ? 0 : Buffer.byteLength(result.body, 'base64')
+      if (carried > config.maxBodyBytes) {
+        log(
+          `relay: refused a ${Math.round(carried / 1024)}KB answer from room ${split.room} — ` +
+            `over the ${Math.round(config.maxBodyBytes / 1024)}KB body cap`,
+        )
+        writeJson(response, 502, {
+          error: 'the Mac answered with more than this relay carries',
+          detail: `${carried} bytes`,
+        })
+        return
+      }
       const payload = result.body === null ? Buffer.alloc(0) : Buffer.from(result.body, 'base64')
       response.writeHead(result.status, {
         ...result.headers,
@@ -242,6 +259,15 @@ export async function startRelay(
           writeJson(response, 400, {
             error: 'deviceId, a hex token and an environment are required',
           })
+          return
+        }
+        // The registry is in memory and a room only exists once a device is
+        // registered, so this is what bounds it: a room already known keeps
+        // working (its Mac re-announces every reconnect), a new one past the
+        // limit does not.
+        if (!pushRegistry.has(room) && pushRegistry.roomCount >= config.maxRooms) {
+          log(`push: refused a room — already holding ${config.maxRooms} of them`)
+          writeJson(response, 429, { error: 'this relay holds as many push rooms as it may have' })
           return
         }
         if (!pushRegistry.register(room, device)) {
@@ -322,6 +348,35 @@ export async function startRelay(
       socket.destroy()
       return
     }
+
+    // `maxClientsPerRoom` is the only bound on how many sockets one room holds,
+    // and it counts the ones still waiting for the Mac as well as the bridged
+    // ones: the upgrade is deferred, so a room with a slow Mac would otherwise
+    // accept every socket that arrived before the first answer.
+    const held = phoneSlots.get(split.room) ?? 0
+    if (held >= config.maxClientsPerRoom) {
+      log(
+        `relay: refused a phone socket for room ${split.room} — ` +
+          `${config.maxClientsPerRoom} already open`,
+      )
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nretry-after: 5\r\n\r\n')
+      socket.destroy()
+      return
+    }
+    phoneSlots.set(split.room, held + 1)
+    // One release per socket, on whichever of its events comes first. The raw
+    // Duplex outlives the upgrade -- `ws` wraps it rather than replacing it --
+    // so this covers a socket that never completed the handshake too.
+    let slotReleased = false
+    const releaseSlot = (): void => {
+      if (slotReleased) return
+      slotReleased = true
+      const remaining = (phoneSlots.get(split.room) ?? 1) - 1
+      if (remaining <= 0) phoneSlots.delete(split.room)
+      else phoneSlots.set(split.room, remaining)
+    }
+    socket.once('close', releaseSlot)
+    socket.once('error', releaseSlot)
 
     // The raw socket is left unanswered until the Mac says yes. Answering first
     // and closing afterwards would show the phone a socket that opened and died,

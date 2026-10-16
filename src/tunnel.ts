@@ -84,6 +84,69 @@ export function saneCloseCode(code: number | undefined): number {
   return 1000
 }
 
+/** Bytes `ws` will accept in a close frame's reason. */
+const MAX_CLOSE_REASON_BYTES = 123
+
+/**
+ * Make a close reason safe to send.
+ *
+ * The sibling of {@link saneCloseCode}, and needed for the same reason: a
+ * bridged socket forwards the reason it was given, and `ws` throws a
+ * `RangeError` -- synchronously, out of `WebSocket.close()` -- for a reason
+ * longer than 123 bytes. The original frame may be perfectly legal on the way
+ * in (a close frame's payload is capped at 125 bytes, so this cannot arrive from
+ * a conforming phone), but the Mac is the other end of the tunnel and its
+ * frames are not trusted: this relay accepts any well-formed credential, so
+ * anyone may be a Mac.
+ *
+ * The cut is made on a character boundary, because a reason truncated mid
+ * codepoint decodes to U+FFFD and re-encodes to three bytes, which can push the
+ * result back over the limit it was cut to.
+ *
+ * @param reason - the reason a peer reported.
+ * @returns a reason that is legal to send.
+ */
+export function saneCloseReason(reason: string | undefined): string {
+  if (reason === undefined || reason === '') return ''
+  const bytes = Buffer.from(reason, 'utf8')
+  if (bytes.length <= MAX_CLOSE_REASON_BYTES) return reason
+
+  let end = MAX_CLOSE_REASON_BYTES
+  // Back up over continuation bytes (0b10xxxxxx) to the start of a character.
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1
+  const cut = bytes.subarray(0, end).toString('utf8')
+  // A cut before a lead byte is lossless, so this only fires if the encoding
+  // was already not what it claimed to be.
+  return Buffer.byteLength(cut, 'utf8') > MAX_CLOSE_REASON_BYTES ? cut.slice(0, -1) : cut
+}
+
+/**
+ * Keep only the string entries of a header record.
+ *
+ * `parseHostFrame` narrows the envelope and nothing else, so every field of a
+ * frame from the Mac is a value of unknown type by the time it is used. A
+ * headers object carrying a number would otherwise reach Node's response
+ * writer, which validates header values and throws out of an async handler.
+ *
+ * @param value - the frame's `headers`.
+ * @returns the usable headers.
+ */
+function headerRecord(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null) return {}
+  const out: Record<string, string> = {}
+  for (const [name, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') out[name] = entry
+  }
+  return out
+}
+
+/** Whether a value is an HTTP status a response may carry. */
+function httpStatus(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : null
+}
+
 /** A tunnel that is not connected cannot serve anything. */
 export class TunnelGoneError extends Error {
   constructor(message = 'the Mac is not connected to the relay') {
@@ -245,13 +308,14 @@ export class Tunnel {
       },
       close: (code, reason) => {
         const safe = saneCloseCode(code)
+        const safeReason = saneCloseReason(reason)
         this.#write({
           t: 'ws-close',
           id,
           code: safe,
-          ...(reason === undefined ? {} : { reason }),
+          ...(safeReason === '' ? {} : { reason: safeReason }),
         })
-        this.#dropStream(id, safe, reason ?? '')
+        this.#dropStream(id, safe, safeReason)
       },
     }
   }
@@ -293,10 +357,13 @@ export class Tunnel {
         if (pending === undefined) return // a late answer to a timed-out request
         clearTimeout(pending.timer)
         this.#pendingRequests.delete(id)
+        // Every field is checked here rather than trusted: a status the HTTP
+        // layer cannot write, or a body that is not base64 text, would throw
+        // somewhere far from this frame and fail a request nobody can trace.
         pending.resolve({
-          status: frame.status,
-          headers: frame.headers,
-          body: frame.body,
+          status: httpStatus(frame.status) ?? 502,
+          headers: headerRecord(frame.headers),
+          body: typeof frame.body === 'string' ? frame.body : null,
         })
         return
       }
@@ -310,26 +377,31 @@ export class Tunnel {
       case 'ws-msg': {
         const stream = this.#pendingStreams.get(id)
         if (stream === undefined) return
-        stream.onMessage(Buffer.from(frame.data, 'base64'), frame.binary)
+        // `Buffer.from(5, 'base64')` throws a TypeError, and this runs inside
+        // the tunnel socket's `message` handler, where nothing catches it: one
+        // malformed frame from one Mac would take the whole relay down.
+        if (typeof frame.data !== 'string') return
+        stream.onMessage(Buffer.from(frame.data, 'base64'), frame.binary === true)
         return
       }
       case 'ws-close': {
-        this.#dropStream(id, frame.code ?? 1000, frame.reason ?? '')
+        this.#dropStream(id, saneCloseCode(frame.code), saneCloseReason(frame.reason))
         return
       }
       case 'error': {
+        const message = typeof frame.message === 'string' ? frame.message : 'the Mac reported an error'
         const request = this.#pendingRequests.get(id)
         if (request !== undefined) {
           clearTimeout(request.timer)
           this.#pendingRequests.delete(id)
-          request.reject(new Error(frame.message))
+          request.reject(new Error(message))
           return
         }
         const stream = this.#pendingStreams.get(id)
         if (stream !== undefined) {
           clearTimeout(stream.timer)
           this.#pendingStreams.delete(id)
-          stream.onError(frame.message)
+          stream.onError(message)
         }
         return
       }

@@ -79,11 +79,16 @@ export const DEFAULT_CONFIG_PATH = 'relay.config.json'
  * it. An empty value is treated as absent rather than as an empty string, which
  * is what an unset Docker variable looks like.
  *
+ * The only failure that stops this is a config file that exists and cannot be
+ * parsed; an absent file is normal, because every value has an environment
+ * override and a default. An empty token list is not an error either -- it is
+ * the self-registration mode the relay ships in.
+ *
  * @param path - the config file path.
  * @param env - the environment to read overrides from.
  * @returns the resolved configuration.
- * @throws when no token is configured, because an open relay is worse than a
- *   relay that refuses to start.
+ * @throws when a config file is present but unreadable, so a typo in it is not
+ *   silently served by the defaults.
  */
 export function loadConfig(
   path: string = DEFAULT_CONFIG_PATH,

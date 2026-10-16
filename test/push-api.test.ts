@@ -72,8 +72,14 @@ async function startFakeApple(): Promise<string> {
   return `http://127.0.0.1:${port}`
 }
 
-/** Boot a relay whose APNs points at the fake. */
-async function boot(authority: string | null): Promise<string> {
+/**
+ * Boot a relay whose APNs points at the fake.
+ *
+ * @param authority - the fake Apple's origin, or `null` for a relay with no key.
+ * @param overrides - config a case needs to differ in.
+ * @returns the relay's base URL.
+ */
+async function boot(authority: string | null, overrides: Partial<RelayConfig> = {}): Promise<string> {
   const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' })
   const config: RelayConfig = {
     port: 0,
@@ -98,6 +104,7 @@ async function boot(authority: string | null): Promise<string> {
             production: false,
             authority,
           },
+    ...overrides,
   }
   relay = await startRelay(config, () => {})
   return `http://127.0.0.1:${relay.port}`
@@ -178,6 +185,28 @@ describe('registering a device', () => {
       environment: 'sandbox',
     })
     expect(reply.status).toBe(400)
+  })
+
+  it('bounds how many rooms it will remember', async () => {
+    // The registry is in memory, and a registration needs nothing but a
+    // well-formed credential -- so without a cap a script grows it without
+    // bound: sixteen devices per room, and no limit on rooms at all. A room that
+    // is already known keeps working, because the Mac re-announces its own
+    // registrations on every reconnect.
+    // Open registration, which is the mode a room cap has to hold in: every
+    // credential is accepted and every credential is its own room.
+    const base = await boot(null, { maxRooms: 3, tokens: [] })
+    const device = { deviceId: 'phone-1', token: 'deadbeef', environment: 'sandbox' }
+    for (let index = 0; index < 3; index += 1) {
+      const reply = await post(base, '/push/v1/register', `credential-number-${index}`, device)
+      expect(reply.status, `room ${index}`).toBe(200)
+    }
+
+    const refused = await post(base, '/push/v1/register', 'credential-number-3', device)
+    expect(refused.status).toBe(429)
+
+    const again = await post(base, '/push/v1/register', 'credential-number-0', device)
+    expect(again.status).toBe(200)
   })
 })
 

@@ -252,12 +252,14 @@ Every key, its environment override and its default — the authoritative list, 
 |---|---|---|---|
 | `port` | `MIZAR_RELAY_PORT` | `8787` | TCP port for the plain-HTTP server. TLS is nginx's job, not this process's |
 | `host` | `MIZAR_RELAY_HOST` | `127.0.0.1` | interface to bind. Leave it; see 5.4 |
-| `tokens` | `MIZAR_RELAY_TOKENS` | *none — required* | the bearer tokens a Mac may present at `/tunnel`. One token = one Mac = one room |
-| `maxBodyBytes` | `MIZAR_RELAY_MAX_BODY` | `4194304` (4 MiB) | largest replayed request body. Past it the relay answers `413` |
+| `tokens` | `MIZAR_RELAY_TOKENS` | `[]` — any credential is accepted | the bearer tokens a Mac may present at `/tunnel`. One token = one Mac = one room. Empty is the shipping mode: each plugin invents its own secret and the room is derived from it, so there is nothing to issue (see 4.3) |
+| `maxBodyBytes` | `MIZAR_RELAY_MAX_BODY` | `4194304` (4 MiB) | largest body the relay carries, in either direction: a bigger request from the phone is answered `413`, a bigger answer from the Mac is answered `502` |
 | `maxMessageBytes` | `MIZAR_RELAY_MAX_MESSAGE` | `4194304` (4 MiB) | largest single WebSocket message. Past it the bridge closes with code `1009` |
 | `maxClientsPerRoom` | `MIZAR_RELAY_MAX_CLIENTS` | `8` | concurrent phone connections allowed per room. A resource guard, not authentication |
 | `requestTimeoutMs` | `MIZAR_RELAY_REQUEST_TIMEOUT` | `30000` | how long a phone request waits for the Mac before `502`, and how long a phone WebSocket waits for the Mac to accept its upgrade before `504` |
 | `tunnelIdleMs` | `MIZAR_RELAY_TUNNEL_IDLE` | `90000` | how long a tunnel may go without answering a ping before the relay drops it. The relay pings every `tunnelIdleMs / 3` (30 s at the default), never faster than 5 s |
+| `maxRooms` | `MIZAR_RELAY_MAX_ROOMS` | `10000` | rooms served at once, and push rooms remembered. The only bound on either map |
+| `maxTunnelsPerIp` | `MIZAR_RELAY_MAX_TUNNELS_PER_IP` | `4` | tunnels one source address may hold. A resource guard, not authentication |
 | `probePort` | `MIZAR_RELAY_PROBE_PORT` | `8788` | UDP port for the endpoint probe; `0` disables it and opens no socket at all |
 
 Rules that are easy to trip over:
@@ -272,9 +274,13 @@ Rules that are easy to trip over:
   `MIZAR_RELAY_PORT=8787` behaves as written and `"probePort": 0` disables the probe. A value that is
   not a number at all is not rejected at load time: it becomes `NaN` and the process dies on start-up
   with `ERR_SOCKET_BAD_PORT` (see section 8).
-- **No token at all is a start-up failure.** The process prints the reason and exits `1`:
-  an empty token list would accept any tunnel, and a relay that exposes a machine which can run code
-  is worse than one that refuses to start.
+- **An empty token list is a supported mode, not a failure.** The relay then accepts any credential
+  of at least sixteen characters and derives the room from it, which is what makes "install the
+  plugin and scan" possible: a room is sixty bits of a hash of a secret the Mac generated locally, so
+  knowing one room tells you nothing about any other, and a stranger who registers a room only gets
+  their own. Set `tokens` when you would rather your relay served only your own Macs — the check is a
+  string comparison against a list, so it keeps a private relay private rather than stopping a
+  determined attacker.
 
 ### 4.5 Run it under systemd
 

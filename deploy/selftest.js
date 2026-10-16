@@ -19,6 +19,7 @@
 // too. Written to match rather than renamed to .cjs, because a file that has to
 // dodge its own package's module type is a file that will confuse the next
 // person to touch it.
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -55,7 +56,14 @@ function loadConfig() {
 
 async function main() {
   const config = loadConfig()
-  const token = config.tokens[0]
+  // An empty `tokens` list is the shipping mode, not a misconfiguration: the
+  // relay accepts any credential of at least sixteen characters and derives the
+  // room from it, exactly as a plugin's own self-invented secret does. Inventing
+  // one here is what keeps this test honest in that mode -- the alternative is a
+  // failure message telling the operator to compare a token they were never
+  // asked to set.
+  const configured = Array.isArray(config.tokens) ? config.tokens : []
+  const token = configured[0] ?? randomBytes(24).toString('base64url')
   const base = `http://127.0.0.1:${config.port}`
   const wsBase = `ws://127.0.0.1:${config.port}`
 
@@ -63,7 +71,10 @@ async function main() {
   console.log('='.repeat(56))
   console.log(`\n  config   ${CONFIG}`)
   console.log(`  port     ${config.port}`)
-  console.log(`  token    ${String(token).slice(0, 8)}…\n`)
+  console.log(
+    `  token    ${String(token).slice(0, 8)}…` +
+      (configured.length === 0 ? ' (invented: this relay accepts any credential)\n' : '\n'),
+  )
 
   // --- the relay is up -----------------------------------------------------
   let health

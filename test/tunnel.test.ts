@@ -226,6 +226,69 @@ describe('Tunnel streams', () => {
   })
 })
 
+/**
+ * The Mac is the far end of a tunnel that anyone may attach in the relay's
+ * normal open-registration mode, so every frame it sends arrives from the wire.
+ * A frame that is merely the wrong shape must not be able to take the relay
+ * down for every other room.
+ */
+describe('frames from the Mac are not trusted', () => {
+  it('survives a stream message whose data is not a string', () => {
+    const socket = new FakeSocket()
+    const tunnel = makeTunnel(socket)
+    const onMessage = vi.fn()
+    tunnel.openStream('/mizar/v1/ws', {}, {
+      onOpened: vi.fn(),
+      onMessage,
+      onClose: vi.fn(),
+      onError: vi.fn(),
+    })
+    const id = socket.last()['id']
+    socket.reply({ t: 'ws-open-ok', id })
+
+    // `Buffer.from(5, 'base64')` throws a TypeError, and this runs inside the
+    // tunnel socket's `message` handler, where nothing catches it.
+    expect(() => socket.reply({ t: 'ws-msg', id, data: 5, binary: false })).not.toThrow()
+    expect(onMessage).not.toHaveBeenCalled()
+    // The stream is still usable: one bad frame is not a reason to drop it.
+    socket.reply({ t: 'ws-msg', id, data: Buffer.from('ok').toString('base64'), binary: false })
+    expect(onMessage).toHaveBeenCalledWith(Buffer.from('ok'), false)
+  })
+
+  it('survives a response whose body is not a string', async () => {
+    const socket = new FakeSocket()
+    const tunnel = makeTunnel(socket)
+    const pending = tunnel.request('GET', '/a', {}, null)
+    const id = socket.last()['id']
+    expect(() => socket.reply({ t: 'res', id, status: 200, headers: {}, body: 5 })).not.toThrow()
+    await expect(pending).resolves.toMatchObject({ status: 200, body: null })
+  })
+
+  it('never hands a close reason the far end cannot send', () => {
+    const socket = new FakeSocket()
+    const tunnel = makeTunnel(socket)
+    const onClose = vi.fn()
+    tunnel.openStream('/mizar/v1/ws', {}, {
+      onOpened: vi.fn(),
+      onMessage: vi.fn(),
+      onClose,
+      onError: vi.fn(),
+    })
+    const id = socket.last()['id']
+    socket.reply({ t: 'ws-open-ok', id })
+
+    // 123 bytes is the most `ws` will put in a close frame; anything longer
+    // makes `WebSocket.close()` throw a RangeError, which the relay's phone
+    // handler would let escape.
+    expect(() =>
+      socket.reply({ t: 'ws-close', id, code: 1001, reason: 'x'.repeat(300) }),
+    ).not.toThrow()
+    expect(onClose).toHaveBeenCalledOnce()
+    const [, reason] = onClose.mock.calls[0] as [number, string]
+    expect(Buffer.byteLength(reason, 'utf8')).toBeLessThanOrEqual(123)
+  })
+})
+
 describe('Tunnel liveness', () => {
   it('starts responsive but goes quiet without a pong', async () => {
     vi.useFakeTimers()

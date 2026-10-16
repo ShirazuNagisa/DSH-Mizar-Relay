@@ -211,6 +211,11 @@ export class PushRegistry {
     return dropped
   }
 
+  /** Whether a room has any devices registered. */
+  has(room: string): boolean {
+    return this.#rooms.has(room)
+  }
+
   /**
    * Every device registered for a room.
    * @param room - the room.

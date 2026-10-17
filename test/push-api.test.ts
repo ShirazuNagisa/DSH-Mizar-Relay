@@ -567,8 +567,11 @@ describe('notifying a room', () => {
       const payload = JSON.parse(end.body) as { aps: Record<string, unknown> }
       expect(payload.aps['event']).toBe('end')
       expect(Number.isInteger(payload.aps['timestamp'])).toBe(true)
-      expect(payload.aps['dismissal-date']).toBe(payload.aps['timestamp'])
-      expect(payload.aps['content-state']).toBeUndefined()
+      // One second after the stamp: the state must render for the system to
+      // end the activity, and an equal date is an undocumented edge.
+      expect(payload.aps['dismissal-date']).toBe(Number(payload.aps['timestamp']) + 1)
+      // The final state is required for the system to decode and end it.
+      expect(payload.aps['content-state']).toEqual({ finished: {} })
     }
   })
 

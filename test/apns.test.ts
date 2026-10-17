@@ -247,17 +247,21 @@ describe('payloads', () => {
     expect((payload['aps'] as Record<string, unknown>)['interruption-level']).toBe('time-sensitive')
   })
 
-  it('builds the Live Activity end payload in Unix seconds, with no content-state', () => {
+  it('builds the Live Activity end payload in Unix seconds, with the final content state', () => {
     // Both stamps are seconds. Milliseconds would land in the year 56000, and
     // iOS discards the end event -- which leaves the activity counting, the
-    // exact bug this exists to fix. An end event carries no state: one sent with
-    // a `content-state` risks a decode failure on a phone being told the
-    // activity is over.
+    // exact bug this exists to fix. The content state is required for the same
+    // outcome: without it a device accepted the push and kept counting (measured
+    // 2026-10-18). `{finished:{}}` is the app's `LiveActivityPhase.finished` in
+    // Swift's synthesised Codable.
     expect(buildLiveActivityEndPayload(1_700_000_000_999)).toEqual({
       aps: {
         timestamp: 1_700_000_000,
         event: 'end',
-        'dismissal-date': 1_700_000_000,
+        // One second, not zero: the state has to render for the system to end
+        // the activity, and a future date has no equal-date edge.
+        'dismissal-date': 1_700_000_001,
+        'content-state': { finished: {} },
       },
     })
   })
@@ -688,7 +692,12 @@ describe('ending a Live Activity', () => {
     expect(String(sent?.headers['apns-expiration'])).toBe('0')
     expect(sent?.headers['content-type']).toBe('application/json')
     expect(JSON.parse(sent?.body ?? '{}')).toEqual({
-      aps: { timestamp: 1_700_000_000, event: 'end', 'dismissal-date': 1_700_000_000 },
+      aps: {
+        timestamp: 1_700_000_000,
+        event: 'end',
+        'dismissal-date': 1_700_000_001,
+        'content-state': { finished: {} },
+      },
     })
 
     await apple.close()

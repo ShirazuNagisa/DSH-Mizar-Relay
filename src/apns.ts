@@ -238,6 +238,23 @@ export function buildPayload(
 }
 
 /**
+ * The final state an ended activity shows while it is being dismissed.
+ *
+ * `content-state` is not optional on an end event. Apple's payload contract says
+ * the system needs it "to ensure the system can decode the JSON payload and
+ * update or end the Live Activity": a real device accepted the end push without
+ * one (APNs answered 200) and went on counting, which is the failure that was
+ * measured on 2026-10-18 and the reason this constant exists.
+ *
+ * The shape is the app's `DSHMizarActivityAttributes.ContentState`, which is the
+ * `LiveActivityPhase` enum: Swift's synthesised `Codable` writes `.finished` as
+ * `{"finished":{}}` (pinned by the app's `LiveActivityPushToken`/`LiveActivity`
+ * test suites, and by the `builds the Live Activity end payload` test here).
+ * There are no dates in it, so no encoding strategy can disagree about it.
+ */
+const FINISHED_CONTENT_STATE = { finished: {} } as const
+
+/**
  * Build the payload that ends one Live Activity.
  *
  * Apple's `end` event dismisses the activity from the Lock Screen and the
@@ -247,8 +264,10 @@ export function buildPayload(
  * while the event itself silently did nothing -- leaving the activity counting,
  * which is the bug this exists to fix.
  *
- * No `content-state`, deliberately. An end event takes none, and a payload that
- * carries one risks a decode failure on a phone being told the activity is over.
+ * The dismissal date is one second after the timestamp rather than equal to it:
+ * a state on the card has to render for the system to end it, and a date in the
+ * future is unambiguous where an equal one is an edge nothing documents. One
+ * second is also short enough that the card is gone before anybody looks twice.
  *
  * @param now - the current time, in epoch milliseconds.
  * @returns the payload object, ready to serialize.
@@ -259,7 +278,8 @@ export function buildLiveActivityEndPayload(now: number): Record<string, unknown
     aps: {
       timestamp,
       event: 'end',
-      'dismissal-date': timestamp,
+      'dismissal-date': timestamp + 1,
+      'content-state': FINISHED_CONTENT_STATE,
     },
   }
 }

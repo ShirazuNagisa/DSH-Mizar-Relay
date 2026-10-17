@@ -84,7 +84,9 @@ export interface FcmResult {
    * INVALID_ARGUMENT` is included for the same reason `apns.ts` includes
    * `BadDeviceToken`: retrying a request Google will never accept turns a dead
    * registration into a permanent stream of failed requests, and a token that
-   * produced a malformed body once will produce it every time.
+   * produced a malformed body once will produce it every time. A bare 404 is
+   * **not** one of these: a wrong project id answers the same way without
+   * naming a registration, so that token is kept.
    */
   readonly unregistered: boolean
   readonly status: number
@@ -429,7 +431,14 @@ function isStaleToken(result: FcmResult): boolean {
 
 /** Whether Google's answer means this registration token should be forgotten. */
 function isUnregistered(status: number, reason: string | null): boolean {
-  if (status === 404) return true
+  // Only Google's own "this registration is gone" answers retire a token. The
+  // status is checked as well as the body because a bare 404 NOT_FOUND is also
+  // what a wrong `projectId` answers, and unregistering every Android phone in
+  // the room over a configuration typo is silent -- the operator only notices
+  // that notifications stopped. INVALID_ARGUMENT stays in the list because the
+  // relay builds the message itself and bounds its size, so a message Google
+  // cannot parse means the registration token is what is wrong.
+  if (status === 404) return reason === 'UNREGISTERED'
   return reason === 'UNREGISTERED' || reason === 'INVALID_ARGUMENT' || reason === 'SENDER_ID_MISMATCH'
 }
 

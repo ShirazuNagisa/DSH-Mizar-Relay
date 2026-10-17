@@ -416,6 +416,31 @@ describe('delivery', () => {
     await google.close()
   })
 
+  it('keeps the registration when Google answers a bare 404, which a wrong project id also produces', async () => {
+    // A typo in `projectId` reaches Google as a path that does not exist, and the
+    // answer is a 404 with no `errorCode` in it. Treating any 404 as "this token
+    // is dead" would unregister every Android phone in the room over a config
+    // mistake, and the operator would only see that notifications stopped.
+    const google = await fakeGoogle((seen) =>
+      seen.path.endsWith('/token')
+        ? tokenOk()
+        : {
+            status: 404,
+            body: JSON.stringify({
+              error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' },
+            }),
+          },
+    )
+    const key = testKey()
+    const client = fakeClient(google, key.pem)
+
+    const result = await client.send(notification)
+
+    // Not retired, and the failure is reported to whoever asked for the push.
+    expect(result).toMatchObject({ delivered: false, unregistered: false, status: 404 })
+    await google.close()
+  })
+
   it('retires a token on SENDER_ID_MISMATCH, which is a wrong project rather than a wrong token', async () => {
     const google = await fakeGoogle((seen) =>
       seen.path.endsWith('/token') ? tokenOk() : fcmError(403, 'SENDER_ID_MISMATCH'),

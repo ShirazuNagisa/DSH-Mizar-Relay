@@ -857,7 +857,9 @@ rotated or pasted anywhere.
 The individual fields win over the service account, and the environment wins over both — the same
 rule the rest of this file follows. Set `channelId` if the app creates one: Android 8 and later
 **silently drop** a notification whose channel id does not exist, which looks exactly like a relay
-that is not sending at all.
+that is not sending at all. The Android client in `DSH-Mizar-Android` creates one called
+`mizar-alerts`; either set `channelId` to that value or omit it and let the app's default channel
+apply.
 
 **`environment` is an iOS field.** FCM has one service, so an Android device has no APNs environment
 to report: the app sends `{token, platform: 'android', locale}` and the relay records none for it
@@ -913,7 +915,10 @@ holds `relay.config.json` (the bundle is ESM, so a `.js` file there is a module,
 import fs from 'node:fs'
 const config = JSON.parse(fs.readFileSync('relay.config.json', 'utf8'))
 const base = `http://127.0.0.1:${config.port}`
-const auth = { authorization: `Bearer ${config.tokens[0]}`, 'content-type': 'application/json' }
+// An empty `tokens` list (the default, open-registration mode) accepts any credential of
+// sixteen characters or more. If this relay has a token list, put one of its entries here.
+const credential = config.tokens[0] ?? 'fcm-check-credential-000000'
+const auth = { authorization: `Bearer ${credential}`, 'content-type': 'application/json' }
 const post = async (path, body) =>
   (await fetch(`${base}${path}`, { method: 'POST', headers: auth, body: JSON.stringify(body) })).json()
 const check = (what, ok, detail) =>

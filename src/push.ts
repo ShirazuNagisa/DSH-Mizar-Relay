@@ -45,6 +45,15 @@ export interface PushDevice {
    * everything else about a registration is the same on both platforms.
    */
   readonly environment: ApnsEnvironment | null
+  /**
+   * The activity push token, for an iOS device that has a Live Activity running.
+   *
+   * `null` when the phone has no activity, and always on Android, which has no
+   * Live Activity even if its app sends the field. This is **not** the alert
+   * token: ending an activity addresses a token iOS mints per activity, and it
+   * is retired with the activity rather than with the install.
+   */
+  readonly liveActivityToken: string | null
   readonly locale: string
   readonly registeredAt: number
 }
@@ -58,6 +67,16 @@ export interface PushRequest {
   readonly threadId: string
   readonly collapseId: string
   readonly timeSensitive: boolean
+  /**
+   * Whether the phone's Live Activity for this notification's session should end.
+   *
+   * Separate from the alert fan-out, because the two are suppressed for opposite
+   * reasons: a phone whose app is on screen is skipped for an alert, and that is
+   * exactly where a Live Activity that keeps counting is most visible. Off by
+   * default: a relay that ended activities for every notification would dismiss
+   * one that is still running.
+   */
+  readonly endLiveActivity: boolean
   /**
    * Devices the plugin has already decided are looking at the app.
    *
@@ -146,11 +165,17 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
       // storing an environment an Android device does not have would make the
       // status endpoint say something untrue.
       environment: null,
+      // Ignored on Android, where no Live Activity exists: an app that sends the
+      // field anyway must not lose its alerts over it, so it is dropped rather
+      // than validated or refused.
+      liveActivityToken: null,
       locale: typeof record['locale'] === 'string' ? record['locale'].slice(0, 32) : 'en',
     }
   }
 
   if (token.length > MAX_IOS_TOKEN_LENGTH || !IOS_TOKEN.test(token)) return null
+  const liveActivityToken = readLiveActivityToken(record['liveActivityToken'])
+  if (liveActivityToken === undefined) return null
   return {
     deviceId,
     token,
@@ -159,8 +184,32 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
     // sandbox token loudly, while the sandbox host silently accepts nothing a
     // real device sent.
     environment: record['environment'] === 'sandbox' ? 'sandbox' : 'production',
+    liveActivityToken,
     locale: typeof record['locale'] === 'string' ? record['locale'].slice(0, 32) : 'en',
   }
+}
+
+/**
+ * Narrow the optional Live Activity token on an iOS registration.
+ *
+ * Absent or `null` means the phone currently has no activity running, which is
+ * also how its app clears a token after it ended the activity itself -- so
+ * absence is a value, not a missing field to preserve.
+ *
+ * The same rules as a device token apply because the token ends up in the same
+ * place: `/3/device/<token>` on an APNs request. Apple issues these as hex, and
+ * a slash in one would address a different endpoint rather than fail loudly.
+ *
+ * @param value - the field as it arrived.
+ * @returns the token, `null` when absent, or `undefined` when it is present and
+ *   unusable -- the one case the registration must be refused over.
+ */
+function readLiveActivityToken(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string' || value.length > MAX_IOS_TOKEN_LENGTH || !IOS_TOKEN.test(value)) {
+    return undefined
+  }
+  return value
 }
 
 /**
@@ -185,6 +234,7 @@ export function readNotification(value: unknown): PushRequest | null {
     threadId: typeof record['threadId'] === 'string' ? record['threadId'].slice(0, 200) : 'mizar',
     collapseId: typeof record['collapseId'] === 'string' ? record['collapseId'].slice(0, 64) : '',
     timeSensitive: record['timeSensitive'] === true,
+    endLiveActivity: record['endLiveActivity'] === true,
     exceptDeviceIds: readExceptDeviceIds(record['exceptDeviceIds']),
   }
 }
@@ -272,6 +322,33 @@ export class PushRegistry {
     return dropped
   }
 
+  /**
+   * Forget one device's Live Activity token, and nothing else.
+   *
+   * Apple answers `Unregistered` for an activity token routinely -- every
+   * activity that ends mints a token that is then retired -- so this is not a
+   * dead phone and must never be treated as one. The device and its alert token
+   * stay; only the token that cannot work again is dropped.
+   *
+   * The token is matched before it is cleared, because an end push can still be
+   * in flight when the app registers the next activity's token. A late answer
+   * about the old token must not clear the new one, or the first slow `410` would
+   * make the relay forget an activity that is still running.
+   *
+   * @param room - the room.
+   * @param deviceId - the device the end push was sent to.
+   * @param token - the activity token Apple retired.
+   * @returns whether it was still that device's current token.
+   */
+  clearLiveActivityToken(room: string, deviceId: string, token: string): boolean {
+    const devices = this.#rooms.get(room)
+    const device = devices?.get(deviceId)
+    if (devices === undefined || device === undefined) return false
+    if (device.liveActivityToken !== token) return false
+    devices.set(deviceId, { ...device, liveActivityToken: null })
+    return true
+  }
+
   /** Whether a room has any devices registered. */
   has(room: string): boolean {
     return this.#rooms.has(room)
@@ -321,6 +398,11 @@ export class PushRegistry {
  * has not set up FCM yet would otherwise stop reaching their iPhone the moment
  * an Android phone was paired.
  *
+ * A request that says the session ended adds a third, smaller fan-out beside
+ * those two: one Live Activity end push per iPhone that has an activity token.
+ * It is not filtered by `exceptDeviceIds` and it does not contribute to the
+ * alert tallies -- see {@link deliverLiveActivityEnds}.
+ *
  * @param options - the registry, the clients and the log.
  * @param room - the room to notify.
  * @param request - what to say.
@@ -349,71 +431,127 @@ export async function deliver(
   /** Devices left behind because their platform has no client. Reported once each. */
   const unrouted = new Map<PushPlatform, number>()
 
-  await Promise.all(
-    devices
-      .filter((device) => !excluded.has(device.deviceId))
-      .map(async (device): Promise<void> => {
-        // An approval or a question is blocking a turn, and the operator waking
-        // up to it late is the same as not being told.
-        const urgent =
-          request.kind === 'approval' || request.kind === 'question' || request.timeSensitive
+  /** Deliver the alert to every device the plugin did not exclude. */
+  async function deliverAlerts(): Promise<void> {
+    await Promise.all(
+      devices
+        .filter((device) => !excluded.has(device.deviceId))
+        .map(async (device): Promise<void> => {
+          // An approval or a question is blocking a turn, and the operator waking
+          // up to it late is the same as not being told.
+          const urgent =
+            request.kind === 'approval' || request.kind === 'question' || request.timeSensitive
 
-        let result: ApnsResult | FcmResult
-        if (device.platform === 'android') {
-          if (options.fcm === null) {
-            unrouted.set('android', (unrouted.get('android') ?? 0) + 1)
-            tally.failed += 1
+          let result: ApnsResult | FcmResult
+          if (device.platform === 'android') {
+            if (options.fcm === null) {
+              unrouted.set('android', (unrouted.get('android') ?? 0) + 1)
+              tally.failed += 1
+              return
+            }
+            const notification: FcmNotification = {
+              deviceToken: device.token,
+              title: request.title,
+              body: request.body,
+              collapseId: request.collapseId,
+              urgent,
+              sessionId: request.sessionId,
+              kind: request.kind,
+            }
+            result = await options.fcm.send(notification)
+          } else {
+            if (options.apns === null) {
+              unrouted.set('ios', (unrouted.get('ios') ?? 0) + 1)
+              tally.failed += 1
+              return
+            }
+            const notification: ApnsNotification = {
+              deviceToken: device.token,
+              // Each device's own environment, because one room holds phones that
+              // disagree about which Apple minted their token.
+              environment: device.environment ?? 'production',
+              title: request.title,
+              body: request.body,
+              threadId: request.threadId,
+              collapseId: request.collapseId,
+              urgent,
+              sessionId: request.sessionId,
+              kind: request.kind,
+            }
+            result = await options.apns.send(notification)
+          }
+
+          if (result.delivered) {
+            tally.sent += 1
             return
           }
-          const notification: FcmNotification = {
-            deviceToken: device.token,
-            title: request.title,
-            body: request.body,
-            collapseId: request.collapseId,
-            urgent,
-            sessionId: request.sessionId,
-            kind: request.kind,
-          }
-          result = await options.fcm.send(notification)
-        } else {
-          if (options.apns === null) {
-            unrouted.set('ios', (unrouted.get('ios') ?? 0) + 1)
-            tally.failed += 1
+          if (result.unregistered) {
+            tally.dropped += options.registry.forgetToken(room, device.token)
+            options.log(
+              `push: retired ${device.platform} token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
+            )
             return
           }
-          const notification: ApnsNotification = {
-            deviceToken: device.token,
-            // Each device's own environment, because one room holds phones that
-            // disagree about which Apple minted their token.
-            environment: device.environment ?? 'production',
-            title: request.title,
-            body: request.body,
-            threadId: request.threadId,
-            collapseId: request.collapseId,
-            urgent,
-            sessionId: request.sessionId,
-            kind: request.kind,
-          }
-          result = await options.apns.send(notification)
-        }
+          tally.failed += 1
+          options.log(
+            `push: ${device.deviceId} in room ${room} refused (${result.status} ${result.reason ?? 'no reason'})`,
+          )
+        }),
+    )
+  }
 
+  /**
+   * End the Live Activity on every iPhone that has one.
+   *
+   * Deliberately **not** filtered by `exceptDeviceIds`. That list means "the
+   * app is on screen, so an alert would be noise" -- and the phone in the
+   * operator's hand is exactly where a countdown that keeps running is most
+   * visible, so an end event there is the least optional of all. Android is not
+   * in this fan-out: it has no Live Activity, and its registration drops the
+   * field.
+   *
+   * A failure here is logged and otherwise forgotten. The tallies describe the
+   * alert, and an activity token Apple has retired is not a reason for the Mac's
+   * notification to be reported as failed after the alert went out.
+   */
+  async function deliverLiveActivityEnds(): Promise<void> {
+    const apnsClient = options.apns
+    if (!request.endLiveActivity || apnsClient === null) return
+    await Promise.all(
+      devices.map(async (device): Promise<void> => {
+        const token = device.liveActivityToken
+        if (device.platform !== 'ios' || typeof token !== 'string' || token === '') return
+        const result = await apnsClient.sendLiveActivityEnd({
+          token,
+          environment: device.environment ?? 'production',
+        })
         if (result.delivered) {
-          tally.sent += 1
+          options.log(`push: ended live activity for ${device.deviceId} in room ${room}`)
           return
         }
         if (result.unregistered) {
-          tally.dropped += options.registry.forgetToken(room, device.token)
+          // Only that activity token: the alert token is a different token, and
+          // Apple retiring an activity is not a dead phone. Matching on the token
+          // as well keeps a late answer about an old activity from clearing the
+          // next one's.
+          options.registry.clearLiveActivityToken(room, device.deviceId, token)
           options.log(
-            `push: retired ${device.platform} token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
+            `push: retired live-activity token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
           )
           return
         }
-        tally.failed += 1
         options.log(
-          `push: ${device.deviceId} in room ${room} refused (${result.status} ${result.reason ?? 'no reason'})`,
+          `push: live-activity end for ${device.deviceId} in room ${room} failed (${result.status} ${result.reason ?? 'no reason'})`,
         )
       }),
-  )
+    )
+  }
+
+  // Both fan-outs run together. An activity token Apple cannot reach costs one
+  // request timeout, exactly like a device token can, and sequencing the ends
+  // after the alerts would hand the plugin a slow request for work that was
+  // already done -- the timeout the parallel fan-out exists to avoid.
+  await Promise.all([deliverAlerts(), deliverLiveActivityEnds()])
 
   // Once per platform per notification, not once per device: a relay that has
   // no FCM credentials and sixteen Android phones must produce one line an

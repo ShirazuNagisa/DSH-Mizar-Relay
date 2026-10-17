@@ -24,6 +24,12 @@
  * indistinguishable from a dead token, so the registration was deleted and the
  * phone went quiet with the Mac still reporting it registered.
  *
+ * **A Live Activity has a third kind of token.** iOS mints one per activity,
+ * separate from the phone's alert token and retired when the activity ends, and
+ * ending the activity is a push to that token under a different topic and push
+ * type. It is the only push this file sends that is not an alert; see
+ * {@link ApnsClient.sendLiveActivityEnd}.
+ *
  * @module dsh-mizar-relay/apns
  */
 import { connect, constants, type ClientHttp2Session } from 'node:http2'
@@ -114,6 +120,21 @@ export interface ApnsResult {
   readonly unregistered: boolean
   readonly status: number
   readonly reason: string | null
+}
+
+/** One Live Activity end push, addressed by the activity's own push token. */
+export interface ApnsLiveActivityEnd {
+  /**
+   * The *activity* push token, not the phone's alert token.
+   *
+   * iOS issues one per Live Activity when it starts and the relay cannot derive
+   * it: it is a different token from the device token, sometimes on a different
+   * Apple, and it dies with the activity. It therefore travels with the
+   * notification the same way the device token does.
+   */
+  readonly token: string
+  /** Which APNs minted the activity token. */
+  readonly environment: ApnsEnvironment
 }
 
 /** How long a signed JWT is reused before it is minted again. */
@@ -217,6 +238,33 @@ export function buildPayload(
 }
 
 /**
+ * Build the payload that ends one Live Activity.
+ *
+ * Apple's `end` event dismisses the activity from the Lock Screen and the
+ * Dynamic Island, and `dismissal-date` is when it may disappear for good. Both
+ * stamps are Unix **seconds**: that is what the Live Activity push contract
+ * defines, and milliseconds would put the date tens of thousands of years out
+ * while the event itself silently did nothing -- leaving the activity counting,
+ * which is the bug this exists to fix.
+ *
+ * No `content-state`, deliberately. An end event takes none, and a payload that
+ * carries one risks a decode failure on a phone being told the activity is over.
+ *
+ * @param now - the current time, in epoch milliseconds.
+ * @returns the payload object, ready to serialize.
+ */
+export function buildLiveActivityEndPayload(now: number): Record<string, unknown> {
+  const timestamp = Math.floor(now / 1000)
+  return {
+    aps: {
+      timestamp,
+      event: 'end',
+      'dismissal-date': timestamp,
+    },
+  }
+}
+
+/**
  * An APNs client.
  *
  * One HTTP/2 session per environment, reused. A connection per notification
@@ -308,35 +356,71 @@ export class ApnsClient {
       return { delivered: false, unregistered: false, status: 413, reason: 'PayloadTooLarge' }
     }
 
-    const first = await this.#attempt(notification, payload, false)
-    if (first.reason === null || !STALE_TOKEN_REASONS.has(first.reason)) return first
-
-    // A rejected provider token is the one APNs answer worth a second attempt.
-    // A token is cached for fifty minutes, and the clock that decides when it is
-    // stale is the same clock that minted it -- so a clock that moved under a
-    // running relay can leave this process holding a token Apple has stopped
-    // accepting while the cache still believes it is good, for as long as the
-    // skew lasts. Once, and then Apple's own answer is reported: a loop here
-    // would turn a genuinely bad key into a request storm against a rate-limited
-    // endpoint, and asking again with the same reason cannot produce a different
-    // answer.
-    return await this.#attempt(notification, payload, true)
+    return await this.#deliver(notification, payload, (freshToken) =>
+      this.#alertHeaders(notification, payload, freshToken),
+    )
   }
 
   /**
-   * Make one request.
+   * End one Live Activity.
+   *
+   * A sibling of {@link send} rather than a flag on it, because nearly every
+   * header differs: the topic carries the `.push-type.liveactivity` suffix, the
+   * push type is `liveactivity`, and priority and expiration are fixed by the
+   * activity contract. Folding that into the alert path would mean conditionals
+   * around the one place where a wrong header fails silently.
+   *
+   * Never throws, for the same reason {@link send} does not: ending the activity
+   * announces state that is already durable, and a failed announcement must not
+   * fail the alert fan-out happening beside it.
+   *
+   * @param end - the activity token and the Apple it belongs to.
+   * @returns what Apple said; `unregistered` means this activity token is dead,
+   *   and says nothing about the device's alert token.
+   */
+  async sendLiveActivityEnd(end: ApnsLiveActivityEnd): Promise<ApnsResult> {
+    // Built once per call, so both timestamps in one payload agree even if the
+    // clock ticks between them.
+    const payload = JSON.stringify(buildLiveActivityEndPayload(Date.now()))
+    return await this.#deliver(
+      { deviceToken: end.token, environment: end.environment },
+      payload,
+      (freshToken) => ({
+        [constants.HTTP2_HEADER_METHOD]: 'POST',
+        [constants.HTTP2_HEADER_PATH]: `/3/device/${end.token}`,
+        [constants.HTTP2_HEADER_AUTHORIZATION]: `bearer ${this.#currentToken(freshToken)}`,
+        // An activity push is addressed to the app's Live Activity topic: the
+        // bundle id plus this suffix. Sent to the plain app topic, Apple
+        // answers `DeviceTokenNotForTopic` -- not a retired token, so a relay
+        // that read that as one would be wrong, and one that retried it would
+        // retry forever.
+        'apns-topic': `${this.#config.topic}.push-type.liveactivity`,
+        'apns-push-type': 'liveactivity',
+        // Apple accepts an activity push at priority 10 only. A deferred end
+        // would arrive after the phone had stopped showing the activity.
+        'apns-priority': 10,
+        // The activity has already ended; there is nothing to keep for later.
+        'apns-expiration': 0,
+        'content-type': 'application/json',
+        [constants.HTTP2_HEADER_CONTENT_LENGTH]: Buffer.byteLength(payload),
+      }),
+    )
+  }
+
+  /**
+   * The framing and headers for one alert.
    *
    * @param notification - what to send.
    * @param payload - the already-encoded body.
    * @param freshToken - whether to mint a new provider token for this attempt.
-   * @returns what Apple said.
+   * @returns the HTTP/2 headers.
    */
-  async #attempt(
+  #alertHeaders(
     notification: ApnsNotification,
     payload: string,
     freshToken: boolean,
-  ): Promise<ApnsResult> {
-    const headers: Record<string, string | number> = {
+  ): Record<string, string | number> {
+    return {
       [constants.HTTP2_HEADER_METHOD]: 'POST',
       [constants.HTTP2_HEADER_PATH]: `/3/device/${notification.deviceToken}`,
       [constants.HTTP2_HEADER_AUTHORIZATION]: `bearer ${this.#currentToken(freshToken)}`,
@@ -351,7 +435,53 @@ export class ApnsClient {
       'content-type': 'application/json',
       [constants.HTTP2_HEADER_CONTENT_LENGTH]: Buffer.byteLength(payload),
     }
+  }
 
+  /**
+   * Send one request, retrying it once when Apple refuses the provider token.
+   *
+   * Shared by alerts and Live Activity ends: the retry rule is about the
+   * deployment's signing key, not about what is being delivered.
+   *
+   * @param target - the token and the Apple it belongs to.
+   * @param payload - the already-encoded body.
+   * @param headers - builds the headers for one attempt, given whether to mint
+   *   a fresh provider token.
+   * @returns what Apple said.
+   */
+  async #deliver(
+    target: { readonly deviceToken: string; readonly environment: ApnsEnvironment },
+    payload: string,
+    headers: (freshToken: boolean) => Record<string, string | number>,
+  ): Promise<ApnsResult> {
+    const first = await this.#attempt(target, payload, headers(false))
+    if (first.reason === null || !STALE_TOKEN_REASONS.has(first.reason)) return first
+
+    // A rejected provider token is the one APNs answer worth a second attempt.
+    // A token is cached for fifty minutes, and the clock that decides when it is
+    // stale is the same clock that minted it -- so a clock that moved under a
+    // running relay can leave this process holding a token Apple has stopped
+    // accepting while the cache still believes it is good, for as long as the
+    // skew lasts. Once, and then Apple's own answer is reported: a loop here
+    // would turn a genuinely bad key into a request storm against a rate-limited
+    // endpoint, and asking again with the same reason cannot produce a different
+    // answer.
+    return await this.#attempt(target, payload, headers(true))
+  }
+
+  /**
+   * Make one request.
+   *
+   * @param target - the token and the Apple it belongs to.
+   * @param payload - the already-encoded body.
+   * @param headers - the headers for this attempt.
+   * @returns what Apple said.
+   */
+  async #attempt(
+    target: { readonly deviceToken: string; readonly environment: ApnsEnvironment },
+    payload: string,
+    headers: Record<string, string | number>,
+  ): Promise<ApnsResult> {
     return await new Promise<ApnsResult>((resolve) => {
       let settled = false
       const finish = (result: ApnsResult): void => {
@@ -362,7 +492,7 @@ export class ApnsClient {
 
       let request
       try {
-        request = this.#connect(notification.environment).request(headers)
+        request = this.#connect(target.environment).request(headers)
       } catch (error) {
         this.#log(`apns: could not open a request: ${describe(error)}`)
         finish({ delivered: false, unregistered: false, status: 0, reason: 'TransportError' })

@@ -324,7 +324,7 @@ export async function startRelay(
         if (device === null) {
           writeJson(response, 400, {
             error:
-              'deviceId and a token valid for its platform are required, and an environment for iOS',
+              'deviceId and a token valid for its platform are required, and a hex liveActivityToken when one is sent',
           })
           return
         }

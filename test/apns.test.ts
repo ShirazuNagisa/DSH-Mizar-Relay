@@ -25,6 +25,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ApnsClient,
   apnsOrigin,
+  buildLiveActivityEndPayload,
   buildPayload,
   providerToken,
   MAX_PAYLOAD_BYTES,
@@ -244,6 +245,21 @@ describe('payloads', () => {
       true,
     )
     expect((payload['aps'] as Record<string, unknown>)['interruption-level']).toBe('time-sensitive')
+  })
+
+  it('builds the Live Activity end payload in Unix seconds, with no content-state', () => {
+    // Both stamps are seconds. Milliseconds would land in the year 56000, and
+    // iOS discards the end event -- which leaves the activity counting, the
+    // exact bug this exists to fix. An end event carries no state: one sent with
+    // a `content-state` risks a decode failure on a phone being told the
+    // activity is over.
+    expect(buildLiveActivityEndPayload(1_700_000_000_999)).toEqual({
+      aps: {
+        timestamp: 1_700_000_000,
+        event: 'end',
+        'dismissal-date': 1_700_000_000,
+      },
+    })
   })
 })
 
@@ -618,6 +634,182 @@ describe('delivery', () => {
   })
 })
 
+describe('ending a Live Activity', () => {
+  /** One registered iPhone with both its alert and its activity token. */
+  function registeredPhone(
+    registry: PushRegistry,
+    overrides: { deviceId?: string; token?: string; liveActivityToken?: string | null } = {},
+  ): void {
+    registry.register('room-a', {
+      deviceId: overrides.deviceId ?? 'phone',
+      token: overrides.token ?? 'aa',
+      platform: 'ios',
+      environment: 'sandbox',
+      locale: 'en',
+      liveActivityToken:
+        overrides.liveActivityToken === undefined ? 'feedface' : overrides.liveActivityToken,
+    })
+  }
+
+  /** A notification whose alert leg should be unaffected by the end leg. */
+  const request = {
+    kind: 'turn-complete',
+    title: '任务完成',
+    body: 'demo',
+    sessionId: 's1',
+    threadId: 's1',
+    collapseId: '',
+    timeSensitive: false,
+    exceptDeviceIds: [] as string[],
+    endLiveActivity: true,
+  }
+
+  it('addresses the activity token with the liveactivity headers and payload', async () => {
+    const apple = await fakeApple(() => ({ status: 200 }))
+    const key = testKey()
+    const client = fakeClient(apple, key.pem)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(1_700_000_000_000)
+
+    const result = await client.sendLiveActivityEnd({ token: 'abc123', environment: 'sandbox' })
+
+    expect(result).toEqual({ delivered: true, unregistered: false, status: 200, reason: null })
+    expect(apple.seen).toHaveLength(1)
+    const sent = apple.seen[0]
+    expect(sent?.path).toBe('/3/device/abc123')
+    // The activity's own topic. Addressing the plain app topic earns
+    // `DeviceTokenNotForTopic`, which is not a retired token and so would be
+    // retried forever.
+    expect(sent?.headers['apns-topic']).toBe('me.shirazu.dshmizar.push-type.liveactivity')
+    expect(sent?.headers['apns-push-type']).toBe('liveactivity')
+    // Activity pushes are accepted at priority 10 only, and an end event is
+    // never worth holding: the activity has already stopped.
+    expect(String(sent?.headers['apns-priority'])).toBe('10')
+    expect(String(sent?.headers['apns-expiration'])).toBe('0')
+    expect(sent?.headers['content-type']).toBe('application/json')
+    expect(JSON.parse(sent?.body ?? '{}')).toEqual({
+      aps: { timestamp: 1_700_000_000, event: 'end', 'dismissal-date': 1_700_000_000 },
+    })
+
+    await apple.close()
+  })
+
+  it('ends every iPhone activity, including the one the app is showing', async () => {
+    const apple = await fakeApple(() => ({ status: 200 }))
+    const key = testKey()
+    const registry = new PushRegistry()
+    registeredPhone(registry, { deviceId: 'on-screen', token: 'aa', liveActivityToken: '11' })
+    registeredPhone(registry, { deviceId: 'in-pocket', token: 'bb', liveActivityToken: '22' })
+    const client = fakeClient(apple, key.pem)
+
+    const outcome = await deliver(
+      { registry, apns: client, fcm: null, log: () => {} },
+      'room-a',
+      // The app on screen is why the *alert* is skipped. The activity still has
+      // to end: an app on screen is exactly where a counting timer is visible.
+      { ...request, exceptDeviceIds: ['on-screen'] },
+    )
+
+    expect(outcome).toMatchObject({ sent: 1, failed: 0, dropped: 0, enabled: true })
+    const alerts = apple.seen.filter((sent) => sent.headers['apns-push-type'] === 'alert')
+    const ends = apple.seen.filter((sent) => sent.headers['apns-push-type'] === 'liveactivity')
+    expect(alerts.map((sent) => sent.path)).toEqual(['/3/device/bb'])
+    expect(ends.map((sent) => sent.path).sort()).toEqual(['/3/device/11', '/3/device/22'])
+
+    await apple.close()
+  })
+
+  it('sends no end push when endLiveActivity is not set', async () => {
+    const apple = await fakeApple(() => ({ status: 200 }))
+    const key = testKey()
+    const registry = new PushRegistry()
+    registeredPhone(registry)
+    const client = fakeClient(apple, key.pem)
+
+    await deliver(
+      { registry, apns: client, fcm: null, log: () => {} },
+      'room-a',
+      { ...request, endLiveActivity: false },
+    )
+
+    expect(apple.seen).toHaveLength(1)
+    expect(apple.seen[0]?.headers['apns-push-type']).toBe('alert')
+    await apple.close()
+  })
+
+  it('clears only the activity token Apple says is retired', async () => {
+    const apple = await fakeApple((sent) =>
+      sent.headers['apns-push-type'] === 'liveactivity'
+        ? { status: 410, body: JSON.stringify({ reason: 'Unregistered' }) }
+        : { status: 200 },
+    )
+    const key = testKey()
+    const registry = new PushRegistry()
+    registeredPhone(registry)
+    const client = fakeClient(apple, key.pem)
+
+    const outcome = await deliver(
+      { registry, apns: client, fcm: null, log: () => {} },
+      'room-a',
+      request,
+    )
+
+    // The alert leg is untouched by what happened to the activity leg.
+    expect(outcome).toMatchObject({ sent: 1, failed: 0, dropped: 0, enabled: true })
+    const [device] = registry.devices('room-a')
+    expect(device?.liveActivityToken).toBeNull()
+    // Never the phone: its alert token still works, and dropping the record
+    // would silence a phone that is perfectly reachable.
+    expect(device?.token).toBe('aa')
+    expect(registry.devices('room-a')).toHaveLength(1)
+
+    await apple.close()
+  })
+
+  it('keeps a failed end push out of the alert tallies, and keeps the token', async () => {
+    const apple = await fakeApple((sent) =>
+      sent.headers['apns-push-type'] === 'liveactivity'
+        ? { status: 503, body: JSON.stringify({ reason: 'ServiceUnavailable' }) }
+        : { status: 200 },
+    )
+    const key = testKey()
+    const registry = new PushRegistry()
+    registeredPhone(registry)
+    const client = fakeClient(apple, key.pem)
+
+    const outcome = await deliver(
+      { registry, apns: client, fcm: null, log: () => {} },
+      'room-a',
+      request,
+    )
+
+    expect(outcome).toMatchObject({ sent: 1, failed: 0, dropped: 0, enabled: true })
+    // A busy Apple is not a retired token: keep it and try again next time.
+    expect(registry.devices('room-a')[0]?.liveActivityToken).toBe('feedface')
+    await apple.close()
+  })
+
+  it('never ends an activity on Android, where the activity field is ignored', async () => {
+    // Android has no Live Activity and no APNs key in this test: if the field
+    // leaked through, the end leg would try to push. `readDevice` is where the
+    // field is dropped, so this asserts it never reaches a device.
+    const device = readDevice({
+      deviceId: 'droid',
+      token: 'droid-token',
+      platform: 'android',
+      liveActivityToken: 'feedface',
+    })
+    expect(device).toMatchObject({ platform: 'android', liveActivityToken: null })
+    expect(readDevice({
+      deviceId: 'droid',
+      token: 'droid-token',
+      platform: 'android',
+      // Not even valid hex: the field is ignored on Android, not validated.
+      liveActivityToken: 'not/hex',
+    })).toMatchObject({ platform: 'android', liveActivityToken: null })
+  })
+})
+
 describe('a provider token Apple will not accept', () => {
   /** One notification, as the client takes it. */
   const notification = {
@@ -739,6 +931,42 @@ describe('the registry', () => {
     expect(registry.forgetToken('a', 'aa')).toBe(2)
     expect(registry.devices('a').map((device) => device.deviceId)).toEqual(['p3'])
   })
+
+  it('clears one device\'s activity token, and only while it is still the current one', () => {
+    const registry = new PushRegistry()
+    registry.register('a', {
+      deviceId: 'p1',
+      token: 'aa',
+      platform: 'ios',
+      environment: 'sandbox',
+      locale: 'en',
+      liveActivityToken: '11',
+    })
+    registry.register('a', {
+      deviceId: 'p2',
+      token: 'bb',
+      platform: 'ios',
+      environment: 'sandbox',
+      locale: 'en',
+      liveActivityToken: '22',
+    })
+
+    // An answer about a token the phone has already replaced must not clear the
+    // replacement: a slow 410 for activity `11` can be in flight when the app
+    // registers the next activity's token, and clearing on that would end the
+    // *new* activity the first time anybody got a late answer.
+    expect(registry.clearLiveActivityToken('a', 'p1', 'stale')).toBe(false)
+    expect(registry.devices('a')[0]?.liveActivityToken).toBe('11')
+
+    expect(registry.clearLiveActivityToken('a', 'p1', '11')).toBe(true)
+    expect(registry.devices('a').find((device) => device.deviceId === 'p1')).toMatchObject({
+      token: 'aa',
+      liveActivityToken: null,
+    })
+    // And nothing else changed.
+    expect(registry.devices('a').find((device) => device.deviceId === 'p2')?.liveActivityToken).toBe('22')
+    expect(registry.deviceCount).toBe(2)
+  })
 })
 
 describe('request validation', () => {
@@ -760,6 +988,34 @@ describe('request validation', () => {
     expect(readDevice({ deviceId: 'p', token: 'aa', environment: 'nonsense' })?.environment).toBe(
       'production',
     )
+  })
+
+  it('reads an activity token only for iOS, and only when it is hex', () => {
+    // Absent means "the phone has no activity running", which is how a phone
+    // clears its token after ending one itself.
+    expect(readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox' })?.liveActivityToken).toBeNull()
+    expect(
+      readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox', liveActivityToken: 'deadBEEF' }),
+    ).toMatchObject({ liveActivityToken: 'deadBEEF' })
+    // Same rule as a device token: it is interpolated into an APNs URL path, so
+    // a slash is a request for a different endpoint, and a 400 is honest.
+    expect(
+      readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox', liveActivityToken: 'has/a/slash' }),
+    ).toBeNull()
+    expect(
+      readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox', liveActivityToken: 'a'.repeat(201) }),
+    ).toBeNull()
+    expect(
+      readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox', liveActivityToken: 7 }),
+    ).toBeNull()
+  })
+
+  it('reads endLiveActivity as a strict true, defaulting to false', () => {
+    expect(readNotification({ title: 't', body: 'b' })?.endLiveActivity).toBe(false)
+    expect(readNotification({ title: 't', body: 'b', endLiveActivity: true })?.endLiveActivity).toBe(true)
+    // Only `true` triggers an end push; a truthy-looking string is not a
+    // decision worth acting on.
+    expect(readNotification({ title: 't', body: 'b', endLiveActivity: 'true' })?.endLiveActivity).toBe(false)
   })
 
   it('requires a title and truncates the rest', () => {

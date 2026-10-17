@@ -38,7 +38,7 @@ bundle 里已经带好编译后的 `lib/`、唯一依赖 `ws`、`install.sh`（�
 
 ```sh
 npm install
-npm test              # 108 个测试
+npm test              # 164 个测试
 npm run typecheck
 npm run build         # tsc → lib/（lib/ 不进仓库，bundle 里才有）
 npm start             # 用 relay.config.json 起一个本地实例

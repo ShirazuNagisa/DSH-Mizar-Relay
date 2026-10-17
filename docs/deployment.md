@@ -975,6 +975,15 @@ the plugin hands that down as a list of devices to leave out — so a second pho
 looked at still receives everything. (It was one global flag first, and an iPad left open on a session
 then silenced the iPhone in somebody's pocket — which is precisely the notification that matters.)
 
+**A Live Activity ends when the session does, even if nobody opens the app.** The Dynamic Island
+timer is not a notification and does not expire on its own, so an alert alone left it counting after
+the session had finished. The phone therefore reports its *activity* push token with its registration
+(`liveActivityToken`), and the plugin sets `endLiveActivity: true` on the notification that reports
+the session finished. The relay sends one `liveactivity` push to each iPhone that holds a token, even
+to a phone whose app is on screen — that is exactly where a stale timer is visible — and the activity
+token is tracked apart from the alert token: when Apple retires one, the relay forgets only that
+token and the phone keeps receiving notifications.
+
 ### 10.6 Restarts, and why there is no database
 
 Registrations live in memory. A room's tokens are a cache of what the Mac already knows, and the Mac

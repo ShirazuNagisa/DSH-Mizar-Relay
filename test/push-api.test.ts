@@ -31,7 +31,18 @@ let apple: Http2Server | undefined
 let google: Server | undefined
 /** Statuses the fake Apple answers with, consumed in order. */
 let answers: Array<{ status: number; body?: string }> = []
-let received: Array<{ path: string; body: string }> = []
+/** An answer chosen by what the request is, when arrival order cannot decide. */
+let answerFor:
+  | ((request: { path: string; body: string; headers: Record<string, string | string[] | undefined> }) => {
+      status: number
+      body?: string
+    })
+  | undefined
+let received: Array<{
+  path: string
+  body: string
+  headers: Record<string, string | string[] | undefined>
+}> = []
 /** HTTP/2 connections the fake Apple has accepted. */
 let connections = 0
 /** What the fake Google received. */
@@ -51,6 +62,7 @@ afterEach(async () => {
     google = undefined
   }
   answers = []
+  answerFor = undefined
   received = []
   connections = 0
   googleReceived = []
@@ -71,8 +83,13 @@ async function startFakeApple(): Promise<string> {
       body += chunk
     })
     stream.on('end', () => {
-      received.push({ path: String(headers[':path'] ?? ''), body })
-      const answer = answers.shift() ?? { status: 200 }
+      const request = {
+        path: String(headers[':path'] ?? ''),
+        body,
+        headers: headers as Record<string, string | string[] | undefined>,
+      }
+      received.push(request)
+      const answer = answerFor?.(request) ?? answers.shift() ?? { status: 200 }
       stream.respond({ ':status': answer.status, 'content-type': 'application/json' })
       stream.end(answer.body ?? '')
     })
@@ -299,6 +316,58 @@ describe('registering a device', () => {
     expect(reply.status).toBe(400)
   })
 
+  it('accepts an activity token, and a later registration without one clears it', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    const registered = await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'deadbeef',
+      environment: 'sandbox',
+      liveActivityToken: 'feedface',
+    })
+    expect(registered.status).toBe(200)
+
+    await post(base, '/push/v1/notify', MAC_A, { ...notification, endLiveActivity: true })
+    expect(received.map((entry) => entry.path)).toContain('/3/device/feedface')
+
+    // Absence means the phone currently has no activity running: the old token
+    // belongs to an activity that has already ended, and pushing to it would be
+    // a wasted request every time.
+    const cleared = await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'deadbeef',
+      environment: 'sandbox',
+    })
+    expect(cleared.status).toBe(200)
+    received = []
+    await post(base, '/push/v1/notify', MAC_A, { ...notification, endLiveActivity: true })
+    expect(received.map((entry) => entry.path)).toEqual(['/3/device/deadbeef'])
+  })
+
+  it('refuses an activity token that is not hex', async () => {
+    const base = await boot(null)
+    const reply = await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'deadbeef',
+      environment: 'sandbox',
+      liveActivityToken: 'has/a/slash',
+    })
+    expect(reply.status).toBe(400)
+  })
+
+  it('ignores an activity token on Android', async () => {
+    const base = await boot(null)
+    // iOS-only field: Android has no Live Activity, so it is dropped rather than
+    // refused -- an Android app sending it is not a reason to lose its alerts.
+    const reply = await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'android-phone',
+      token: ANDROID_TOKEN,
+      platform: 'android',
+      liveActivityToken: 'feedface',
+    })
+    expect(reply.status).toBe(200)
+  })
+
   it('bounds how many rooms it will remember', async () => {
     // The registry is in memory, and a registration needs nothing but a
     // well-formed credential -- so without a cap a script grows it without
@@ -458,6 +527,153 @@ describe('notifying a room', () => {
     })
     const statusBody = (await status.json()) as { devices: unknown[] }
     expect(statusBody.devices).toHaveLength(2)
+  })
+
+  it('ends Live Activities even for the phone the app is on screen on, without moving the alert tallies', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+    })
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-2',
+      token: 'bbbb',
+      environment: 'sandbox',
+      liveActivityToken: '2222',
+    })
+
+    const reply = await post(base, '/push/v1/notify', MAC_A, {
+      ...notification,
+      // The app is on screen on phone-1, so its alert is skipped -- but its
+      // activity must still end; that is where a counting timer is visible.
+      exceptDeviceIds: ['phone-1'],
+      endLiveActivity: true,
+    })
+
+    // The notification's own tallies count alerts only: one alert, one success.
+    expect(reply.json).toMatchObject({ ok: true, sent: 1, failed: 0, dropped: 0, enabled: true })
+    const alerts = received.filter((entry) => entry.headers['apns-push-type'] === 'alert')
+    const ends = received.filter((entry) => entry.headers['apns-push-type'] === 'liveactivity')
+    expect(alerts.map((entry) => entry.path)).toEqual(['/3/device/bbbb'])
+    expect(ends.map((entry) => entry.path).sort()).toEqual(['/3/device/1111', '/3/device/2222'])
+    for (const end of ends) {
+      expect(end.headers['apns-topic']).toBe('me.shirazu.dshmizar.push-type.liveactivity')
+      expect(String(end.headers['apns-priority'])).toBe('10')
+      expect(String(end.headers['apns-expiration'])).toBe('0')
+      expect(end.headers['content-type']).toBe('application/json')
+      const payload = JSON.parse(end.body) as { aps: Record<string, unknown> }
+      expect(payload.aps['event']).toBe('end')
+      expect(Number.isInteger(payload.aps['timestamp'])).toBe(true)
+      expect(payload.aps['dismissal-date']).toBe(payload.aps['timestamp'])
+      expect(payload.aps['content-state']).toBeUndefined()
+    }
+  })
+
+  it('sends no end push when endLiveActivity is false or absent', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+    })
+
+    for (const extra of [{}, { endLiveActivity: false }]) {
+      received = []
+      const reply = await post(base, '/push/v1/notify', MAC_A, { ...notification, ...extra })
+      expect(reply.json).toMatchObject({ sent: 1, failed: 0, dropped: 0 })
+      expect(received.map((entry) => entry.path)).toEqual(['/3/device/aaaa'])
+      expect(received[0]?.headers['apns-push-type']).toBe('alert')
+    }
+  })
+
+  it('clears only the activity token Apple says is retired', async () => {
+    const authority = await startFakeApple()
+    answerFor = (request) =>
+      request.headers['apns-push-type'] === 'liveactivity'
+        ? { status: 410, body: JSON.stringify({ reason: 'Unregistered' }) }
+        : { status: 200 }
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+      locale: 'en',
+    })
+
+    const reply = await post(base, '/push/v1/notify', MAC_A, {
+      ...notification,
+      endLiveActivity: true,
+    })
+    // The activity token retiring is not an alert failing: the alert was
+    // delivered, and nothing was dropped from the registry.
+    expect(reply.json).toMatchObject({ sent: 1, failed: 0, dropped: 0 })
+
+    // The phone is still registered and its next alert still goes out. Dropping
+    // the device over a dead activity token would silence a working phone.
+    received = []
+    const again = await post(base, '/push/v1/notify', MAC_A, notification)
+    expect(again.json).toMatchObject({ sent: 1, failed: 0, dropped: 0 })
+    expect(received.map((entry) => entry.path)).toEqual(['/3/device/aaaa'])
+    const status = await fetch(`${base}/push/v1/status`, {
+      headers: { authorization: `Bearer ${MAC_A}` },
+    })
+    expect(((await status.json()) as { devices: unknown[] }).devices).toHaveLength(1)
+  })
+
+  it('keeps a failed end push out of the alert tallies, and retries it next time', async () => {
+    const authority = await startFakeApple()
+    answerFor = (request) =>
+      request.headers['apns-push-type'] === 'liveactivity'
+        ? { status: 503, body: JSON.stringify({ reason: 'ServiceUnavailable' }) }
+        : { status: 200 }
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+    })
+
+    const reply = await post(base, '/push/v1/notify', MAC_A, {
+      ...notification,
+      endLiveActivity: true,
+    })
+    expect(reply.json).toMatchObject({ sent: 1, failed: 0, dropped: 0 })
+
+    // A busy Apple is not a dead activity, so the token is kept for next time.
+    received = []
+    await post(base, '/push/v1/notify', MAC_A, { ...notification, endLiveActivity: true })
+    expect(
+      received.filter((entry) => entry.headers['apns-push-type'] === 'liveactivity'),
+    ).toHaveLength(1)
+  })
+
+  it('never sends an activity push for an Android device', async () => {
+    const authority = await startFakeApple()
+    const googleAuthority = await startFakeGoogle()
+    const base = await boot(authority, {}, fcmConfig(googleAuthority))
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'android-phone',
+      token: ANDROID_TOKEN,
+      platform: 'android',
+      // Ignored on Android: no Live Activity exists there, so no APNs request
+      // may be made for this phone whatever it sends.
+      liveActivityToken: 'feedface',
+    })
+
+    const reply = await post(base, '/push/v1/notify', MAC_A, {
+      ...notification,
+      endLiveActivity: true,
+    })
+    expect(reply.json).toMatchObject({ sent: 1, failed: 0, dropped: 0 })
+    expect(received).toHaveLength(0)
+    expect(googleReceived.filter((entry) => entry.path !== '/token')).toHaveLength(1)
   })
 
   it('routes each platform to its own service, in the same room and the same call', async () => {

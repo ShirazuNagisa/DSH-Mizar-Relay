@@ -12,5 +12,8 @@
   "probePort": 8788,
   "_apns": {
     "_comment": "推送是可选的。要用就在 relay.config.json 里加一个 apns 块（keyId / teamId / topic / key），key 是 Apple 给你的 .p8 文件内容，必须是真的私钥 —— 占位的假 PEM 会让推送关闭（中继本身照常运行）。步骤见 docs/deployment.md 第 10 节。"
+  },
+  "_fcm": {
+    "_comment": "Android 推送（FCM）同样是可选的：在 relay.config.json 里加一个 fcm 块。serviceAccountFile 指向 Firebase 服务账号 JSON 的路径（也可以把整份 JSON 内联进 serviceAccount），channelId 是 App 建好的通知通道；不填则走 App 的默认通道。步骤见 docs/deployment.md 第 10.3 节。"
   }
 }

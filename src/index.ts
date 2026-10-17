@@ -26,6 +26,7 @@ import { createSocket, type Socket as UdpSocket } from 'node:dgram'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
 import { loadConfig, type RelayConfig } from './config.js'
+import { FcmClient } from './fcm.js'
 import { deliver, PushRegistry, readDevice, readNotification } from './push.js'
 import { deriveRoom, secretsEqual } from './room.js'
 import { RoomRegistry, Tunnel, saneCloseCode, type TunnelStream } from './tunnel.js'
@@ -124,6 +125,31 @@ function createApnsOrWarn(
 }
 
 /**
+ * Build the FCM client, or say why push to Android is off.
+ *
+ * Same rule as APNs: a malformed service account costs push, not the tunnel.
+ *
+ * @param config - the `fcm` block, which is present but may be unusable.
+ * @param log - where to report.
+ * @returns the client, or `null` when its key could not be read.
+ */
+function createFcmOrWarn(
+  config: NonNullable<RelayConfig['fcm']>,
+  log: (message: string) => void,
+): FcmClient | null {
+  try {
+    return new FcmClient(config, log)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log(
+      `relay: push to Android is off — the configured FCM service account could not be read (${message}). ` +
+        'Replace fcm.serviceAccount / fcm.serviceAccountFile in relay.config.json with the JSON Firebase gave you, or remove the fcm block.',
+    )
+    return null
+  }
+}
+
+/**
  * Start the relay.
  *
  * @param config - the resolved configuration.
@@ -142,14 +168,18 @@ export async function startRelay(
   const pushRegistry = new PushRegistry()
   // A key that will not parse is a configuration mistake, not a reason for the
   // tunnel to be down: the relay's whole job -- letting a phone reach a Mac --
-  // needs nothing from Apple, and an operator who pasted a key with the wrong
-  // newlines in it should be told so, not given a service that exits at start-up.
+  // needs nothing from Apple or Google, and an operator who pasted a key with the
+  // wrong newlines in it should be told so, not given a service that exits at start-up.
   //
   // Measured on the shipped bundle: the example config's placeholder key made
   // `createPrivateKey` throw `ERR_OSSL_UNSUPPORTED` out of `startRelay`, so a
-  // fresh install following the deployment notes never listened at all.
+  // fresh install following the deployment notes never listened at all. The FCM
+  // service account goes through the same guard for the same reason.
   const apns =
     config.apns === null ? null : createApnsOrWarn(config.apns, log)
+  const fcm = config.fcm === null ? null : createFcmOrWarn(config.fcm, log)
+  /** Whether this relay can notify anybody at all, on any platform. */
+  const pushEnabled = apns !== null || fcm !== null
   /** Phone sockets waiting for the Mac to accept their upgrade. */
   // The upgrade socket is a Duplex, not a net.Socket: `ws` accepts whatever the
   // HTTP server hands over, and typing it as a Socket made every use of it an error.
@@ -173,7 +203,11 @@ export async function startRelay(
         rooms: rooms.size,
         inFlight: rooms.inFlight,
         pushDevices: pushRegistry.deviceCount,
-        push: apns !== null,
+        // Either-or, and left that way so the grep an operator already has
+        // ("push":true) keeps meaning "this relay can notify somebody". `fcm`
+        // is the new half and says which one.
+        push: pushEnabled,
+        fcm: fcm !== null,
         version: TUNNEL_PROTOCOL_VERSION,
       })
       return
@@ -289,7 +323,8 @@ export async function startRelay(
         const device = readDevice(parsed)
         if (device === null) {
           writeJson(response, 400, {
-            error: 'deviceId, a hex token and an environment are required',
+            error:
+              'deviceId and a token valid for its platform are required, and an environment for iOS',
           })
           return
         }
@@ -306,11 +341,13 @@ export async function startRelay(
           writeJson(response, 429, { error: 'this room has as many devices as it may have' })
           return
         }
-        log(`push: registered ${device.deviceId} (${device.environment}) for room ${room}`)
+        log(
+          `push: registered ${device.deviceId} (${device.platform}, ${device.environment ?? 'n/a'}) for room ${room}`,
+        )
         writeJson(response, 200, {
           ok: true,
           devices: pushRegistry.devices(room).length,
-          enabled: apns !== null,
+          enabled: pushEnabled,
         })
         return
       }
@@ -332,7 +369,7 @@ export async function startRelay(
           writeJson(response, 400, { error: 'title and body are required' })
           return
         }
-        const outcome = await deliver({ registry: pushRegistry, client: apns, log }, room, notification)
+        const outcome = await deliver({ registry: pushRegistry, apns, fcm, log }, room, notification)
         writeJson(response, 200, { ok: true, ...outcome })
         return
       }
@@ -345,11 +382,12 @@ export async function startRelay(
           ok: true,
           devices: pushRegistry.devices(room).map((device) => ({
             deviceId: device.deviceId,
+            platform: device.platform,
             environment: device.environment,
             locale: device.locale,
             registeredAt: device.registeredAt,
           })),
-          enabled: apns !== null,
+          enabled: pushEnabled,
         })
         return
       }
@@ -669,6 +707,7 @@ export async function startRelay(
       waiting.clear()
       rooms.closeAll()
       apns?.close()
+      fcm?.close()
       probe?.close()
       await new Promise<void>((resolve) => wss.close(() => resolve()))
       await new Promise<void>((resolve) => server.close(() => resolve()))

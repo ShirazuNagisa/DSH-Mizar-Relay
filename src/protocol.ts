@@ -16,7 +16,7 @@
  * @module dsh-mizar-relay/protocol
  */
 
-/** A request the phone made, on its way to the Mac. */
+/** A request the phone made, on its way to the computer. */
 export interface TunnelRequest {
   readonly t: 'req'
   readonly id: string
@@ -28,7 +28,7 @@ export interface TunnelRequest {
   readonly body: string | null
 }
 
-/** The Mac's answer to {@link TunnelRequest}. */
+/** The computer's answer to {@link TunnelRequest}. */
 export interface TunnelResponse {
   readonly t: 'res'
   readonly id: string
@@ -45,7 +45,7 @@ export interface TunnelStreamOpen {
   readonly headers: Readonly<Record<string, string>>
 }
 
-/** The Mac accepted the stream; the phone socket is upgraded. */
+/** The computer accepted the stream; the phone socket is upgraded. */
 export interface TunnelStreamOpened {
   readonly t: 'ws-open-ok'
   readonly id: string
@@ -68,7 +68,7 @@ export interface TunnelStreamClose {
   readonly reason?: string
 }
 
-/** Liveness. Sent by the relay; the Mac answers with the same id. */
+/** Liveness. Sent by the relay; the computer answers with the same id. */
 export interface TunnelPing {
   readonly t: 'ping'
   readonly id: string
@@ -86,7 +86,7 @@ export interface TunnelWelcome {
   /**
    * The room this tunnel serves.
    *
-   * The relay derives it from the token rather than accepting one from the Mac.
+   * The relay derives it from the token rather than accepting one from the computer.
    * That keeps the derivation in exactly one place -- there is no second
    * implementation to drift -- and means a tunnel cannot claim a room belonging
    * to a different token.
@@ -95,7 +95,7 @@ export interface TunnelWelcome {
   readonly protocolVersion: number
 }
 
-/** Everything the relay may send to a Mac. */
+/** Everything the relay may send to a computer. */
 export type RelayToHost =
   | TunnelWelcome
   | TunnelRequest
@@ -104,7 +104,7 @@ export type RelayToHost =
   | TunnelStreamClose
   | TunnelPing
 
-/** Everything a Mac may send to the relay. */
+/** Everything a computer may send to the relay. */
 export type HostToRelay =
   | TunnelResponse
   | TunnelStreamOpened
@@ -116,7 +116,7 @@ export type HostToRelay =
 /** The tunnel protocol version. */
 export const TUNNEL_PROTOCOL_VERSION = 1
 
-/** The path a Mac dials to establish its tunnel. */
+/** The path a computer dials to establish its tunnel. */
 export const TUNNEL_PATH = '/tunnel'
 
 /** The prefix a phone dials. Everything after it is the room, then the Mizar path. */

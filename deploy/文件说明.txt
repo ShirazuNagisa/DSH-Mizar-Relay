@@ -8,7 +8,7 @@ DSH-Mizar 中继服务器 v0.0.0 — 文件说明
   nginx-websocket.conf   宝塔反向代理里要粘贴的片段（不粘贴就连不上）
   DEPLOYMENT-FULL.md     完整参考：配置项全表、systemd 细节、排错手册
 
-  app/selftest.js        自检：不用 Mac 也能验中继是否正常
+  app/selftest.js        自检：不用电脑也能验中继是否正常
 
   app/                   服务端本体
     lib/                 已经编译好，服务器上不需要 TypeScript
@@ -19,7 +19,7 @@ DSH-Mizar 中继服务器 v0.0.0 — 文件说明
 不需要 npm install，不需要联网，不需要编译。
 
 
-部署完在 Mac 上要改的（~/.dsh/profiles/<profile>/cordis.patch.yml）:
+部署完在电脑上要改的（~/.dsh/profiles/<profile>/cordis.patch.yml）:
 
   - id: mizar
     config:

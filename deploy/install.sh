@@ -91,7 +91,7 @@ printf '\n'
 #
 # Everything except the config. Re-running this installer is how an upgrade is
 # applied, and a blanket copy would put the shipped placeholder over the token
-# the Mac is already paired against -- which looks like the relay breaking
+# the computer is already paired against -- which looks like the relay breaking
 # rather than the installer having clobbered a credential.
 mkdir -p "$TARGET"
 for entry in "$HERE"/app/*; do
@@ -116,7 +116,7 @@ chmod 600 "$TARGET/relay.config.json"
 # before its domain existed.
 #
 # Re-running the installer leaves an existing token alone, so an upgrade does not
-# silently invalidate the Mac that is already paired against it.
+# silently invalidate the computer that is already paired against it.
 say "relay.config.json is root-only"
 
 # --- systemd ----------------------------------------------------------------
@@ -181,7 +181,7 @@ $(printf '=%.0s' {1..40})
      Then paste the block from nginx-websocket.conf into the site's config.
      Without it the WebSocket handshake is stripped and nothing connects.
 
-  Then put this in the DSH-Mizar plugin's config on your Mac:
+  Then put this in the DSH-Mizar plugin's config on your computer:
 
     relay:
       url: "https://<your-domain>"

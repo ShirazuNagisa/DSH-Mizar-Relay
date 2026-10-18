@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Check the relay end to end, without a Mac.
+ * Check the relay end to end, without a computer.
  *
  * The failure this exists to prevent is spending an hour on DNS, TLS and nginx
- * when the thing that is actually broken is the relay. This acts as the Mac: it
+ * when the thing that is actually broken is the relay. This acts as the computer: it
  * opens a tunnel, receives a request the way the plugin would, answers it, and
  * checks the answer comes back through the relay. If this passes, the server
  * side is correct and anything still failing lives in the reverse proxy.
@@ -113,7 +113,7 @@ async function main() {
         resolve({ room: frame.room, socket })
         return
       }
-      // Act as the Mac for the request the HTTP leg below will make.
+      // Act as the computer for the request the HTTP leg below will make.
       if (frame.t === 'req') {
         socket.send(
           JSON.stringify({
@@ -144,7 +144,7 @@ async function main() {
 
   if (room.room === undefined) {
     check('the token is accepted and a room is assigned', false, JSON.stringify(room))
-    console.log('\n  The token in relay.config.json is the one the Mac must be given.\n')
+    console.log('\n  The token in relay.config.json is the one the computer must be given.\n')
     process.exit(1)
   }
   check('the token is accepted and a room is assigned', /^[0-9A-HJKMNP-TV-Z]{12}$/.test(room.room), room.room)
@@ -172,7 +172,7 @@ async function main() {
   })
   check('a phone WebSocket is bridged through to the tunnel', bridged === 'bridged', bridged)
 
-  // --- an unknown room is a 404, like one whose Mac is away ----------------
+  // --- an unknown room is a 404, like one whose computer is away ----------------
   const unknown = await fetch(`${base}/r/AAAAAAAAAAAA/mizar/v1/hello`)
   const offline = await fetch(`${base}/r/${room.room}/mizar/v1/hello`)
   check(

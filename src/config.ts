@@ -2,7 +2,7 @@
  * Relay configuration.
  *
  * Deliberately a file rather than a database: this relay serves one operator and
- * a handful of Macs, and a token list that fits in a text file is easier to
+ * a handful of computers, and a token list that fits in a text file is easier to
  * audit than a schema. Everything here has an environment-variable override so a
  * container deployment does not need a writable filesystem.
  *
@@ -54,7 +54,7 @@ export interface RelayConfig {
   readonly maxMessageBytes: number
   /** Concurrent client connections allowed per room. */
   readonly maxClientsPerRoom: number
-  /** How long a phone request waits for the Mac before it is failed, in ms. */
+  /** How long a phone request waits for the computer before it is failed, in ms. */
   readonly requestTimeoutMs: number
   /** How long a tunnel may go without a pong before it is dropped, in ms. */
   readonly tunnelIdleMs: number

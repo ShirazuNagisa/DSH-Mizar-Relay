@@ -3,7 +3,7 @@
  *
  * The unit tests cover signing and framing. What they cannot cover is the part
  * that is easy to get quietly wrong: whether the credential identifies the room,
- * whether a token registered by one Mac can be notified by another, whether a
+ * whether a token registered by one computer can be notified by another, whether a
  * retired token stops being tried, and whether one room's two platforms are
  * routed to two different services. All four are routing facts, and routing
  * facts need a server.
@@ -372,7 +372,7 @@ describe('registering a device', () => {
     // The registry is in memory, and a registration needs nothing but a
     // well-formed credential -- so without a cap a script grows it without
     // bound: sixteen devices per room, and no limit on rooms at all. A room that
-    // is already known keeps working, because the Mac re-announces its own
+    // is already known keeps working, because the computer re-announces its own
     // registrations on every reconnect.
     // Open registration, which is the mode a room cap has to hold in: every
     // credential is accepted and every credential is its own room.
@@ -470,7 +470,7 @@ describe('notifying a room', () => {
     const authority = await startFakeApple()
     const base = await boot(authority)
     // One room, two phones that disagree about which Apple minted their token:
-    // a Debug build and a TestFlight build, both paired to the same Mac.
+    // a Debug build and a TestFlight build, both paired to the same computer.
     await post(base, '/push/v1/register', MAC_A, {
       deviceId: 'desk-debug-build',
       token: 'aaaa',
@@ -497,7 +497,7 @@ describe('notifying a room', () => {
     expect(connections).toBe(2)
   })
 
-  it('leaves out the devices whose app the Mac says is on screen', async () => {
+  it('leaves out the devices whose app the computer says is on screen', async () => {
     const authority = await startFakeApple()
     const base = await boot(authority)
     await post(base, '/push/v1/register', MAC_A, {
@@ -683,7 +683,7 @@ describe('notifying a room', () => {
     const authority = await startFakeApple()
     const googleAuthority = await startFakeGoogle()
     const base = await boot(authority, {}, fcmConfig(googleAuthority))
-    // One room, two phones on two services: an iPhone paired to this Mac and an
+    // One room, two phones on two services: an iPhone paired to this computer and an
     // Android one. Before `platform` existed the second could not even register.
     await post(base, '/push/v1/register', MAC_A, {
       deviceId: 'iphone',
@@ -808,7 +808,7 @@ describe('notifying a room', () => {
     expect(JSON.stringify(body)).not.toContain(ANDROID_TOKEN)
   })
 
-  it('does not let one Mac notify another Mac\'s phones', async () => {
+  it('does not let one computer notify another computer\'s phones', async () => {
     const authority = await startFakeApple()
     const base = await boot(authority)
     await post(base, '/push/v1/register', MAC_A, {
@@ -853,7 +853,7 @@ describe('notifying a room', () => {
       environment: 'sandbox',
     })
     const reply = await post(base, '/push/v1/notify', MAC_A, notification)
-    // Not an error: a Mac whose relay cannot push should be told so, not left
+    // Not an error: a computer whose relay cannot push should be told so, not left
     // with a failed request it will retry.
     expect(reply.status).toBe(200)
     expect(reply.json).toMatchObject({ ok: true, sent: 0, enabled: false })

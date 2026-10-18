@@ -5,11 +5,11 @@
  * tokens belong to which room, which service each token belongs to, and how to
  * hand a notification to Apple or to Google; it does **not** know what a session
  * is, what an approval is, or when either deserves a notification. That
- * judgement stays on the Mac, in the plugin, where the evidence is.
+ * judgement stays on the computer, in the plugin, where the evidence is.
  *
  * ### Why the room comes from the credential
  *
- * A registration is authenticated by the same tunnel credential the Mac already
+ * A registration is authenticated by the same tunnel credential the computer already
  * presents, and the room is derived from it exactly as the tunnel's is. There is
  * therefore no way to register a token against somebody else's room, and no
  * second enrolment mechanism to get wrong -- which is the whole reason the phone
@@ -17,7 +17,7 @@
  *
  * ### Why the registry is in memory
  *
- * A room's registrations are a cache of what the Mac already knows, and the Mac
+ * A room's registrations are a cache of what the computer already knows, and the computer
  * re-announces all of them every time its tunnel reconnects. Persisting them
  * here would create a second copy of a fact that has an owner, and a relay that
  * restarted would then serve stale tokens forever with nothing to correct it.
@@ -384,7 +384,7 @@ export class PushRegistry {
  * a device Apple cannot reach costs a full request timeout, and a session Apple
  * closed without telling anybody, a wiped phone or a stalled network all produce
  * exactly that: the first such device pushed the plugin's own ten-second client
- * timeout past its limit while the rest were still being sent, so the Mac logged
+ * timeout past its limit while the rest were still being sent, so the computer logged
  * a failed notification for one that had in fact gone out. Sending together
  * bounds the wall clock at one request. The fan-out is bounded by
  * {@link MAX_DEVICES_PER_ROOM}, which is what makes `Promise.all` safe here, and
@@ -511,7 +511,7 @@ export async function deliver(
    * field.
    *
    * A failure here is logged and otherwise forgotten. The tallies describe the
-   * alert, and an activity token Apple has retired is not a reason for the Mac's
+   * alert, and an activity token Apple has retired is not a reason for the computer's
    * notification to be reported as failed after the alert went out.
    */
   async function deliverLiveActivityEnds(): Promise<void> {

@@ -430,7 +430,7 @@ describe('delivery', () => {
     // The second phone's request reached Apple before the first was answered.
     // Sent one at a time, a room of sixteen devices where one is unreachable
     // takes sixteen request timeouts to work through -- longer than the plugin's
-    // ten-second client timeout, so the Mac reports a failure for notifications
+    // ten-second client timeout, so the computer reports a failure for notifications
     // that did go out.
     expect(apple.events.indexOf('push /3/device/bb')).toBeLessThan(
       apple.events.indexOf('pop /3/device/aa'),

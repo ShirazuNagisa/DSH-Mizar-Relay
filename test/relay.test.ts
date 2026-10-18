@@ -31,7 +31,7 @@ const config = (overrides: Partial<RelayConfig> = {}): RelayConfig => ({
 })
 
 /**
- * A stand-in for the Mac: connects its tunnel and answers whatever it is asked
+ * A stand-in for the computer: connects its tunnel and answers whatever it is asked
  * with a fixed reply, so the test is about the relay and not about the plugin.
  */
 class FakeMac {
@@ -119,7 +119,7 @@ class FakeMac {
     this.#handler = () => undefined
   }
 
-  /** Send a stream message of the given size, as the Mac would. */
+  /** Send a stream message of the given size, as the computer would. */
   sendStreamMessage(payload: string): void {
     this.#socket.send(
       JSON.stringify({
@@ -135,14 +135,14 @@ class FakeMac {
     this.#socket.close()
   }
 
-  /** Drop the socket without a close handshake, as a dead Mac would. */
+  /** Drop the socket without a close handshake, as a dead computer would. */
   kill(): void {
     this.#socket.terminate()
   }
 }
 
 describe('relay HTTP replay', () => {
-  it('carries a request to the Mac and its answer back', async () => {
+  it('carries a request to the computer and its answer back', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     mac.respondWith(200, '{"hostId":"abc"}')
@@ -189,7 +189,7 @@ describe('relay HTTP replay', () => {
     expect(headers['transfer-encoding']).toBeUndefined()
   })
 
-  it('propagates the Mac response status, not a relay one', async () => {
+  it('propagates the computer response status, not a relay one', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     mac.respondWith(429, '{"error":"slow down"}')
@@ -205,7 +205,7 @@ describe('relay HTTP replay', () => {
   })
 
   it('answers the same 404 whether the room is unknown or merely offline', async () => {
-    // Distinguishing them would let anyone enumerate which Macs are online.
+    // Distinguishing them would let anyone enumerate which computers are online.
     relay = await startRelay(config(), () => undefined)
     const offline = await fetch(`http://127.0.0.1:${relay.port}/r/${ROOM}/mizar/v1/hello`)
     const unknown = await fetch(`http://127.0.0.1:${relay.port}/r/AAAAAAAAAAAA/mizar/v1/hello`)
@@ -213,7 +213,7 @@ describe('relay HTTP replay', () => {
     expect(await offline.text()).toBe(await unknown.text())
   })
 
-  it('reports 502 when the Mac goes silent past the timeout', async () => {
+  it('reports 502 when the computer goes silent past the timeout', async () => {
     relay = await startRelay(config({ requestTimeoutMs: 100 }), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     mac.goSilent()
@@ -222,7 +222,7 @@ describe('relay HTTP replay', () => {
     expect(response.status).toBe(502)
   })
 
-  it('fails an in-flight request the moment the Mac drops', async () => {
+  it('fails an in-flight request the moment the computer drops', async () => {
     relay = await startRelay(config({ requestTimeoutMs: 30_000 }), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     mac.goSilent()
@@ -261,13 +261,13 @@ describe('relay tunnel admission', () => {
     await expect(FakeMac.connect(`ws://127.0.0.1:${relay.port}`, '')).rejects.toThrow(/401/)
   })
 
-  it('tells the Mac which room it serves', async () => {
+  it('tells the computer which room it serves', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     expect(mac.room).toBe(ROOM)
   })
 
-  it('lets a reconnecting Mac take over its own room', async () => {
+  it('lets a reconnecting computer take over its own room', async () => {
     relay = await startRelay(config(), () => undefined)
     const first = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     const second = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
@@ -286,7 +286,7 @@ describe('relay tunnel admission', () => {
 })
 
 describe('relay WebSocket bridging', () => {
-  it('bridges a phone socket through to the Mac', async () => {
+  it('bridges a phone socket through to the computer', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     mac.echoStreams()
@@ -307,7 +307,7 @@ describe('relay WebSocket bridging', () => {
     phone.close()
   })
 
-  it('refuses the upgrade with 502 when the Mac will not accept the stream', async () => {
+  it('refuses the upgrade with 502 when the computer will not accept the stream', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
     mac.refuseStreams()
@@ -318,12 +318,12 @@ describe('relay WebSocket bridging', () => {
       phone.once('unexpected-response', (_request, response) => resolve(response.statusCode))
       phone.once('error', () => undefined)
     })
-    // The Mac's refusal is visible as an HTTP status, not as a socket that opened
+    // The computer's refusal is visible as an HTTP status, not as a socket that opened
     // and immediately died -- the two are indistinguishable in a client's logs.
     expect(status).toBe(502)
   })
 
-  it('refuses a phone socket for a room with no Mac', async () => {
+  it('refuses a phone socket for a room with no computer', async () => {
     relay = await startRelay(config(), () => undefined)
     const phone = new WebSocket(`ws://127.0.0.1:${relay.port}/r/NOSUCHROOM/mizar/v1/ws`)
     const status = await new Promise<number>((resolve, reject) => {
@@ -373,7 +373,7 @@ describe('relay WebSocket bridging', () => {
 
 describe('relay limits on what comes back', () => {
   it('refuses to carry a response body past the body cap', async () => {
-    // The cap used to apply to the phone's request only, so a Mac -- and in open
+    // The cap used to apply to the phone's request only, so a computer -- and in open
     // registration anybody may be one -- could make the relay allocate and write
     // an answer of any size.
     relay = await startRelay(config({ maxBodyBytes: 1024 }), () => undefined)
@@ -388,7 +388,7 @@ describe('relay limits on what comes back', () => {
     expect(after.status).toBe(200)
   })
 
-  it('shuts down even while a phone is waiting for the Mac to answer', async () => {
+  it('shuts down even while a phone is waiting for the computer to answer', async () => {
     // A deferred upgrade leaves a raw socket parked with no answer. Draining
     // waits for it, so shutdown used to stall for the whole request timeout --
     // thirty seconds by default -- on every restart.
@@ -502,7 +502,7 @@ describe('the frame size guard', () => {
       phone.once('error', reject)
     })
 
-    // The Mac sends something far too big for the phone leg.
+    // The computer sends something far too big for the phone leg.
     mac.sendStreamMessage('x'.repeat(4096))
     await new Promise((resolve) => setTimeout(resolve, 200))
 

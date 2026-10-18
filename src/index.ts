@@ -1,7 +1,7 @@
 /**
  * The relay.
  *
- * A Mac opens one outbound WebSocket to `/tunnel` and is thereafter reachable at
+ * A computer opens one outbound WebSocket to `/tunnel` and is thereafter reachable at
  * `/r/<room>/...` by anything that can reach this server. Requests are replayed
  * over that socket; a phone WebSocket is bridged through it. Nothing about the
  * Mizar protocol is interpreted here -- the relay moves bytes and does not know
@@ -11,11 +11,11 @@
  * Two behaviours are worth reading the code for:
  *
  *   - **The upgrade is deferred.** A phone WebSocket is not accepted until the
- *     Mac has accepted it, so an unreachable Mac produces an HTTP error rather
+ *     computer has accepted it, so an unreachable computer produces an HTTP error rather
  *     than a socket that opens and immediately dies. The two look identical in a
  *     client's logs and only one of them is diagnosable.
  *   - **A room with no tunnel is a 404, and the same 404 as a room that never
- *     existed.** Telling the difference would let anybody enumerate which Macs
+ *     existed.** Telling the difference would let anybody enumerate which computers
  *     are online.
  *
  * @module dsh-mizar-relay/index
@@ -80,7 +80,7 @@ async function readBody(request: IncomingMessage, limit: number): Promise<Buffer
   return Buffer.concat(chunks)
 }
 
-/** The headers worth carrying to the Mac: everything that describes the request. */
+/** The headers worth carrying to the computer: everything that describes the request. */
 function forwardableHeaders(request: IncomingMessage): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [name, value] of Object.entries(request.headers)) {
@@ -167,7 +167,7 @@ export async function startRelay(
   /** Every room's notification endpoints. See `push.ts` for why this is memory. */
   const pushRegistry = new PushRegistry()
   // A key that will not parse is a configuration mistake, not a reason for the
-  // tunnel to be down: the relay's whole job -- letting a phone reach a Mac --
+  // tunnel to be down: the relay's whole job -- letting a phone reach a computer --
   // needs nothing from Apple or Google, and an operator who pasted a key with the
   // wrong newlines in it should be told so, not given a service that exits at start-up.
   //
@@ -180,7 +180,7 @@ export async function startRelay(
   const fcm = config.fcm === null ? null : createFcmOrWarn(config.fcm, log)
   /** Whether this relay can notify anybody at all, on any platform. */
   const pushEnabled = apns !== null || fcm !== null
-  /** Phone sockets waiting for the Mac to accept their upgrade. */
+  /** Phone sockets waiting for the computer to accept their upgrade. */
   // The upgrade socket is a Duplex, not a net.Socket: `ws` accepts whatever the
   // HTTP server hands over, and typing it as a Socket made every use of it an error.
   const waiting = new Set<{ socket: Duplex; timer: NodeJS.Timeout }>()
@@ -215,7 +215,7 @@ export async function startRelay(
 
     // The plugin's notification API. Handled before the room paths because it is
     // not part of the tunnel: these requests are answered here, not replayed to
-    // a Mac.
+    // a computer.
     if (url.startsWith(PUSH_PREFIX)) {
       await handlePush(request, response, url.slice(PUSH_PREFIX.length).split('?')[0] ?? '')
       return
@@ -228,7 +228,7 @@ export async function startRelay(
     }
 
     // The same answer whether the room is empty or was never issued. Distinguishing
-    // them would let anyone enumerate which Macs are currently online.
+    // them would let anyone enumerate which computers are currently online.
     const tunnel = rooms.get(split.room)
     if (tunnel === undefined || !tunnel.alive) {
       writeJson(response, 404, { error: 'not found' })
@@ -249,8 +249,8 @@ export async function startRelay(
         body.length === 0 ? null : body.toString('base64'),
       )
       // The cap is on the wire in both directions. It used to bound the phone's
-      // request only, so whatever a Mac answered was allocated and written
-      // through unmeasured -- and in open-registration mode anybody may be a Mac.
+      // request only, so whatever a computer answered was allocated and written
+      // through unmeasured -- and in open-registration mode anybody may be a computer.
       const carried = result.body === null ? 0 : Buffer.byteLength(result.body, 'base64')
       if (carried > config.maxBodyBytes) {
         log(
@@ -258,7 +258,7 @@ export async function startRelay(
             `over the ${Math.round(config.maxBodyBytes / 1024)}KB body cap`,
         )
         writeJson(response, 502, {
-          error: 'the Mac answered with more than this relay carries',
+          error: 'the computer answered with more than this relay carries',
           detail: `${carried} bytes`,
         })
         return
@@ -271,7 +271,7 @@ export async function startRelay(
       response.end(payload)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      writeJson(response, 502, { error: 'the Mac did not answer', detail: message })
+      writeJson(response, 502, { error: 'the computer did not answer', detail: message })
     }
   }
 
@@ -279,9 +279,9 @@ export async function startRelay(
    * Answer one push request.
    *
    * Authenticated by the tunnel credential, and the room is derived from it --
-   * the same derivation the tunnel upgrade uses, so a Mac can only ever register
+   * the same derivation the tunnel upgrade uses, so a computer can only ever register
    * a token against its own room. The phone never calls this: it hands its token
-   * to the Mac over the authenticated Mizar protocol, and the Mac brings it
+   * to the computer over the authenticated Mizar protocol, and the computer brings it
    * here. That is what keeps a second trust relationship out of the design.
    *
    * @param request - the request.
@@ -330,7 +330,7 @@ export async function startRelay(
         }
         // The registry is in memory and a room only exists once a device is
         // registered, so this is what bounds it: a room already known keeps
-        // working (its Mac re-announces every reconnect), a new one past the
+        // working (its computer re-announces every reconnect), a new one past the
         // limit does not.
         if (!pushRegistry.has(room) && pushRegistry.roomCount >= config.maxRooms) {
           log(`push: refused a room — already holding ${config.maxRooms} of them`)
@@ -420,8 +420,8 @@ export async function startRelay(
     }
 
     // `maxClientsPerRoom` is the only bound on how many sockets one room holds,
-    // and it counts the ones still waiting for the Mac as well as the bridged
-    // ones: the upgrade is deferred, so a room with a slow Mac would otherwise
+    // and it counts the ones still waiting for the computer as well as the bridged
+    // ones: the upgrade is deferred, so a room with a slow computer would otherwise
     // accept every socket that arrived before the first answer.
     const held = phoneSlots.get(split.room) ?? 0
     if (held >= config.maxClientsPerRoom) {
@@ -448,9 +448,9 @@ export async function startRelay(
     socket.once('close', releaseSlot)
     socket.once('error', releaseSlot)
 
-    // The raw socket is left unanswered until the Mac says yes. Answering first
+    // The raw socket is left unanswered until the computer says yes. Answering first
     // and closing afterwards would show the phone a socket that opened and died,
-    // which reads as a bug in the app rather than as an unreachable Mac.
+    // which reads as a bug in the app rather than as an unreachable computer.
     const entry = {
       socket,
       timer: setTimeout(() => {
@@ -462,7 +462,7 @@ export async function startRelay(
     entry.timer.unref?.()
     waiting.add(entry)
 
-    /** The phone went away before the Mac answered. */
+    /** The phone went away before the computer answered. */
     const onSocketGone = (): void => {
       clearTimeout(entry.timer)
       waiting.delete(entry)
@@ -478,9 +478,9 @@ export async function startRelay(
     // the stream's handlers are fixed when it opens and the socket they must talk
     // to does not exist yet -- and, for data coming back, will not exist for
     // another round trip. A first version of this left `onMessage` empty with a
-    // comment explaining that the Mac "does not send before the upgrade
+    // comment explaining that the computer "does not send before the upgrade
     // completes", which was true and beside the point: the handler is permanent,
-    // and so the Mac's answers had nowhere to go for the life of the stream.
+    // and so the computer's answers had nowhere to go for the life of the stream.
     const opened: { stream: TunnelStream | null; phone: WebSocket | null } = {
       stream: null,
       phone: null,
@@ -506,7 +506,7 @@ export async function startRelay(
         // 502 is far more useful than a socket that opens and immediately dies.
         // After it, the phone socket is the only thing left to close.
         if (opened.phone !== null) {
-          opened.phone.close(1011, 'the Mac dropped the stream')
+          opened.phone.close(1011, 'the computer dropped the stream')
         } else if (!socket.destroyed) {
           socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n')
           socket.destroy()
@@ -571,7 +571,7 @@ export async function startRelay(
     })
   }
 
-  /** Authenticate and attach a Mac's tunnel. */
+  /** Authenticate and attach a computer's tunnel. */
   function handleTunnelUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     // Self-registration. A relay that issued credentials would need an operator
     // to hand them out and a user to type them, which is the configuration this
@@ -579,7 +579,7 @@ export async function startRelay(
     // the room is derived from it.
     //
     // That is safe for the reason the room is derived rather than chosen: the
-    // room is 60 bits of a hash of a secret this Mac generated locally, so
+    // room is 60 bits of a hash of a secret this computer generated locally, so
     // knowing one tells you nothing about any other. What the relay must guard
     // is not who may connect but how many may, which is what the limits below
     // are for.
@@ -655,10 +655,10 @@ export async function startRelay(
   }
 
   /**
-   * Keep every Mac awake, and drop the ones that stop answering.
+   * Keep every computer awake, and drop the ones that stop answering.
    *
    * The ping is what turns a half-open tunnel into a disconnect the relay can
-   * act on. Without it a Mac whose process died keeps a socket that accepts
+   * act on. Without it a computer whose process died keeps a socket that accepts
    * writes, and every phone request pays a full timeout to discover it.
    */
   let pingCounter = 0
@@ -718,7 +718,7 @@ export async function startRelay(
 /**
  * The UDP endpoint probe.
  *
- * This is the relay being useful with the one thing a Mac behind a campus
+ * This is the relay being useful with the one thing a computer behind a campus
  * firewall cannot do for itself: it has a public address, so it can tell each
  * peer where that peer appears from the outside. That is the whole of STUN for
  * this purpose, in about twenty lines, and it means no third-party service is

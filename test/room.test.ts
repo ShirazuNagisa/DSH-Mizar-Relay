@@ -32,7 +32,7 @@ describe('deriveRoom', () => {
 
   it('separates tokens that differ by one character', () => {
     // A room id is a function of the capability, so two tokens must never collide
-    // onto one room -- that would let one Mac's phone reach a different Mac.
+    // onto one room -- that would let one computer's phone reach a different computer.
     expect(deriveRoom('token-a')).not.toBe(deriveRoom('token-b'))
     expect(deriveRoom('token-a')).not.toBe(deriveRoom('token-a '))
   })

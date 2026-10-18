@@ -1,8 +1,8 @@
 # Deploying the DSH-Mizar relay
 
-The relay is the third answer to "how does the phone reach the Mac", after the two in
+The relay is the third answer to "how does the phone reach the computer", after the two in
 This document: a small Node service you run on a server with a public
-address, which lets a Mac that **cannot accept inbound connections at all** still be reachable.
+address, which lets a computer that **cannot accept inbound connections at all** still be reachable.
 
 This document is the operator's guide. It is written to be followed top to bottom on a fresh
 server, with BaoTa Panel (宝塔面板) assumed for the web side because that is where the sharp edges
@@ -18,36 +18,36 @@ are.
 
 ## 1. What this is, and why
 
-A Mac at home or in an office usually cannot be dialled from outside: consumer NAT drops unsolicited
+A computer at home or in an office usually cannot be dialled from outside: consumer NAT drops unsolicited
 inbound packets, and campus or corporate networks block them outright. The relay inverts the
-problem. The Mac opens **one outbound WebSocket** to the relay and holds it open; anything arriving
-at the relay for that Mac is replayed down that socket.
+problem. The computer opens **one outbound WebSocket** to the relay and holds it open; anything arriving
+at the relay for that computer is replayed down that socket.
 
 ```text
  iPhone ──── HTTPS / WSS ────► nginx (TLS) ──► relay (127.0.0.1:8787) ──┐
                                                                        │ one outbound WSS
-                                                                       │ the Mac opened
- Mac (plugin listener on 127.0.0.1:19390) ◄────────────────────────────┘
+                                                                       │ the computer opened
+ computer (plugin listener on 127.0.0.1:19390) ◄───────────────────────┘
 ```
 
-The Mac has no inbound port, no port forwarding, no VPN and no second network to join. It dials
+The computer has no inbound port, no port forwarding, no VPN and no second network to join. It dials
 `wss://mizar.example.com/tunnel` with `Authorization: Bearer <token>`, the relay derives a **room**
-from that token, and the Mac becomes reachable at `https://mizar.example.com/r/<room>/…`.
+from that token, and the computer becomes reachable at `https://mizar.example.com/r/<room>/…`.
 
 What the relay does and does not do:
 
 | | |
 |---|---|
-| It **does** terminate a WebSocket with the Mac and multiplex phone traffic over it | HTTP requests are replayed and their answers returned; phone WebSockets are bridged through |
+| It **does** terminate a WebSocket with the computer and multiplex phone traffic over it | HTTP requests are replayed and their answers returned; phone WebSockets are bridged through |
 | It **does not** understand the Mizar protocol | a request is a method, a path, headers and a body; the relay moves those and knows nothing about sessions, devices or approvals |
 | It **does not** authenticate phones | the phone still pairs with the plugin's own pairing code and then speaks with a device token, over the tunnel, exactly as it would on a LAN |
-| It **does** decide which Mac a request reaches | and only from the token, never from anything the Mac or the phone claims |
+| It **does** decide which computer a request reaches | and only from the token, never from anything the computer or the phone claims |
 
 Two deliberate behaviours are worth knowing before you debug anything:
 
-- **A room with no Mac connected and a room that never existed answer the same 404.** Telling them
-  apart would let anyone enumerate which Macs are online.
-- **A phone WebSocket is not accepted until the Mac accepts it.** An unreachable Mac produces an
+- **A room with no computer connected and a room that never existed answer the same 404.** Telling them
+  apart would let anyone enumerate which computers are online.
+- **A phone WebSocket is not accepted until the computer accepts it.** An unreachable computer produces an
   HTTP error rather than a socket that opens and immediately dies. The two look identical in a
   client's logs, and only one of them is diagnosable.
 
@@ -55,9 +55,9 @@ Two deliberate behaviours are worth knowing before you debug anything:
 
 | Path | Who uses it | What happens |
 |---|---|---|
-| `/tunnel` | the Mac | WebSocket upgrade, authenticated with `Authorization: Bearer <token>`; an unknown token gets `401` and a closed socket |
+| `/tunnel` | the computer | WebSocket upgrade, authenticated with `Authorization: Bearer <token>`; an unknown token gets `401` and a closed socket |
 | `/r/<room>/…` | the phone | replayed over the tunnel; WebSocket upgrades are bridged; `404` when that room has no live tunnel |
-| `/healthz` | you | `{"ok":true,"rooms":1,"inFlight":0,"version":1}` — `rooms` counts the Macs currently attached (section 7) |
+| `/healthz` | you | `{"ok":true,"rooms":1,"inFlight":0,"version":1}` — `rooms` counts the computers currently attached (section 7) |
 | `udp/<probePort>` | peers | endpoint probe: any datagram gets JSON back containing the sender's public address and port |
 
 ---
@@ -72,7 +72,7 @@ Two deliberate behaviours are worth knowing before you debug anything:
 | **TLS** | a certificate for that name. This guide uses Let's Encrypt through BaoTa; any certificate that nginx can load works |
 | **Disk** | tens of megabytes. The configuration is a text file, not a database |
 | **Network** | inbound TCP 443 (and TCP 80 for the certificate), optionally inbound UDP 8788 for the probe |
-| **On the Mac** | the `dsh-mizar` plugin already installed and working, and the tunnel token in its own config (section 6) |
+| **On the computer** | the `dsh-mizar` plugin already installed and working, and the tunnel token in its own config (section 6) |
 
 ---
 
@@ -91,7 +91,7 @@ Two deliberate behaviours are worth knowing before you debug anything:
    npm ci --omit=dev     # 只留运行时依赖 ws
    ```
 
-4. 生成隧道令牌：`openssl rand -base64 32`。**一个 Mac 一个令牌**，等同于"成为那台 Mac"的
+4. 生成隧道令牌：`openssl rand -base64 32`。**一个电脑一个令牌**，等同于"成为那台电脑"的
    凭证，不要外传、不要提交进 git。
 5. 写配置：`cp relay.config.example.json relay.config.json`，把令牌填进 `tokens`，
    `chmod 600 relay.config.json`。默认 `port: 8787`、`host: 127.0.0.1`、`probePort: 8788`。
@@ -110,7 +110,7 @@ Two deliberate behaviours are worth knowing before you debug anything:
    ```
 
 9. 安全组/防火墙放行 TCP 80、TCP 443；想要打洞探测再放行 **UDP 8788**。**绝不要**放行 8787。
-10. Mac 插件配置里打开 `relay`（见第 6 节），重启 DSH，日志出现
+10. 电脑插件配置里打开 `relay`（见第 6 节），重启 DSH，日志出现
     `relay: serving room …`，然后在面板里生成配对二维码给手机扫。
 11. 验证：`curl https://mizar.example.com/healthz` 应返回
     `{"ok":true,"rooms":1,"inFlight":0,"version":1}`。
@@ -125,7 +125,7 @@ The relay is the `relay/` directory of this repository and nothing else — it d
 plugin, and the plugin does not import it. Copy that one directory:
 
 ```sh
-# from the repository root on the Mac
+# from the repository root on the computer
 rsync -av --exclude node_modules --exclude lib \
   relay/ root@203.0.113.10:/www/wwwroot/dsh-mizar-relay/
 ```
@@ -160,7 +160,7 @@ These are the script names exactly as declared in [`relay/package.json`](../rela
 > **The order matters, and `npm ci --omit=dev` alone will not work.** The build script is `tsc`,
 > and `typescript` is a **devDependency**. Prune first and `npm run build` fails with a missing
 > compiler. Either build first and prune afterwards (above), or — if you would rather not install a
-> compiler on the server at all — run `npm ci && npm run build` on the Mac, copy `lib/`,
+> compiler on the server at all — run `npm ci && npm run build` on the computer, copy `lib/`,
 > `package.json` and `package-lock.json` across, and run `npm ci --omit=dev` there.
 >
 > `npm ci --omit=dev` deletes `node_modules` and reinstalls from the lockfile, which is why it is
@@ -174,11 +174,11 @@ openssl rand -base64 32          # 44 characters, mixed case, may contain + / =
 openssl rand -hex 32             # 64 characters, hex only — easier to paste into a config file
 ```
 
-Either is fine. Use a separate token per Mac: one token is one room, so the list is also your
-inventory, and retiring a Mac is deleting one line.
+Either is fine. Use a separate token per computer: one token is one room, so the list is also your
+inventory, and retiring a computer is deleting one line.
 
-**A token is not a password for an account — it is the capability to *be* that Mac.** Whoever holds
-it can attach a process to the relay as your Mac, receive every phone request, and answer as the
+**A token is not a password for an account — it is the capability to *be* that computer.** Whoever holds
+it can attach a process to the relay as your computer, receive every phone request, and answer as the
 plugin would. That is a stronger position than holding a room id (section 9). So:
 
 - generate it on the server, paste it into one file, and do not send it through chat, tickets or
@@ -197,8 +197,8 @@ room = first 12 characters of Crockford base32( SHA-256( "dsh-mizar-relay/room:"
 ```
 
 The alphabet is `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (no `I`, `L`, `O` or `U`, so a room read off a
-screen cannot be mistyped into a different valid one). The relay computes it and tells the Mac in
-its first frame; the Mac never invents one, so a tunnel cannot claim a room that belongs to a
+screen cannot be mistyped into a different valid one). The relay computes it and tells the computer in
+its first frame; the computer never invents one, so a tunnel cannot claim a room that belongs to a
 different token.
 
 To cross-check the room for a token, on the server, from the relay directory:
@@ -252,11 +252,11 @@ Every key, its environment override and its default — the authoritative list, 
 |---|---|---|---|
 | `port` | `MIZAR_RELAY_PORT` | `8787` | TCP port for the plain-HTTP server. TLS is nginx's job, not this process's |
 | `host` | `MIZAR_RELAY_HOST` | `127.0.0.1` | interface to bind. Leave it; see 5.4 |
-| `tokens` | `MIZAR_RELAY_TOKENS` | `[]` — any credential is accepted | the bearer tokens a Mac may present at `/tunnel`. One token = one Mac = one room. Empty is the shipping mode: each plugin invents its own secret and the room is derived from it, so there is nothing to issue (see 4.3) |
-| `maxBodyBytes` | `MIZAR_RELAY_MAX_BODY` | `4194304` (4 MiB) | largest body the relay carries, in either direction: a bigger request from the phone is answered `413`, a bigger answer from the Mac is answered `502` |
+| `tokens` | `MIZAR_RELAY_TOKENS` | `[]` — any credential is accepted | the bearer tokens a computer may present at `/tunnel`. One token = one computer = one room. Empty is the shipping mode: each plugin invents its own secret and the room is derived from it, so there is nothing to issue (see 4.3) |
+| `maxBodyBytes` | `MIZAR_RELAY_MAX_BODY` | `4194304` (4 MiB) | largest body the relay carries, in either direction: a bigger request from the phone is answered `413`, a bigger answer from the computer is answered `502` |
 | `maxMessageBytes` | `MIZAR_RELAY_MAX_MESSAGE` | `4194304` (4 MiB) | largest single WebSocket message. Past it the bridge closes with code `1009` |
 | `maxClientsPerRoom` | `MIZAR_RELAY_MAX_CLIENTS` | `8` | concurrent phone connections allowed per room. A resource guard, not authentication |
-| `requestTimeoutMs` | `MIZAR_RELAY_REQUEST_TIMEOUT` | `30000` | how long a phone request waits for the Mac before `502`, and how long a phone WebSocket waits for the Mac to accept its upgrade before `504` |
+| `requestTimeoutMs` | `MIZAR_RELAY_REQUEST_TIMEOUT` | `30000` | how long a phone request waits for the computer before `502`, and how long a phone WebSocket waits for the computer to accept its upgrade before `504` |
 | `tunnelIdleMs` | `MIZAR_RELAY_TUNNEL_IDLE` | `90000` | how long a tunnel may go without answering a ping before the relay drops it. The relay pings every `tunnelIdleMs / 3` (30 s at the default), never faster than 5 s |
 | `maxRooms` | `MIZAR_RELAY_MAX_ROOMS` | `10000` | rooms served at once, and push rooms remembered. The only bound on either map |
 | `maxTunnelsPerIp` | `MIZAR_RELAY_MAX_TUNNELS_PER_IP` | `4` | tunnels one source address may hold. A resource guard, not authentication |
@@ -276,9 +276,9 @@ Rules that are easy to trip over:
   with `ERR_SOCKET_BAD_PORT` (see section 8).
 - **An empty token list is a supported mode, not a failure.** The relay then accepts any credential
   of at least sixteen characters and derives the room from it, which is what makes "install the
-  plugin and scan" possible: a room is sixty bits of a hash of a secret the Mac generated locally, so
+  plugin and scan" possible: a room is sixty bits of a hash of a secret the computer generated locally, so
   knowing one room tells you nothing about any other, and a stranger who registers a room only gets
-  their own. Set `tokens` when you would rather your relay served only your own Macs — the check is a
+  their own. Set `tokens` when you would rather your relay served only your own computers — the check is a
   string comparison against a list, so it keeps a private relay private rather than stopping a
   determined attacker.
 
@@ -337,7 +337,7 @@ Why each of the lines that matter:
   supervises Node itself instead of supervising npm supervising Node — one less process to signal
   on restart. Use the absolute `node` path from `command -v node`; systemd does not read your
   shell's `PATH`, and a Node installed by nvm or by BaoTa's Node manager is not in `/usr/bin`.
-- **`Restart=always`** with a short `RestartSec` is what makes a relay restart invisible: the Mac
+- **`Restart=always`** with a short `RestartSec` is what makes a relay restart invisible: the computer
   reconnects on its own with exponential backoff (section 6).
 - **The `Environment=` lines** are shown quoted on purpose: base64 tokens can contain `/`, `+` and
   `=`, and quoting keeps systemd from splitting at a space. systemd performs no shell expansion
@@ -435,20 +435,20 @@ proxy_send_timeout 3600s;
 | `proxy_http_version 1.1` | WebSocket upgrades exist in HTTP/1.1. nginx talks HTTP/1.0 to upstreams by default, where `Upgrade` is not a thing |
 | `proxy_set_header Upgrade $http_upgrade` | forwards the client's `Upgrade: websocket` to the relay. Without it the relay never sees an upgrade request at all |
 | `proxy_set_header Connection "upgrade"` | tells the relay this connection is an upgrade and not a keep-alive request. **This and the line above are a pair** — with only one of them the handshake is stripped and what the client gets back is a plain HTTP response instead of `101 Switching Protocols` |
-| `proxy_set_header Host $host` | keeps the hostname the client used, rather than `127.0.0.1:8787`, in the request the Mac eventually replays |
-| `proxy_set_header X-Real-IP $remote_addr` | the phone's real address. The relay forwards it to the Mac as an ordinary request header (it is not a hop-by-hop header), which is the only way the Mac can see who is calling — from the plugin's side the connection arrives from loopback |
-| `proxy_read_timeout 3600s` | **the one people lose an evening to.** nginx's default is 60 s: a proxied socket that says nothing for 60 s is closed. The tunnel is exactly such a socket whenever it is quiet, and the symptom is a Mac that reconnects roughly every minute, forever |
+| `proxy_set_header Host $host` | keeps the hostname the client used, rather than `127.0.0.1:8787`, in the request the computer eventually replays |
+| `proxy_set_header X-Real-IP $remote_addr` | the phone's real address. The relay forwards it to the computer as an ordinary request header (it is not a hop-by-hop header), which is the only way the computer can see who is calling — from the plugin's side the connection arrives from loopback |
+| `proxy_read_timeout 3600s` | **the one people lose an evening to.** nginx's default is 60 s: a proxied socket that says nothing for 60 s is closed. The tunnel is exactly such a socket whenever it is quiet, and the symptom is a computer that reconnects roughly every minute, forever |
 | `proxy_send_timeout 3600s` | the write-side equivalent, for a large answer being pushed to a slow phone |
 
 What the two failure modes actually look like:
 
-- **Missing `Upgrade`/`Connection`.** The Mac's connection to `wss://…/tunnel` ends with a non-101
+- **Missing `Upgrade`/`Connection`.** The computer's connection to `wss://…/tunnel` ends with a non-101
   response, so no tunnel ever registers; `/healthz` reports `"rooms":0` while answering perfectly
   over HTTPS, which is what makes this confusing. The phone's WebSocket fails the same way.
 - **Short `proxy_read_timeout`.** The tunnel connects, `rooms` becomes `1`, and then it drops about
-  every 60 seconds. The relay logs `relay: tunnel for room … disconnected` in a loop, the Mac logs
+  every 60 seconds. The relay logs `relay: tunnel for room … disconnected` in a loop, the computer logs
   `relay: reconnecting in Ns`, and everything appears to work between drops. The relay pings its
-  tunnel every 30 seconds, which usually keeps the Mac's leg under the limit — but the phone's leg
+  tunnel every 30 seconds, which usually keeps the computer's leg under the limit — but the phone's leg
   can be quiet for longer, a raised `tunnelIdleMs` widens the gap, and a 60-second window is far too
   close to a 30-second heartbeat to rely on.
 
@@ -460,7 +460,7 @@ nginx -t && nginx -s reload
 
 > **A tidier variant.** Setting `Connection` to the literal `"upgrade"` means it is also sent on
 > plain requests, like `/healthz` and the HTTP replay under `/r/…`. The relay strips `Connection`
-> and `Upgrade` before forwarding anything to the Mac, so this is tolerated. If you prefer the
+> and `Upgrade` before forwarding anything to the computer, so this is tolerated. If you prefer the
 > standard form, declare this once in the `http` context (for BaoTa that means the nginx main
 > configuration, **not** inside the site's `server` block, where a `map` is invalid):
 
@@ -486,11 +486,11 @@ The Node process speaks **plain HTTP**: no certificate, no encryption of its own
 That has two consequences:
 
 - Exposing 8787 publicly would put the tunnel token on the wire in clear text as a bearer header,
-  readable by anything between the Mac and the server. TLS in front is not a nicety here; it is the
+  readable by anything between the computer and the server. TLS in front is not a nicety here; it is the
   only encryption the tunnel has.
 - It would also expose `/r/<room>/…` unencrypted to the entire internet. The room is a weaker secret
   than the token (section 9), and it is not meant to be the thing standing between a stranger and
-  your Mac.
+  your computer.
 
 So: bind loopback, let nginx own 443, and **do not open 8787 in the security group or the host
 firewall.** If you have a reason to bind something else — a container network, a second machine —
@@ -500,7 +500,7 @@ set `host` deliberately and put a firewall in front of it.
 
 | Port | Protocol | Open? | Why |
 |---|---|---|---|
-| 443 | TCP | yes | phones and the Mac's tunnel |
+| 443 | TCP | yes | phones and the computer's tunnel |
 | 80 | TCP | yes | the HTTPS redirect and Let's Encrypt's HTTP-01 challenge |
 | 8788 | UDP | only if you want the probe | endpoint discovery for peer-to-peer hole punching; the reply tells a peer how it looks from outside |
 | 8787 | TCP | **never** | the relay's plain-HTTP port; nginx is the only client it should have |
@@ -515,9 +515,9 @@ the relay then opens no UDP socket at all and the firewall rule is unnecessary.
 
 ---
 
-## 6. Configuring the Mac plugin
+## 6. Configuring the computer plugin
 
-The Mac side needs the relay's URL and the very same token. The plugin's `relay` block lives in the
+The computer side needs the relay's URL and the very same token. The plugin's `relay` block lives in the
 DSH profile configuration — the row's `config`, which belongs to the profile's own patch layer
 (`~/.dsh/profiles/<profile>/cordis.patch.yml`); the row itself is inserted by the plugin's bundle
 patch, so two profiles can configure Mizar independently. Confirm what actually took effect with:
@@ -546,20 +546,20 @@ relay:
 | `url` | `''` | the relay's base URL, e.g. `https://mizar.example.com`. `https://` and `wss://` are both accepted — the client translates to `wss://` for the tunnel — so the value you copy out of a browser works as-is |
 | `token` | `''` | the tunnel token, exactly the string in the relay's `tokens` list. It is sent as `Authorization: Bearer …` on the tunnel upgrade and never appears in a QR code |
 | `publicUrl` | `''` | the base URL a **phone** should be given, when it differs from `url`. Empty means "the same host as `url`" |
-| `preferLoopback` | `true` | while the tunnel is up, bind only `127.0.0.1` instead of the configured bind mode. With a tunnel the phone never needs to reach the Mac directly, so the listener stops exporting itself onto whatever network the Mac is on |
+| `preferLoopback` | `true` | while the tunnel is up, bind only `127.0.0.1` instead of the configured bind mode. With a tunnel the phone never needs to reach the computer directly, so the listener stops exporting itself onto whatever network the computer is on |
 | `reconnectBaseMs` | `1000` | first reconnect delay after the tunnel drops; doubles, with jitter, up to the cap |
 | `reconnectMaxMs` | `60000` | longest reconnect delay |
 
 ### `publicUrl`, and when you need it
 
-`publicUrl` exists for one situation: **the Mac reaches the relay by a different address than the
-phone does.** A Mac sitting on the same LAN as the relay can dial it privately, while phones on
+`publicUrl` exists for one situation: **the computer reaches the relay by a different address than the
+phone does.** A computer sitting on the same LAN as the relay can dial it privately, while phones on
 mobile data cannot:
 
 ```yaml
 relay:
   enabled: true
-  url: http://192.168.1.10:8787        # the Mac's path to the relay, over the LAN
+  url: http://192.168.1.10:8787        # the computer's path to the relay, over the LAN
   token: Zt8kQ2mR9vX4pL6cH1sB3nD7fG0jW5yA
   publicUrl: https://mizar.example.com # what the QR code must carry for phones
 ```
@@ -567,11 +567,11 @@ relay:
 With `publicUrl` empty, the phone is given the relay URL itself, with the scheme a phone needs
 (`https` when `url` is `https` or `wss`, otherwise `http`). The room is derived from the token, not
 from either URL, so both addresses lead to the same room. Note the trade-off in the example above:
-the Mac-to-relay leg is then plain `ws://` across the LAN, which is fine inside a trusted network and
+the computer-to-relay leg is then plain `ws://` across the LAN, which is fine inside a trusted network and
 not fine anywhere else — if it bothers you, point `url` at the public hostname too and keep the whole
 path inside TLS.
 
-### Sequence, and what the Mac logs
+### Sequence, and what the computer logs
 
 1. Set `relay.enabled: true` with `url` and `token`, then **restart DSH** — the listener's bind mode
    and the tunnel are both decided at start-up.
@@ -619,9 +619,9 @@ Reading it:
 | Field | Meaning |
 |---|---|
 | `ok` | the process is up and answering |
-| `rooms` | how many Macs currently have a tunnel attached. `0` with the Mac's plugin enabled means the tunnel never established — the token, or the nginx directives in 5.3 |
-| `inFlight` | phone requests and WebSocket streams waiting on a Mac right now. A number that stays above zero while nothing is happening means a stuck Mac or a stalled tunnel |
-| `version` | the tunnel protocol version, `1`. It must match what the Mac logs as "this build speaks" |
+| `rooms` | how many computers currently have a tunnel attached. `0` with the computer's plugin enabled means the tunnel never established — the token, or the nginx directives in 5.3 |
+| `inFlight` | phone requests and WebSocket streams waiting on a computer right now. A number that stays above zero while nothing is happening means a stuck computer or a stalled tunnel |
+| `version` | the tunnel protocol version, `1`. It must match what the computer logs as "this build speaks" |
 
 If the second command returns nginx's HTML error page instead of that JSON, nginx is not reaching
 the relay: check that the proxy covers `/` and that `systemctl status dsh-mizar-relay` is happy.
@@ -645,9 +645,9 @@ while nginx's own HTML 404 proves it did not. The same trick works for a room:
 curl -sS https://mizar.example.com/r/GJ31NAZY4PRH/mizar/v1/hello
 ```
 
-With the Mac connected this is the plugin's unauthenticated identity probe and answers
+With the computer connected this is the plugin's unauthenticated identity probe and answers
 `200` with something like
-`{"hostId":"…","hostName":"…","protocolVersion":1,"pairingOpen":false,"paired":true}`. With the Mac
+`{"hostId":"…","hostName":"…","protocolVersion":1,"pairingOpen":false,"paired":true}`. With the computer
 offline it is the relay's `404 {"error":"not found"}` — the same answer as a room that never
 existed, by design.
 
@@ -665,16 +665,16 @@ Then, as things happen:
 
 | Line | Meaning |
 |---|---|
-| `relay: tunnel for room <room> connected` | a Mac authenticated and attached |
-| `relay: tunnel for room <room> connected (replaced a stale one)` | the same Mac reconnected before its old socket was noticed — normal after a network blip |
+| `relay: tunnel for room <room> connected` | a computer authenticated and attached |
+| `relay: tunnel for room <room> connected (replaced a stale one)` | the same computer reconnected before its old socket was noticed — normal after a network blip |
 | `relay: tunnel for room <room> disconnected` | the tunnel closed. Repeating roughly every minute is the nginx timeout in 5.3 |
-| `relay: tunnel refused — unknown token` | a Mac presented a token that is not in the list |
+| `relay: tunnel refused — unknown token` | a computer presented a token that is not in the list |
 | `relay: tunnel for room <room> stopped answering; dropping it` | no pong inside `tunnelIdleMs`; the relay is not routing to a half-open socket any more |
-| `relay: stream refused for room <room>: <reason>` | a phone WebSocket the Mac would not accept |
+| `relay: stream refused for room <room>: <reason>` | a phone WebSocket the computer would not accept |
 | `relay: probe socket error: <message>` | the UDP probe failed to bind — usually another process on 8788 |
 | `relay: SIGTERM, shutting down` | systemd asked it to stop; it closes tunnels and exits `0` |
 
-### The panel, and the Mac's own view
+### The panel, and the computer's own view
 
 The plugin's status payload carries a `relay` object:
 
@@ -699,12 +699,12 @@ roster is still the authoritative answer to "who has access", relay or no relay.
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
-| The Mac's tunnel is refused with `401`, relay logs `tunnel refused — unknown token` | the Mac's `relay.token` is not byte-for-byte one of the relay's `tokens` | compare the two strings; watch for a trailing newline from a copy-paste, a smart quote, or a token that was rotated on one side only. Check whether `MIZAR_RELAY_TOKENS` is set in the unit file — it **replaces** the file's list, so editing `relay.config.json` then has no effect |
-| `/r/<room>/…` answers `404 {"error":"not found"}` even though the QR code scanned | the room in the URL is not the room the token derives (typo, whitespace in the token, or the token was rotated), **or** the Mac is simply offline. The relay deliberately does not distinguish these | check `rooms` in `/healthz`: `1` means a Mac is attached and the room is wrong; `0` means no Mac is attached. Cross-check the room with the `deriveRoom` one-liner in 4.3, and re-issue the QR code after the tunnel is up |
-| `/r/<room>/…` answers `502 {"error":"the Mac did not answer","detail":…}` | the tunnel is up but the plugin's local listener did not answer — DSH restarting, listener not bound, or the tunnel congested | read the Mac's DSH log; the plugin reports the local failure reason itself. A `504` here instead means the request outlived `requestTimeoutMs` |
-| The phone's WebSocket fails to connect, or opens and dies instantly; the Mac's tunnel never establishes | nginx is not upgrading the connection — `proxy_http_version 1.1` and the `Upgrade`/`Connection` pair are missing or only half present | add all three lines from 5.3 to the proxy location, `nginx -t`, `nginx -s reload`. Confirm with `/healthz`: `rooms` stays `0` while HTTPS itself works fine |
+| The computer's tunnel is refused with `401`, relay logs `tunnel refused — unknown token` | the computer's `relay.token` is not byte-for-byte one of the relay's `tokens` | compare the two strings; watch for a trailing newline from a copy-paste, a smart quote, or a token that was rotated on one side only. Check whether `MIZAR_RELAY_TOKENS` is set in the unit file — it **replaces** the file's list, so editing `relay.config.json` then has no effect |
+| `/r/<room>/…` answers `404 {"error":"not found"}` even though the QR code scanned | the room in the URL is not the room the token derives (typo, whitespace in the token, or the token was rotated), **or** the computer is simply offline. The relay deliberately does not distinguish these | check `rooms` in `/healthz`: `1` means a computer is attached and the room is wrong; `0` means no computer is attached. Cross-check the room with the `deriveRoom` one-liner in 4.3, and re-issue the QR code after the tunnel is up |
+| `/r/<room>/…` answers `502 {"error":"the computer did not answer","detail":…}` | the tunnel is up but the plugin's local listener did not answer — DSH restarting, listener not bound, or the tunnel congested | read the computer's DSH log; the plugin reports the local failure reason itself. A `504` here instead means the request outlived `requestTimeoutMs` |
+| The phone's WebSocket fails to connect, or opens and dies instantly; the computer's tunnel never establishes | nginx is not upgrading the connection — `proxy_http_version 1.1` and the `Upgrade`/`Connection` pair are missing or only half present | add all three lines from 5.3 to the proxy location, `nginx -t`, `nginx -s reload`. Confirm with `/healthz`: `rooms` stays `0` while HTTPS itself works fine |
 | The tunnel drops and reconnects about once a minute | nginx's default 60-second `proxy_read_timeout` closed a quiet socket | set `proxy_read_timeout 3600s` (and `proxy_send_timeout 3600s`), reload nginx. The relay log showing `tunnel for room … disconnected` on that rhythm is the confirmation |
-| `curl /healthz` works on 443 but the tunnel never comes up, and the Mac logs `relay: reconnecting in Ns` | as above, or the token is wrong, or `relay.enabled` is true while `url`/`token` is empty | check the Mac's log for `relay: enabled but url or token is empty — not connecting`, and compare tokens |
+| `curl /healthz` works on 443 but the tunnel never comes up, and the computer logs `relay: reconnecting in Ns` | as above, or the token is wrong, or `relay.enabled` is true while `url`/`token` is empty | check the computer's log for `relay: enabled but url or token is empty — not connecting`, and compare tokens |
 | The endpoint probe gets no answer | inbound UDP 8788 is blocked (cloud security group, host firewall), or `probePort` is `0` | open UDP 8788 in both places, or set `probePort: 0` and stop expecting a reply |
 | `413 {"error":"request body too large"}` | the request body exceeded `maxBodyBytes` | raise `maxBodyBytes` if the payload is legitimate |
 | The relay exits `1` on start with "no tunnel token configured" | `tokens` is empty, or the process is running somewhere the config file is not, or `MIZAR_RELAY_TOKENS` is set to an empty string | check `WorkingDirectory`, then the file, then the environment |
@@ -719,7 +719,7 @@ journalctl -u dsh-mizar-relay -f          # the relay's view
 tail -f /www/wwwlogs/mizar.example.com.log # nginx's view (BaoTa's log directory)
 ```
 
-The relay log says whether a Mac attached and with which room; the nginx log says whether the request
+The relay log says whether a computer attached and with which room; the nginx log says whether the request
 even arrived, and with what status.
 
 ---
@@ -733,7 +733,7 @@ session content and the agent's answers pass through the Node process as plainte
 side of nginx. The relay does not *interpret* any of it — it has no idea what a session is, and it
 never parses a Mizar frame — but "does not interpret" is not "cannot read". When you run the relay
 yourself, on your own server, that is usually exactly what you want: you are the one person who
-already has access to the Mac. It is *not* fine to hand the relay to somebody else and assume the
+already has access to the computer. It is *not* fine to hand the relay to somebody else and assume the
 tunnel protects you. That is why end-to-end encryption between the phone and the plugin is listed as
 future work: with the tunnel as it exists today there is nowhere for it to live, because the relay is
 a TLS terminator on the path.
@@ -742,7 +742,7 @@ a TLS terminator on the path.
 the phone's stored pairing, and in nginx's access log — all places a token must never appear. Knowing
 a room lets a stranger reach the plugin's two unauthenticated endpoints, `/mizar/v1/hello` and
 `/mizar/v1/pair`; `/pair` still demands a live, single-use code and is rate limited, so a room leak
-is survivable. A token leak is not: it lets somebody *be* your Mac, receive every phone request and
+is survivable. A token leak is not: it lets somebody *be* your computer, receive every phone request and
 answer as the plugin would. That asymmetry is the reason tokens live in exactly two configuration
 files and rooms are allowed to travel in QR codes.
 
@@ -756,7 +756,7 @@ arrives through a tunnel, and none of it can be bypassed by reaching the relay.
 
 - Keep `host` at `127.0.0.1` and 8787 closed to the internet (5.4). Plain HTTP on a public port puts
   the token on the wire in clear text.
-- `chmod 600 relay.config.json`, and do not commit it. One token per Mac, so revoking a Mac is
+- `chmod 600 relay.config.json`, and do not commit it. One token per computer, so revoking a computer is
   deleting one entry and restarting.
 - If others can read the unit file, keep the token out of it and use a root-only `EnvironmentFile`.
 - Treat a screenshot of the pairing QR as a room disclosure; re-issue the code afterwards rather than
@@ -779,7 +779,7 @@ can send a notification. The plugin does not have — and must not have — the 
 ships inside a plugin installed from a public registry is not a key, it is a public string.
 
 The plugin tells the relay *what happened*; the relay decides nothing. Its judgement stays where the
-evidence is, on the Mac.
+evidence is, on the computer.
 
 ### 10.1 Making the key
 
@@ -814,7 +814,7 @@ build only works against `api.sandbox.push.apple.com`, and sending it to product
 
 Which one a phone needs is a fact the *phone* has and a server cannot infer, so the app reports it
 with its registration and the relay routes each notification to the host that device's token belongs
-to. One relay therefore serves a Mac with a TestFlight phone and an Xcode phone on it at the same
+to. One relay therefore serves a computer with a TestFlight phone and an Xcode phone on it at the same
 time, with nothing to configure. `MIZAR_APNS_ENV` is kept so existing config files keep loading, and
 leaving it set either way changes nothing.
 
@@ -872,7 +872,7 @@ no `fcm` configured delivers to the iPhones and counts the Android device as fai
 the log naming the missing credential — not one per device, and never a failed notification for the
 phones that could be reached.
 
-**A room's registrations still live in memory.** Nothing about FCM changes that: see 10.6. The Mac
+**A room's registrations still live in memory.** Nothing about FCM changes that: see 10.6. The computer
 re-announces every token on every reconnect, so a relay restart — or a config change, which is also a
 restart — re-registers both platforms with nobody touching a phone.
 
@@ -886,7 +886,7 @@ curl -s localhost:8787/healthz
 `push: true` means a credential is loaded — it stays the either-or flag an existing grep already
 looks for, so it did not change meaning when FCM arrived — and `fcm` says whether the Google half is
 the one. With `push: true, fcm: false` it is the APNs half. `pushDevices` counts the phones currently
-registered. And per room, with the Mac's own tunnel credential:
+registered. And per room, with the computer's own tunnel credential:
 
 ```sh
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8787/push/v1/status
@@ -899,7 +899,7 @@ diagnostic.
 The `environment` reported per device is the one its token belongs to, and it is what the relay
 routes that device's notifications through. It is `null` on Android, where there is nothing to route.
 
-A phone appears in `pushDevices` only after its app has been granted permission and told the Mac
+A phone appears in `pushDevices` only after its app has been granted permission and told the computer
 about it — which happens on the launch *after* the operator taps Allow. If the count is zero, the
 permission was refused or the app has not been opened since. Revoking a device from the panel removes
 it here as well, so a phone the operator has just removed stops being woken immediately rather than at
@@ -986,7 +986,7 @@ token and the phone keeps receiving notifications.
 
 ### 10.6 Restarts, and why there is no database
 
-Registrations live in memory. A room's tokens are a cache of what the Mac already knows, and the Mac
+Registrations live in memory. A room's tokens are a cache of what the computer already knows, and the computer
 re-announces all of them every time its tunnel reconnects — which is exactly what happens when this
 process restarts. Persisting them here would be a second copy of a fact that has an owner, and a
 relay that came back with stale tokens would have nothing to correct them with.

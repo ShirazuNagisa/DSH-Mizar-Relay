@@ -22,7 +22,7 @@
  * the host per send. A relay that picked one host for the whole deployment
  * answered `BadDeviceToken` for every phone built the other way -- which is
  * indistinguishable from a dead token, so the registration was deleted and the
- * phone went quiet with the Mac still reporting it registered.
+ * phone went quiet with the computer still reporting it registered.
  *
  * **A Live Activity has a third kind of token.** iOS mints one per activity,
  * separate from the phone's alert token and retired when the activity ends, and
@@ -89,7 +89,7 @@ export interface ApnsNotification {
    * Per notification rather than per deployment because one room holds phones
    * that disagree: a Debug build on the desk talks to the sandbox while the
    * TestFlight build in a pocket talks to production, and both are paired to the
-   * same Mac.
+   * same computer.
    */
   readonly environment: ApnsEnvironment
   readonly title: string

@@ -1,15 +1,15 @@
 /**
- * One Mac's tunnel, and the rooms they live in.
+ * One computer's tunnel, and the rooms they live in.
  *
- * A tunnel is a single outbound WebSocket carrying every phone request that Mac
+ * A tunnel is a single outbound WebSocket carrying every phone request that computer
  * is serving. The multiplexing is deliberately thin -- an id, a promise, a timer
  * -- because the alternative, a real stream protocol with windows and flow
  * control, buys nothing for a workload that is request/response JSON.
  *
- * The behaviour that matters is what happens when the Mac goes away. A dropped
+ * The behaviour that matters is what happens when the computer goes away. A dropped
  * tunnel must fail every in-flight request *immediately*: a phone showing a
  * spinner for thirty seconds and then a timeout is indistinguishable from a
- * broken app, and the honest answer ("the Mac is not connected") is available
+ * broken app, and the honest answer ("the computer is not connected") is available
  * the moment the socket closes.
  *
  * @module dsh-mizar-relay/tunnel
@@ -27,11 +27,11 @@ export interface ReplayResult {
 
 /** Callbacks a phone WebSocket provides while it is bridged through a tunnel. */
 export interface StreamHandlers {
-  /** The Mac accepted the upgrade; the phone socket may now be accepted. */
+  /** The computer accepted the upgrade; the phone socket may now be accepted. */
   readonly onOpened: () => void
-  /** A message from the Mac. */
+  /** A message from the computer. */
   readonly onMessage: (data: Buffer, binary: boolean) => void
-  /** The Mac closed the stream. */
+  /** The computer closed the stream. */
   readonly onClose: (code: number, reason: string) => void
   /** The tunnel failed before or during the stream. */
   readonly onError: (message: string) => void
@@ -39,9 +39,9 @@ export interface StreamHandlers {
 
 /** A stream opened through the tunnel. */
 export interface TunnelStream {
-  /** Send one message toward the Mac. */
+  /** Send one message toward the computer. */
   send(data: Buffer, binary: boolean): void
-  /** Close the stream toward the Mac. */
+  /** Close the stream toward the computer. */
   close(code?: number, reason?: string): void
 }
 
@@ -95,9 +95,9 @@ const MAX_CLOSE_REASON_BYTES = 123
  * `RangeError` -- synchronously, out of `WebSocket.close()` -- for a reason
  * longer than 123 bytes. The original frame may be perfectly legal on the way
  * in (a close frame's payload is capped at 125 bytes, so this cannot arrive from
- * a conforming phone), but the Mac is the other end of the tunnel and its
+ * a conforming phone), but the computer is the other end of the tunnel and its
  * frames are not trusted: this relay accepts any well-formed credential, so
- * anyone may be a Mac.
+ * anyone may be a computer.
  *
  * The cut is made on a character boundary, because a reason truncated mid
  * codepoint decodes to U+FFFD and re-encodes to three bytes, which can push the
@@ -124,7 +124,7 @@ export function saneCloseReason(reason: string | undefined): string {
  * Keep only the string entries of a header record.
  *
  * `parseHostFrame` narrows the envelope and nothing else, so every field of a
- * frame from the Mac is a value of unknown type by the time it is used. A
+ * frame from the computer is a value of unknown type by the time it is used. A
  * headers object carrying a number would otherwise reach Node's response
  * writer, which validates header values and throws out of an async handler.
  *
@@ -149,7 +149,7 @@ function httpStatus(value: unknown): number | null {
 
 /** A tunnel that is not connected cannot serve anything. */
 export class TunnelGoneError extends Error {
-  constructor(message = 'the Mac is not connected to the relay') {
+  constructor(message = 'the computer is not connected to the relay') {
     super(message)
     this.name = 'TunnelGoneError'
   }
@@ -157,13 +157,13 @@ export class TunnelGoneError extends Error {
 
 /** A request that outlived its deadline. */
 export class TunnelTimeoutError extends Error {
-  constructor(message = 'the Mac did not answer in time') {
+  constructor(message = 'the computer did not answer in time') {
     super(message)
     this.name = 'TunnelTimeoutError'
   }
 }
 
-/** The transport a room speaks to its Mac over. */
+/** The transport a room speaks to its computer over. */
 export interface TunnelSocket {
   send(text: string): void
   close(code?: number, reason?: string): void
@@ -173,7 +173,7 @@ export interface TunnelSocket {
   readonly bufferedAmount: number
 }
 
-/** One Mac's tunnel. */
+/** One computer's tunnel. */
 export class Tunnel {
   readonly #socket: TunnelSocket
   readonly #requestTimeoutMs: number
@@ -186,8 +186,8 @@ export class Tunnel {
 
   /**
    * @param socket - the host's WebSocket, already authenticated.
-   * @param requestTimeoutMs - how long a request may wait for the Mac.
-   * @param maxBufferedBytes - drop rather than queue past this, so one slow Mac
+   * @param requestTimeoutMs - how long a request may wait for the computer.
+   * @param maxBufferedBytes - drop rather than queue past this, so one slow computer
    *   cannot grow the relay's memory without bound.
    */
   constructor(socket: TunnelSocket, requestTimeoutMs: number, maxBufferedBytes = 8 * 1024 * 1024) {
@@ -205,15 +205,15 @@ export class Tunnel {
     return !this.#closed
   }
 
-  /** How many phone requests are waiting on the Mac right now. */
+  /** How many phone requests are waiting on the computer right now. */
   get inFlight(): number {
     return this.#pendingRequests.size + this.#pendingStreams.size
   }
 
   /**
-   * Ask the Mac to prove it is still there.
+   * Ask the computer to prove it is still there.
    *
-   * A tunnel can be half-open -- the Mac's process is gone, or a NAT mapping
+   * A tunnel can be half-open -- the computer's process is gone, or a NAT mapping
    * expired, and nothing has noticed because no traffic was flowing. Without
    * this the relay would keep routing to a socket that accepts writes and never
    * answers, and every phone request would spend its full timeout learning that.
@@ -225,7 +225,7 @@ export class Tunnel {
   }
 
   /**
-   * Whether the Mac has answered recently enough to keep serving.
+   * Whether the computer has answered recently enough to keep serving.
    * @param idleMs - how long silence is tolerated.
    * @returns whether the tunnel is still considered live.
    */
@@ -234,15 +234,15 @@ export class Tunnel {
   }
 
   /**
-   * Send one request to the Mac and wait for its answer.
+   * Send one request to the computer and wait for its answer.
    *
    * @param method - the HTTP method.
    * @param path - the Mizar path, including its `/mizar/v1` prefix.
    * @param headers - request headers to carry through.
    * @param body - base64 body, or `null`.
-   * @returns the Mac's answer.
+   * @returns the computer's answer.
    * @throws {TunnelGoneError} when the tunnel is not connected.
-   * @throws {TunnelTimeoutError} when the Mac does not answer in time.
+   * @throws {TunnelTimeoutError} when the computer does not answer in time.
    */
   async request(
     method: string,
@@ -288,7 +288,7 @@ export class Tunnel {
     const id = this.#allocate()
     const timer = setTimeout(() => {
       if (this.#pendingStreams.delete(id)) {
-        handlers.onError('the Mac did not accept the stream in time')
+        handlers.onError('the computer did not accept the stream in time')
       }
     }, this.#requestTimeoutMs)
     timer.unref?.()
@@ -344,7 +344,7 @@ export class Tunnel {
     }
   }
 
-  /** Route one frame from the Mac. */
+  /** Route one frame from the computer. */
   #receive(text: string): void {
     const frame = parseHostFrame(text)
     if (frame === null) return
@@ -379,7 +379,7 @@ export class Tunnel {
         if (stream === undefined) return
         // `Buffer.from(5, 'base64')` throws a TypeError, and this runs inside
         // the tunnel socket's `message` handler, where nothing catches it: one
-        // malformed frame from one Mac would take the whole relay down.
+        // malformed frame from one computer would take the whole relay down.
         if (typeof frame.data !== 'string') return
         stream.onMessage(Buffer.from(frame.data, 'base64'), frame.binary === true)
         return
@@ -389,7 +389,7 @@ export class Tunnel {
         return
       }
       case 'error': {
-        const message = typeof frame.message === 'string' ? frame.message : 'the Mac reported an error'
+        const message = typeof frame.message === 'string' ? frame.message : 'the computer reported an error'
         const request = this.#pendingRequests.get(id)
         if (request !== undefined) {
           clearTimeout(request.timer)
@@ -426,7 +426,7 @@ export class Tunnel {
    * Fail everything outstanding.
    *
    * Called on close and on error. Every waiter is settled here rather than left
-   * to its own timer, because "the Mac disconnected" is known now and a phone
+   * to its own timer, because "the computer disconnected" is known now and a phone
    * should not spend the next thirty seconds learning it.
    *
    * @param reason - what to tell the waiters.
@@ -453,7 +453,7 @@ export class Tunnel {
 export class RoomRegistry {
   readonly #rooms = new Map<string, Tunnel>()
 
-  /** How many Macs are connected. */
+  /** How many computers are connected. */
   get size(): number {
     return this.#rooms.size
   }
@@ -463,7 +463,7 @@ export class RoomRegistry {
     return [...this.#rooms.keys()]
   }
 
-  /** Phone requests waiting on a Mac right now, across every room. */
+  /** Phone requests waiting on a computer right now, across every room. */
   get inFlight(): number {
     let total = 0
     for (const tunnel of this.#rooms.values()) total += tunnel.inFlight
@@ -473,9 +473,9 @@ export class RoomRegistry {
   /**
    * Attach a tunnel to a room, replacing any previous one.
    *
-   * A Mac that reconnects after a network blip arrives as a new socket while the
+   * A computer that reconnects after a network blip arrives as a new socket while the
    * old one may still be half-open. Replacing is right: the newer connection is
-   * the one the Mac is listening on, and keeping both would split phone requests
+   * the one the computer is listening on, and keeping both would split phone requests
    * across two sockets where only one is read.
    *
    * @param room - the room id.

@@ -4,14 +4,14 @@
  * The room is what a phone puts in its URL, so it travels: into a QR code, into
  * the app's stored pairing, into a reverse proxy's access log. The tunnel token
  * does none of that -- it is the capability that lets a process attach itself as
- * somebody's Mac, and it stays in the plugin's config and the relay's config.
+ * somebody's computer, and it stays in the plugin's config and the relay's config.
  *
  * Separating the two is the point. A leaked room lets a stranger reach a
  * plugin's unauthenticated endpoints, which are two: `/hello` and `/pair`, and
  * `/pair` still demands a live single-use code and is rate limited. A leaked
- * token would let a stranger *be* the Mac.
+ * token would let a stranger *be* the computer.
  *
- * The relay derives the room and tells the Mac; the Mac never invents one. That
+ * The relay derives the room and tells the computer; the computer never invents one. That
  * is why this function exists in exactly one package.
  *
  * @module dsh-mizar-relay/room

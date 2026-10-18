@@ -195,7 +195,7 @@ describe('Tunnel streams', () => {
     expect(tunnel.inFlight).toBe(0)
   })
 
-  it('reports a stream the Mac never accepted', async () => {
+  it('reports a stream the computer never accepted', async () => {
     const socket = new FakeSocket()
     const tunnel = makeTunnel(socket, 20)
     const onError = vi.fn()
@@ -209,7 +209,7 @@ describe('Tunnel streams', () => {
     expect(onError).toHaveBeenCalledWith(expect.stringContaining('did not accept'))
   })
 
-  it('drops a stream when the Mac reports an error for it', () => {
+  it('drops a stream when the computer reports an error for it', () => {
     const socket = new FakeSocket()
     const tunnel = makeTunnel(socket)
     const onError = vi.fn()
@@ -227,12 +227,12 @@ describe('Tunnel streams', () => {
 })
 
 /**
- * The Mac is the far end of a tunnel that anyone may attach in the relay's
+ * The computer is the far end of a tunnel that anyone may attach in the relay's
  * normal open-registration mode, so every frame it sends arrives from the wire.
  * A frame that is merely the wrong shape must not be able to take the relay
  * down for every other room.
  */
-describe('frames from the Mac are not trusted', () => {
+describe('frames from the computer are not trusted', () => {
   it('survives a stream message whose data is not a string', () => {
     const socket = new FakeSocket()
     const tunnel = makeTunnel(socket)

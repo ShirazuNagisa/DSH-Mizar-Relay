@@ -55,3 +55,8 @@ npm start             # 用 relay.config.json 起一个本地实例
 | `deploy/` | 打包进 bundle 的部署材料（install.sh、nginx 片段、selftest、说明） |
 | `deploy/pack.sh` | 打 bundle 的脚本 |
 | `docs/deployment.md` | 部署参考 |
+
+## 许可
+
+本项目以 **GNU General Public License v3.0**（GPLv3，SPDX：`GPL-3.0-only`）发布。
+许可证全文见 [LICENSE](LICENSE)。

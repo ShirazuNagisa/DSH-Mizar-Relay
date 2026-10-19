@@ -7,8 +7,13 @@
 # fetch. That is the point -- a server in China fetching from the npm registry is
 # a step that can fail for reasons that have nothing to do with this software.
 #
-# Usage:  sudo ./install.sh [install-dir]
+# Usage:  sudo [MIZAR_ROLE=0|1] ./install.sh [install-dir]
 # Default install dir: /www/wwwroot/dsh-mizar-relay
+#
+# Role 1 (the account/paid relay) generates an admin password, an internal
+# report secret, and enables the account service. Role 0 (the free relay)
+# leaves accounts off and, when MIZAR_ACCOUNT_REPORT_TO is set, reports traffic
+# to the account relay. Re-running the installer keeps the existing config.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,13 +104,82 @@ for entry in "$HERE"/app/*; do
   if [ "$name" = "relay.config.json" ]; then continue; fi
   cp -R "$entry" "$TARGET/"
 done
+NEW_CONFIG=0
 if [ -f "$TARGET/relay.config.json" ]; then
   say "copied the server to $TARGET (kept the existing relay.config.json)"
 else
   cp "$HERE/app/relay.config.json" "$TARGET/"
+  NEW_CONFIG=1
   say "copied the server to $TARGET"
 fi
 
+chmod 600 "$TARGET/relay.config.json"
+
+# --- data directory ---------------------------------------------------------
+#
+# accounts.json, invites.json, traffic.json and audit.log live here. The systemd
+# unit's ProtectSystem=strict makes everything else read-only, so this one path
+# is the only writable place the service has.
+DATA_DIR="$TARGET/data"
+mkdir -p "$DATA_DIR"
+chmod 700 "$DATA_DIR"
+
+# --- account service --------------------------------------------------------
+#
+# A fresh role=1 install needs three secrets nobody should have to hand-write:
+# the admin password/hash, the relay-to-relay report secret, and the App Store
+# product id. They are generated here, printed once, and written into the
+# root-only config. A re-run keeps the existing config: changing the admin
+# password or the report secret is an explicit operation, not an upgrade side
+# effect.
+if [ "$NEW_CONFIG" -eq 1 ]; then
+  ROLE="${MIZAR_ROLE:-0}"
+  case "$ROLE" in
+    0|1) ;;
+    *) fail "MIZAR_ROLE must be 0 (free) or 1 (paid/account), got '$ROLE'" ;;
+  esac
+  if [ "$ROLE" = "1" ]; then
+    SECRET_JSON="$("$NODE_BIN" "$TARGET/lib/accounts/cli.js" admin-secret)"
+    ADMIN_PASSWORD="$(printf '%s' "$SECRET_JSON" | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).password))')"
+    ADMIN_HASH="$(printf '%s' "$SECRET_JSON" | "$NODE_BIN" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).hash))')"
+    INTERNAL_SECRET="${MIZAR_ACCOUNT_INTERNAL_SECRET:-$("$NODE_BIN" -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')}"
+    PUBLIC_BASE_URL="${MIZAR_PUBLIC_BASE_URL:-https://dshmizar-1.shirazu-nagisa.com}"
+    APPSTORE_PRODUCT_ID="${MIZAR_APPSTORE_PRODUCT_ID:-me.shirazu.dshmizar.paid.monthly}"
+    GRAVATAR_URLS="${MIZAR_GRAVATAR_BASE_URLS:-https://gravatar.loli.net,https://cn.cravatar.com,https://www.gravatar.com}"
+    "$NODE_BIN" "$TARGET/lib/accounts/cli.js" configure       --config "$TARGET/relay.config.json"       --role 1       --enable-accounts       --data-dir "$DATA_DIR"       --admin-password-hash "$ADMIN_HASH"       --internal-secret "$INTERNAL_SECRET"       --report-id "${MIZAR_ACCOUNT_REPORT_ID:-primary-1}"       --public-base-url "$PUBLIC_BASE_URL"       --product-id "$APPSTORE_PRODUCT_ID"       --gravatar-base-urls "$GRAVATAR_URLS" >/dev/null
+    say "account service enabled (role=1)"
+    printf '
+  ┌──────────────────────────────────────────────────────────────┐
+'
+    printf '  │  ADMIN PASSWORD (shown once, save it now):                   │
+'
+    printf '  │  %-60s│
+' "$ADMIN_PASSWORD"
+    printf '  └──────────────────────────────────────────────────────────────┘
+
+'
+    printf '  Internal report secret: %s
+
+' "$INTERNAL_SECRET"
+  else
+    REPORT_TO="${MIZAR_ACCOUNT_REPORT_TO:-}"
+    INTERNAL_SECRET="${MIZAR_ACCOUNT_INTERNAL_SECRET:-}"
+    ARGS=(--config "$TARGET/relay.config.json" --role 0 --disable-accounts --data-dir "$DATA_DIR" --report-id "${MIZAR_ACCOUNT_REPORT_ID:-primary-0}")
+    [ -n "$REPORT_TO" ] && ARGS+=(--report-to "$REPORT_TO")
+    [ -n "$INTERNAL_SECRET" ] && ARGS+=(--internal-secret "$INTERNAL_SECRET")
+    "$NODE_BIN" "$TARGET/lib/accounts/cli.js" configure "${ARGS[@]}" >/dev/null
+    say "free relay configured (role=0, accounts off)"
+    if [ -n "$REPORT_TO" ]; then say "traffic will be reported to $REPORT_TO"; fi
+  fi
+else
+  say "existing relay.config.json kept; role/accounts were not changed"
+  if [ "${MIZAR_ROLE:-}" = "1" ]; then
+    say "to enable accounts: generate a password with"
+    say "  $NODE_BIN $TARGET/lib/accounts/cli.js admin-secret"
+    say "then merge the hash with:"
+    say "  $NODE_BIN $TARGET/lib/accounts/cli.js configure --config $TARGET/relay.config.json --role 1 --enable-accounts --data-dir $DATA_DIR --admin-password-hash '<hash>' --internal-secret '<secret>' --report-id primary-1 --public-base-url https://dshmizar-1.shirazu-nagisa.com"
+  fi
+fi
 chmod 600 "$TARGET/relay.config.json"
 
 # --- token ------------------------------------------------------------------
@@ -135,13 +209,14 @@ Restart=always
 RestartSec=3
 User=root
 
-# The relay only needs to listen on loopback and open outbound connections.
-# It writes nothing, so it is given nothing to write to.
+# The relay listens on loopback and opens outbound connections. The account
+# service writes only its data directory; everything else stays read-only.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/
+ReadWritePaths=$DATA_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -195,5 +270,16 @@ $(printf '=%.0s' {1..40})
 
   Logs:  journalctl -u dsh-mizar-relay -f
   Stop:  systemctl stop dsh-mizar-relay
+
+  Account service (role=1 only):
+
+    https://<your-domain>/admin
+    https://<your-domain>/account/v1/*
+
+  The admin password was printed above if this was a fresh role=1 install.
+  It is stored only as a scrypt hash in relay.config.json (mode 600).
+  For the free relay, set MIZAR_ACCOUNT_REPORT_TO and the same
+  MIZAR_ACCOUNT_INTERNAL_SECRET before installing an existing config, or edit
+  the accounts block with \`lib/accounts/cli.js configure\`.
 
 DONE

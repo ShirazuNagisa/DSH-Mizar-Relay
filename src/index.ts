@@ -25,9 +25,16 @@ import type { Duplex } from 'node:stream'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
+import { AccountApi } from './accounts/api.js'
+import { AdminApi } from './accounts/admin.js'
+import { identityFor, isPrivateHeader } from './accounts/identity.js'
+import { parseHash } from './accounts/passwords.js'
+import { AccountStore } from './accounts/store.js'
+import { TrafficLedger, isValidDay, isValidIdentity } from './accounts/traffic.js'
 import { clientAddress } from './client-address.js'
 import { loadConfig, type RelayConfig } from './config.js'
 import { FcmClient } from './fcm.js'
+import { parseJsonObject, readBody, writeJson } from './http.js'
 import { deliver, PushRegistry, readDevice, readNotification } from './push.js'
 import { deriveRoom, secretsEqual } from './room.js'
 import { RoomRegistry, Tunnel, saneCloseCode, type TunnelStream } from './tunnel.js'
@@ -37,6 +44,9 @@ import {
   TUNNEL_PROTOCOL_VERSION,
   splitRoomPath,
 } from './protocol.js'
+
+/** The relay's own version, for the admin settings page. */
+const RELAY_VERSION = '0.2.4'
 
 /** Path prefix of the push API. */
 const PUSH_PREFIX = '/push/v1/'
@@ -68,17 +78,12 @@ export interface Relay {
   close(): Promise<void>
 }
 
-/** Read a request body, refusing anything past the cap. */
-async function readBody(request: IncomingMessage, limit: number): Promise<Buffer | null> {
-  const chunks: Buffer[] = []
-  let total = 0
-  for await (const chunk of request) {
-    const buffer = chunk as Buffer
-    total += buffer.length
-    if (total > limit) return null
-    chunks.push(buffer)
-  }
-  return Buffer.concat(chunks)
+/** Injectable dependencies, used by tests to keep clocks and networks still. */
+export interface RelayDependencies {
+  readonly now?: () => number
+  readonly fetchImpl?: typeof fetch
+  readonly passwordParams?: import('./accounts/passwords.js').ScryptParams
+  readonly appstoreRoots?: readonly string[]
 }
 
 /** The headers worth carrying to the computer: everything that describes the request. */
@@ -86,6 +91,7 @@ function forwardableHeaders(request: IncomingMessage): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [name, value] of Object.entries(request.headers)) {
     if (HOP_BY_HOP.has(name.toLowerCase())) continue
+    if (isPrivateHeader(name)) continue
     if (typeof value === 'string') out[name] = value
     else if (Array.isArray(value)) out[name] = value.join(', ')
   }
@@ -160,6 +166,7 @@ function createFcmOrWarn(
 export async function startRelay(
   config: RelayConfig,
   log: (message: string) => void = console.log,
+  deps: RelayDependencies = {},
 ): Promise<Relay> {
   const rooms = new RoomRegistry()
   /** Live tunnels per source address. Not a security boundary, a resource one. */
@@ -188,6 +195,78 @@ export async function startRelay(
   /** Phone sockets (or in-flight upgrades) held by each room, for the per-room cap. */
   const phoneSlots = new Map<string, number>()
 
+  // The account service and the traffic ledger are created before the HTTP
+  // server so every route below closes over the same instance. A relay with
+  // accounts disabled still has a ledger when it is configured to report to the
+  // account relay; it simply keeps it in memory and stores no files.
+  const accountsConfig = config.accounts
+  if (accountsConfig?.enabled === true && parseHash(accountsConfig.adminPasswordHash) === null) {
+    throw new Error(
+      'accounts.enabled requires a valid adminPasswordHash; run the installer or the account CLI to generate one',
+    )
+  }
+  const accountStore =
+    accountsConfig?.enabled === true
+      ? await AccountStore.open({
+          dataDir: accountsConfig.dataDir,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
+          ...(deps.passwordParams === undefined ? {} : { passwordParams: deps.passwordParams }),
+          ...(deps.appstoreRoots === undefined ? {} : { appstoreRoots: deps.appstoreRoots }),
+          gravatar: accountsConfig.gravatar,
+          apple: {
+            audiences: accountsConfig.appleAudiences,
+            keysURL: accountsConfig.appleKeysURL,
+          },
+          appstore: {
+            bundleId: accountsConfig.appstore.bundleId,
+            productId: accountsConfig.appstore.productId,
+            allowSandbox: accountsConfig.appstore.allowSandbox,
+          },
+          log,
+        })
+      : null
+  const traffic = await TrafficLedger.open({
+    dataDir: accountsConfig?.enabled === true ? accountsConfig.dataDir : null,
+    relayId: accountsConfig?.reportId === undefined || accountsConfig.reportId === ''
+      ? `relay-${config.role}`
+      : accountsConfig.reportId,
+    role: config.role,
+    reportTo: accountsConfig?.reportTo ?? '',
+    internalSecret: accountsConfig?.internalSecret ?? '',
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+    ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
+    log,
+  })
+  accountStore?.setTrafficRemover((hashes) => {
+    for (const hash of hashes) traffic.remove(`account:${hash}`)
+  })
+  const accountApi =
+    accountStore === null
+      ? null
+      : new AccountApi({
+          store: accountStore,
+          trustProxy: config.trustProxy,
+          notificationsEnabled: accountsConfig?.appstore.notificationsEnabled ?? true,
+          log,
+        })
+  const adminApi =
+    accountStore === null || accountsConfig === null
+      ? null
+      : new AdminApi({
+          store: accountStore,
+          traffic,
+          passwordHash: accountsConfig.adminPasswordHash,
+          role: config.role,
+          dataDir: accountsConfig.dataDir,
+          publicBaseURL: accountsConfig.publicBaseURL,
+          bundleId: accountsConfig.appstore.bundleId,
+          productId: accountsConfig.appstore.productId,
+          version: RELAY_VERSION,
+          trustProxy: config.trustProxy,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+        })
+
   const server: Server = createServer((request, response) => {
     void handleHttp(request, response).catch(() => {
       if (!response.headersSent) response.writeHead(500)
@@ -210,6 +289,8 @@ export async function startRelay(
         push: pushEnabled,
         fcm: fcm !== null,
         version: TUNNEL_PROTOCOL_VERSION,
+        role: config.role,
+        accounts: accountStore !== null,
       })
       return
     }
@@ -219,6 +300,31 @@ export async function startRelay(
     // a computer.
     if (url.startsWith(PUSH_PREFIX)) {
       await handlePush(request, response, url.slice(PUSH_PREFIX.length).split('?')[0] ?? '')
+      return
+    }
+
+    // The account API and the admin UI are answered here, never replayed to a
+    // computer. The paths are reserved whether or not this relay serves them, so
+    // a free relay answers 404 instead of leaking the request into a room.
+    const parsedUrl = new URL(url, 'http://relay.invalid')
+    if (parsedUrl.pathname.startsWith('/account/v1/')) {
+      if (accountApi === null) {
+        writeJson(response, 404, { error: 'not found' })
+      } else {
+        await accountApi.handle(request, response, parsedUrl)
+      }
+      return
+    }
+    if (parsedUrl.pathname === '/internal/v1/traffic') {
+      await handleTrafficReport(request, response)
+      return
+    }
+    if (parsedUrl.pathname === '/admin' || parsedUrl.pathname.startsWith('/admin/')) {
+      if (adminApi === null) {
+        writeJson(response, 404, { error: 'not found' })
+      } else {
+        await adminApi.handle(request, response, parsedUrl)
+      }
       return
     }
 
@@ -236,6 +342,12 @@ export async function startRelay(
       return
     }
 
+    const peer = clientAddress(request.socket.remoteAddress, request.headers, config.trustProxy !== false)
+    const identity = identityFor(request.headers, {
+      room: split.room,
+      peer,
+      userAgent: request.headers['user-agent'] ?? '',
+    })
     const body = await readBody(request, config.maxBodyBytes)
     if (body === null) {
       writeJson(response, 413, { error: 'request body too large' })
@@ -265,6 +377,7 @@ export async function startRelay(
         return
       }
       const payload = result.body === null ? Buffer.alloc(0) : Buffer.from(result.body, 'base64')
+      traffic.record(identity.key, body.length, carried)
       response.writeHead(result.status, {
         ...result.headers,
         'content-length': String(payload.length),
@@ -274,6 +387,67 @@ export async function startRelay(
       const message = error instanceof Error ? error.message : String(error)
       writeJson(response, 502, { error: 'the computer did not answer', detail: message })
     }
+  }
+
+  /**
+   * Accept one traffic report from another relay.
+   *
+   * This is the only account-ish route without a user session: it is
+   * authenticated by the shared internal secret, carries no personal data beyond
+   * the already-hashed identity keys, and is small and idempotent (counters add).
+   */
+  async function handleTrafficReport(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (
+      accountsConfig === null ||
+      accountsConfig.internalSecret === '' ||
+      request.method !== 'POST'
+    ) {
+      writeJson(response, 404, { error: 'not found' })
+      return
+    }
+    const presented = bearerToken(request)
+    if (presented === null || !secretsEqual(presented, accountsConfig.internalSecret)) {
+      writeJson(response, 401, { error: 'the internal secret is required' })
+      return
+    }
+    const raw = await readBody(request, 1024 * 1024)
+    if (raw === null) {
+      writeJson(response, 413, { error: 'report too large' })
+      return
+    }
+    const parsed = parseJsonObject(raw.toString('utf8'))
+    if (parsed === null) {
+      writeJson(response, 400, { error: 'a JSON object is required' })
+      return
+    }
+    const relayId = typeof parsed['relayId'] === 'string' ? parsed['relayId'] : ''
+    const role = parsed['role']
+    const entries = parsed['entries']
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(relayId) || (role !== 0 && role !== 1) || !Array.isArray(entries)) {
+      writeJson(response, 400, { error: 'relayId, role and entries are required' })
+      return
+    }
+    if (entries.length > 500) {
+      writeJson(response, 413, { error: 'at most 500 entries per report' })
+      return
+    }
+    const clean = entries.flatMap((entry) => {
+      if (typeof entry !== 'object' || entry === null) return []
+      const record = entry as Record<string, unknown>
+      const identity = record['identity']
+      const day = record['day']
+      const bytesIn = record['in']
+      const bytesOut = record['out']
+      if (!isValidIdentity(identity) || !isValidDay(day)) return []
+      if (typeof bytesIn !== 'number' || typeof bytesOut !== 'number') return []
+      if (!Number.isFinite(bytesIn) || !Number.isFinite(bytesOut) || bytesIn < 0 || bytesOut < 0) return []
+      return [{ identity, day, in: bytesIn, out: bytesOut }]
+    })
+    traffic.ingest({ relayId, role, entries: clean })
+    writeJson(response, 200, { ok: true, accepted: clean.length })
   }
 
   /**
@@ -420,6 +594,13 @@ export async function startRelay(
       return
     }
 
+    const peer = clientAddress(request.socket.remoteAddress, request.headers, config.trustProxy !== false)
+    const identity = identityFor(request.headers, {
+      room: split.room,
+      peer,
+      userAgent: request.headers['user-agent'] ?? '',
+    })
+
     // `maxClientsPerRoom` is the only bound on how many sockets one room holds,
     // and it counts the ones still waiting for the computer as well as the bridged
     // ones: the upgrade is deferred, so a room with a slow computer would otherwise
@@ -496,7 +677,7 @@ export async function startRelay(
         socket.removeListener('error', onSocketGone)
         wss.handleUpgrade(request, socket, head, (phone: WebSocket) => {
           opened.phone = phone
-          bridgePhone(phone, stream)
+          bridgePhone(phone, stream, identity)
         })
       },
       onError: (message) => {
@@ -532,6 +713,7 @@ export async function startRelay(
           )
           return
         }
+        traffic.record(identity.key, 0, data.length)
         opened.phone?.send(data, { binary })
       },
       onClose: (code, reason) => {
@@ -552,13 +734,18 @@ export async function startRelay(
   })
 
   /** Move bytes between a phone WebSocket and its tunnel stream. */
-  function bridgePhone(phone: WebSocket, stream: TunnelStream): void {
+  function bridgePhone(
+    phone: WebSocket,
+    stream: TunnelStream,
+    identity: ReturnType<typeof identityFor>,
+  ): void {
     phone.on('message', (data: Buffer, isBinary: boolean) => {
       if (data.length > config.maxMessageBytes) {
         phone.close(1009, 'message too large')
         stream.close(1009, 'message too large')
         return
       }
+      traffic.record(identity.key, data.length, 0)
       stream.send(Buffer.isBuffer(data) ? data : Buffer.from(String(data)), isBinary)
     })
     phone.on('close', (code: number, reason: Buffer) => {
@@ -713,6 +900,8 @@ export async function startRelay(
     port: boundPort,
     close: async () => {
       clearInterval(sweeper)
+      await traffic.close()
+      await accountStore?.close()
       for (const entry of waiting) clearTimeout(entry.timer)
       waiting.clear()
       rooms.closeAll()
@@ -763,19 +952,6 @@ function startProbe(config: RelayConfig, log: (message: string) => void): UdpSoc
   return socket
 }
 
-/** Write a JSON response. */
-function writeJson(response: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body)
-  response.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload),
-    'cache-control': 'no-store',
-  })
-  response.end(payload)
-}
-
-export { loadConfig, deriveRoom, splitRoomPath, ROOM_PREFIX }
-
 /**
  * Start from configuration, or exit with the reason.
  *
@@ -793,14 +969,19 @@ export function main(): void {
     return
   }
 
-  void startRelay(config).then((relay) => {
-    const shutdown = (signal: string): void => {
-      console.log(`relay: ${signal}, shutting down`)
-      void relay.close().then(() => process.exit(0))
-    }
-    process.on('SIGTERM', () => shutdown('SIGTERM'))
-    process.on('SIGINT', () => shutdown('SIGINT'))
-  })
+  void startRelay(config)
+    .then((relay) => {
+      const shutdown = (signal: string): void => {
+        console.log(`relay: ${signal}, shutting down`)
+        void relay.close().then(() => process.exit(0))
+      }
+      process.on('SIGTERM', () => shutdown('SIGTERM'))
+      process.on('SIGINT', () => shutdown('SIGINT'))
+    })
+    .catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : String(error))
+      process.exit(1)
+    })
 }
 
 // Run when invoked directly, stay importable when a test wants a relay.

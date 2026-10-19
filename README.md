@@ -14,6 +14,26 @@
                               └─ 推送：/push/v1/notify ──▶ Apple (APNs) ──▶ 手机
 ```
 
+## 账户服务、角色与 App Store 订阅
+
+从 0.2.4 起，中继可以承担账户服务：
+
+- `role: 0` 是免费中继（主力0），`role: 1` 是付费/账户中继（主力1）。
+  role 只用于标记和流量归属，**不会拒绝隧道连接**。
+- `accounts.enabled: true` 的中继提供：
+  - `/account/v1/*`：注册、登录、Apple 登录、邀请码兑换、App Store 订阅校验
+  - `/admin`：用户/游客/流量/邀请码/设置后台（管理员密码 + HttpOnly cookie + CSRF）
+  - 汇总流量：主力0 每 30 秒把身份计数上报到主力1
+- 账户数据只写入配置的 `dataDir`（`accounts.json`、`invites.json`、
+  `traffic.json`、`audit.log`），不进入代码仓库。
+- 付费账户有两种来源：**App Store 月度自动续期订阅**（StoreKit 2，价格在
+  App Store Connect 设置）和**邀请码/后台授予**；两者独立记账，取较晚到期时间。
+- 邮箱注册账户最多 2 台设备；Apple 登录账户不限设备。
+- Gravatar 在主力1 不可直连时使用镜像链，全部失败回退哈希生成头像。
+
+主力1 的完整配置、nginx/证书、App Store Connect 清单和备份说明见
+[docs/deployment.md](docs/deployment.md) 第 11 节。
+
 ## 部署
 
 打包成一个自包含的 bundle，然后在服务器上装：
@@ -38,7 +58,7 @@ bundle 里已经带好编译后的 `lib/`、唯一依赖 `ws`、`install.sh`（�
 
 ```sh
 npm install
-npm test              # 164 个测试
+npm test              # 200+ 个测试
 npm run typecheck
 npm run build         # tsc → lib/（lib/ 不进仓库，bundle 里才有）
 npm start             # 用 relay.config.json 起一个本地实例

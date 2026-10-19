@@ -15,6 +15,22 @@
 
 ---
 
+## 账户服务（可选）
+
+从 0.2.4 起，中继可以承担账户服务：
+
+- 主力1（付费/账户中继）用 `sudo MIZAR_ROLE=1 ./install.sh` 安装，安装器会生成
+  管理员密码、内部上报密钥，启用 `/account/v1/*`、`/admin` 和流量汇总，并把
+  密码只打印一次。
+- 主力0（免费中继）用 `sudo MIZAR_ROLE=0 ./install.sh`，保持 accounts 关闭；
+  在 `app/relay.config.json` 的 `accounts` 块填 `reportTo`（主力1 地址）、
+  `reportId: "primary-0"`、与主力1 相同的 `internalSecret`。
+- 账户数据只写入安装目录的 `data/`（accounts.json / invites.json / traffic.json /
+  audit.log），systemd unit 只给这个目录写权限。
+- App Store 月度订阅由 Server 端校验 Apple 签名，App Store Connect 的
+  Product ID 必须与 `accounts.appstore.productId`、iOS 常量一致。
+- 完整配置、nginx/证书、App Store Connect 清单见 `DEPLOYMENT-FULL.md` 第 11 节。
+
 ## 推送（APNs）
 
 中继还负责把「审批/提问/跑完」的推送转给 Apple——手机不在前台时的通知走这条路，

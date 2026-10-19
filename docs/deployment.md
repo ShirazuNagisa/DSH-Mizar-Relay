@@ -66,11 +66,11 @@ Two deliberate behaviours are worth knowing before you debug anything:
 
 | | |
 |---|---|
-| **Server** | a public IPv4 address that does not change. Any small VPS is enough — the relay stores nothing, runs one Node process and holds a handful of sockets |
-| **Node** | 20 or newer, from [`relay/package.json`](../relay/package.json) `engines`. Check with `node --version` |
+| **Server** | a public IPv4 address that does not change. Any small VPS is enough — a free relay stores nothing; the account relay stores JSON files under its data directory and runs the same one Node process |
+| **Node** | 20 or newer, from [`relay/package.json`](../relay/package.json) `engines`. Node 24 LTS is recommended for the account relay. Check with `node --version` |
 | **Domain** | one name with an `A` record pointing at the server, e.g. `mizar.example.com` |
 | **TLS** | a certificate for that name. This guide uses Let's Encrypt through BaoTa; any certificate that nginx can load works |
-| **Disk** | tens of megabytes. The configuration is a text file, not a database |
+| **Disk** | tens of megabytes for the tunnel; the account service stores JSON files under its data directory (accounts, invites, traffic) and needs a writable path |
 | **Network** | inbound TCP 443 (and TCP 80 for the certificate), optionally inbound UDP 8788 for the probe |
 | **On the computer** | the `dsh-mizar` plugin already installed and working, and the tunnel token in its own config (section 6) |
 
@@ -263,6 +263,17 @@ Every key, its environment override and its default — the authoritative list, 
 | `maxRooms` | `MIZAR_RELAY_MAX_ROOMS` | `10000` | rooms served at once, and push rooms remembered. The only bound on either map |
 | `maxTunnelsPerIp` | `MIZAR_RELAY_MAX_TUNNELS_PER_IP` | `4` | tunnels one source address may hold. A resource guard, not authentication. Behind the loopback reverse proxy the address is the client's, from `X-Real-IP` (see `trustProxy`); before 0.2.3 this counted the proxy and was effectively a global cap of four |
 | `probePort` | `MIZAR_RELAY_PROBE_PORT` | `8788` | UDP port for the endpoint probe; `0` disables it and opens no socket at all |
+| `role` | `MIZAR_RELAY_ROLE` | `0` | `0` = free relay, `1` = paid/account relay. A label used by the account service and traffic reports; it never rejects a connection |
+| `accounts` | — | absent | Account service block. Only the account relay (主力1) enables it. Every field is optional; see section 11 |
+| `accounts.enabled` | `MIZAR_ACCOUNTS_ENABLED` | `false` | Serve `/account/v1/*`, `/admin`, and aggregate traffic |
+| `accounts.dataDir` | `MIZAR_ACCOUNTS_DATA_DIR` | `./data` | directory for accounts.json/invites.json/traffic.json/audit.log |
+| `accounts.adminPasswordHash` | `MIZAR_ADMIN_PASSWORD_HASH` | — | scrypt hash printed by `lib/accounts/cli.js admin-secret`; required when enabled |
+| `accounts.internalSecret` | `MIZAR_ACCOUNT_INTERNAL_SECRET` | — | shared secret for `/internal/v1/traffic` between relays |
+| `accounts.reportTo` | `MIZAR_ACCOUNT_REPORT_TO` | — | free relay's account-relay origin (e.g. `https://dshmizar-1.shirazu-nagisa.com`) |
+| `accounts.reportId` | `MIZAR_ACCOUNT_REPORT_ID` | — | this relay's id in traffic reports (`primary-0`/`primary-1`) |
+| `accounts.gravatar.baseURLs` | `MIZAR_GRAVATAR_BASE_URLS` | official Gravatar | ordered mirrors; the account relay in China needs `https://gravatar.loli.net,https://cn.cravatar.com,https://www.gravatar.com` |
+| `accounts.appstore.productId` | `MIZAR_APPSTORE_PRODUCT_ID` | `me.shirazu.dshmizar.paid.monthly` | auto-renewable subscription product id; must match App Store Connect and iOS |
+| `accounts.appstore.allowSandbox` | `MIZAR_APPSTORE_ALLOW_SANDBOX` | `true` | accept Sandbox StoreKit transactions |
 
 Rules that are easy to trip over:
 
@@ -986,14 +997,285 @@ to a phone whose app is on screen — that is exactly where a stale timer is vis
 token is tracked apart from the alert token: when Apple retires one, the relay forgets only that
 token and the phone keeps receiving notifications.
 
-### 10.6 Restarts, and why there is no database
+### 10.6 Restarts, push registrations, and why there is no database
 
-Registrations live in memory. A room's tokens are a cache of what the computer already knows, and the computer
+Push registrations live in memory. A room's tokens are a cache of what the computer already knows, and the computer
 re-announces all of them every time its tunnel reconnects — which is exactly what happens when this
 process restarts. Persisting them here would be a second copy of a fact that has an owner, and a
 relay that came back with stale tokens would have nothing to correct them with.
+
+Account data is the exception: `accounts.json`, `invites.json`, and `traffic.json` live in the
+account relay's `data/` directory and are reloaded on start. That is why the systemd unit grants
+exactly that directory write access. It is still a file, not a database: one process, serialized
+writes, and a copy that can be backed up with `cp`.
 
 A token Apple reports as retired — `410 Unregistered`, or `BadDeviceToken` — is dropped on the spot.
 So is one Google reports as `404 UNREGISTERED`, or as belonging to another project
 (`SENDER_ID_MISMATCH`). Retrying either forever turns a misconfiguration into a permanent stream of
 failed requests.
+
+---
+
+## 11. Accounts, App Store subscription, admin WebUI, and relay roles
+
+This section is only for the account relay (主力1). The free relay (主力0) keeps
+`accounts.enabled=false`, stores no user data, and reports traffic to 主力1.
+
+### 11.1 Roles
+
+- `"role": 0` — free relay. Carries free/guest traffic and reports counters.
+- `"role": 1` — paid/account relay. Serves `/account/v1/*`, `/admin`, and the
+  aggregated traffic views. Also carries whatever tunnels connect to it.
+- Role is **not** an authorization check on tunnels. A paid account may still use
+  a free relay; the value is a label and an accounting dimension.
+
+### 11.2 Node and the bundle
+
+The account relay needs Node 20+; Node 24 LTS is recommended. The bundle is
+self-contained (built `lib/`, `node_modules/ws`, installer), so the server never
+runs `npm install` or TypeScript.
+
+```sh
+# on the computer, in the repository
+cd dsh-relay
+npm run pack
+
+# on 主力1
+scp release/dsh-relay/dsh-mizar-relay-<version>.tar.gz root@124.220.194.121:/tmp/
+ssh root@124.220.194.121
+mkdir -p /www/wwwroot/dsh-mizar-relay
+tar -xzf /tmp/dsh-mizar-relay-<version>.tar.gz -C /www/wwwroot/dsh-mizar-relay --strip-components=1
+cd /www/wwwroot/dsh-mizar-relay
+sudo MIZAR_ROLE=1 ./install.sh
+```
+
+The installer:
+
+- finds Node (PATH, `/www/server/nodejs/*/bin/node`, common locations, nvm);
+- copies the server without touching an existing `relay.config.json`;
+- creates `/www/wwwroot/dsh-mizar-relay/data` mode 700 and grants the systemd
+  unit `ReadWritePaths` to it;
+- for a fresh role=1 config, generates an admin password/hash, an internal report
+  secret, sets role=1, enables accounts, and prints the admin password **once**;
+- for role=0, sets role=0, accounts off, and optionally the report target.
+
+A re-run keeps the existing config. To enable accounts on an existing install:
+
+```sh
+NODE=/www/server/nodejs/v24.22.0/bin/node
+SECRET_JSON="$($NODE lib/accounts/cli.js admin-secret)"
+# capture .password and .hash from the JSON, then:
+$NODE lib/accounts/cli.js configure \
+  --config relay.config.json --role 1 --enable-accounts \
+  --data-dir ./data \
+  --admin-password-hash '<hash>' \
+  --internal-secret '<shared secret>' \
+  --report-id primary-1 \
+  --public-base-url https://dshmizar-1.shirazu-nagisa.com \
+  --product-id me.shirazu.dshmizar.paid.monthly \
+  --gravatar-base-urls https://gravatar.loli.net,https://cn.cravatar.com,https://www.gravatar.com
+```
+
+### 11.3 nginx and TLS for the account relay
+
+The account domain must have a valid certificate; the app uses HTTPS and the
+App Store notification endpoint uses HTTPS. The relay still binds loopback.
+
+1. Create the webroot:
+
+   ```sh
+   mkdir -p /www/wwwroot/dshmizar-1.shirazu-nagisa.com/.well-known/acme-challenge
+   ```
+
+2. Add a site config at
+   `/www/server/panel/vhost/nginx/dshmizar-1.shirazu-nagisa.com.conf`:
+
+   ```nginx
+   server {
+     listen 80;
+     server_name dshmizar-1.shirazu-nagisa.com;
+     root /www/wwwroot/dshmizar-1.shirazu-nagisa.com;
+     location /.well-known/acme-challenge/ { try_files $uri =404; }
+     location / { return 301 https://$host$request_uri; }
+   }
+
+   server {
+     listen 443 ssl;
+     http2 on;
+     server_name dshmizar-1.shirazu-nagisa.com;
+     ssl_certificate     /etc/letsencrypt/live/dshmizar-1.shirazu-nagisa.com/fullchain.pem;
+     ssl_certificate_key /etc/letsencrypt/live/dshmizar-1.shirazu-nagisa.com/privkey.pem;
+
+     client_max_body_size 2m;
+     proxy_http_version 1.1;
+     proxy_set_header Upgrade $http_upgrade;
+     proxy_set_header Connection "upgrade";
+     proxy_set_header Host $host;
+     proxy_set_header X-Real-IP $remote_addr;
+     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+     proxy_set_header X-Forwarded-Proto $scheme;
+     proxy_read_timeout 3600s;
+     proxy_send_timeout 3600s;
+     proxy_buffering off;
+
+     location / { proxy_pass http://127.0.0.1:8787; }
+   }
+   ```
+
+3. Install certbot and issue the certificate:
+
+   ```sh
+   dnf install -y certbot
+   certbot certonly --webroot -w /www/wwwroot/dshmizar-1.shirazu-nagisa.com \
+     -d dshmizar-1.shirazu-nagisa.com --agree-tos --register-unsafely-without-email
+   certbot renew --quiet && nginx -s reload   # add to cron/systemd timer
+   nginx -t && nginx -s reload
+   ```
+
+4. Verify:
+
+   ```sh
+   curl -fsS https://dshmizar-1.shirazu-nagisa.com/healthz
+   # {"ok":true,...,"role":1,"accounts":true}
+   ```
+
+5. Open `https://dshmizar-1.shirazu-nagisa.com/admin` and log in with the
+   printed admin password. Create the first invite code there.
+
+Do **not** open 8787 in the firewall/security group; only nginx should reach it.
+
+### 11.4 App Store subscription
+
+The paid account is an auto-renewable subscription, one month, price set in App
+Store Connect (¥6.00/month for China). The app uses StoreKit 2 and shows Apple's
+purchase sheet; the server verifies Apple's JWS instead of trusting the client.
+
+Server verification:
+
+- Apple Root CA G2/G3 are embedded and used to verify the `x5c` certificate
+  chain in every StoreKit transaction and App Store Server Notification V2.
+- The transaction must match:
+  - `bundleId`: `accounts.appstore.bundleId`
+  - `productId`: `accounts.appstore.productId`
+  - `type`: `Auto-Renewable Subscription`
+  - `environment`: `Production` or `Sandbox` (if allowed)
+  - `appAccountToken`: the account's UUID
+- The first transaction for an `originalTransactionId` binds it to that account.
+  A second account claiming it is refused (`APPSTORE_ACCOUNT_MISMATCH`).
+- Renewals extend the App Store entitlement; refunds/revocations clear it. The
+  manual/invite entitlement is separate, so a refund only removes what Apple
+  sold. The effective paid state is the later of the two.
+- App Store Server Notifications V2 URL:
+  `https://dshmizar-1.shirazu-nagisa.com/account/v1/appstore/notifications`
+  (configure both Production and Sandbox in App Store Connect).
+
+App Store Connect checklist (operator):
+
+1. Complete Paid Apps agreement, tax, and banking.
+2. Create subscription group `DSH-Mizar 付费账户`.
+3. Add auto-renewable subscription:
+   - Product ID: `me.shirazu.dshmizar.paid.monthly`
+   - Duration: 1 month
+   - Price: ¥6.00 (China; the app displays `product.displayPrice`, never a
+     hard-coded price)
+   - Localizations, review screenshot, availability.
+4. Attach the subscription to the app version under review.
+5. Add Sandbox testers; verify purchase, restore, renewal, cancel, and refund
+   on a real device.
+6. Add the server notification URL (production and sandbox).
+7. Provide a demo account in App Store review notes and a privacy policy URL.
+
+The app's `Product ID` constant, the relay's
+`accounts.appstore.productId`, and App Store Connect must all match.
+
+### 11.5 Account API and admin UI
+
+Endpoints (JSON, no-store, 64 KiB body limit):
+
+- `POST /account/v1/register`
+- `POST /account/v1/login`
+- `POST /account/v1/apple`
+- `GET  /account/v1/me`
+- `POST /account/v1/logout`
+- `POST /account/v1/delete`
+- `POST /account/v1/invite/redeem`
+- `POST /account/v1/appstore/transaction`
+- `POST /account/v1/appstore/sync`
+- `POST /account/v1/appstore/notifications` (Apple JWS, no Bearer)
+
+The public user object never contains a password hash, token hash, Apple `sub`,
+transaction JWS, or full original transaction id.
+
+Admin pages: `/admin`, `/admin/users`, `/admin/users/:id`, `/admin/guests`,
+`/admin/invites`, `/admin/traffic`, `/admin/settings`. Authentication is an
+HMAC-signed HttpOnly cookie derived from the admin password hash; every POST
+carries a CSRF token.
+
+### 11.6 Traffic accounting
+
+The phone sends two headers on every relayed request and WebSocket upgrade:
+
+- `x-mizar-client-id`: the installation UUID (also the account device id)
+- `x-mizar-account`: the **SHA-256** of the account session token, not the token
+
+The relay strips both before replaying the request to the computer. Identities:
+
+- `account:<64hex>` — a logged-in account
+- `guest:<clientId>` — a logged-out install
+- `anon:<hash>` — an old client that sent neither header
+
+Counters are per UTC day and per relay, kept 90 days. The free relay posts
+batches every 30 seconds to `/internal/v1/traffic` on the account relay with
+`Authorization: Bearer <accounts.internalSecret>`; the account relay merges them
+and the admin UI shows user/guest totals. A failed report is buffered in memory
+and retried; relaying itself never waits for it.
+
+### 11.7 Data, backup, and rollback
+
+- Critical: `data/accounts.json` (users, sessions, entitlements, App Store
+  bindings) and `data/invites.json`.
+- `data/traffic.json` is statistics and can be lost more cheaply.
+- `data/audit.log` records admin changes and invite redemptions.
+- Files are mode 600, the directory 700; the config is 600. Back up
+  `accounts.json` and `invites.json` off the server regularly.
+- Do **not** copy the config or data between relays except the
+  `internalSecret`; the free relay must not hold account data.
+- Rollback: set `accounts.enabled=false` and restart to take the account API and
+  admin UI offline. The tunnel and every free feature keep working. Reverting the
+  app binary is a separate App Store action.
+
+### 11.8 Free relay (主力0) upgrade
+
+1. Upload the same bundle and run `sudo ./install.sh` (existing config kept).
+2. Edit the `accounts` block (or use the CLI) to:
+
+   ```json
+   "role": 0,
+   "accounts": {
+     "enabled": false,
+     "dataDir": "./data",
+     "internalSecret": "<same as 主力1>",
+     "reportTo": "https://dshmizar-1.shirazu-nagisa.com",
+     "reportId": "primary-0"
+   }
+   ```
+
+3. Restart. The tunnel reconnect is brief; the computer reconnects
+   automatically.
+4. Verify `/healthz` returns `role:0, accounts:false` and the 主力1 admin shows
+   `primary-0` traffic within about 30 seconds.
+
+### 11.9 Security notes
+
+- The account service handles emails, password hashes, session token hashes, and
+  App Store subscription identifiers. Treat `data/` and the config as personal
+  data; do not commit or share them.
+- The relay already terminates TLS; nobody but the operator can read the traffic.
+- The admin UI must be reachable only over HTTPS. The cookie is Secure when nginx
+  sets `X-Forwarded-Proto: https`.
+- App Store JWS verification is pinned to Apple roots; do not replace it with a
+  decoded-payload check.
+- Custom invite codes are a promotional/administrative mechanism. Public
+  promotions should use Apple Offer Codes to stay within App Store payment
+  rules; the invitation entry in the app's About screen should be removed or
+  gated if App Review objects.

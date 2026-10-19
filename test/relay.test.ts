@@ -28,6 +28,8 @@ const config = (overrides: Partial<RelayConfig> = {}): RelayConfig => ({
   probePort: 0, // disabled: binding a UDP port per test is noise
   apns: null, // notifications are off unless a case turns them on
   fcm: null, // and so is the Android half
+  role: 0,
+  accounts: null,
   ...overrides,
 })
 
@@ -177,6 +179,23 @@ describe('relay HTTP replay', () => {
     expect(Buffer.from(String(sent?.['body']), 'base64').toString('utf8')).toBe('{"code":"ABCD-EFGH"}')
   })
 
+  it('strips the relay-private identity headers before the computer sees them', async () => {
+    relay = await startRelay(config(), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
+    mac.respondWith(200, '{}')
+    await fetch(`http://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/hello`, {
+      headers: {
+        'x-mizar-account': 'a'.repeat(64),
+        'x-mizar-client-id': 'device-0001',
+        'x-visible': 'yes',
+      },
+    })
+    const headers = (mac.requests[0] as { headers: Record<string, string> }).headers
+    expect(headers['x-mizar-account']).toBeUndefined()
+    expect(headers['x-mizar-client-id']).toBeUndefined()
+    expect(headers['x-visible']).toBe('yes')
+  })
+
   it('does not forward hop-by-hop headers', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
@@ -309,6 +328,25 @@ describe('relay WebSocket bridging', () => {
     })
     phone.send('hello from the phone')
     expect(await reply).toBe('echo:hello from the phone')
+    phone.close()
+  })
+
+  it('carries a 400 KiB attachment-sized frame in both directions', async () => {
+    relay = await startRelay(config({ maxMessageBytes: 1024 * 1024 }), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
+    mac.echoStreams()
+    const phone = new WebSocket(`ws://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/ws`)
+    await new Promise<void>((resolve, reject) => {
+      phone.once('open', () => resolve())
+      phone.once('error', reject)
+    })
+    const payload = 'x'.repeat(400 * 1024)
+    const reply = new Promise<string>((resolve) => {
+      phone.once('message', (data: Buffer) => resolve(data.toString('utf8')))
+    })
+    phone.send(payload)
+    const echoed = await reply
+    expect(echoed.length).toBe(payload.length + 'echo:'.length)
     phone.close()
   })
 

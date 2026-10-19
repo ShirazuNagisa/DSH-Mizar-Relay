@@ -9,6 +9,8 @@ DSH-Mizar 中继服务器 v0.0.0 — 文件说明
   DEPLOYMENT-FULL.md     完整参考：配置项全表、systemd 细节、排错手册
 
   app/selftest.js        自检：不用电脑也能验中继是否正常
+  data/                 账户数据目录（仅 accounts.enabled=true 时使用，权限 700）
+  app/lib/accounts/cli.js  管理员密码/邀请码/配置辅助命令
 
   app/                   服务端本体
     lib/                 已经编译好，服务器上不需要 TypeScript

@@ -16,5 +16,34 @@
   },
   "_fcm": {
     "_comment": "Android 推送（FCM）同样是可选的：在 relay.config.json 里加一个 fcm 块。serviceAccountFile 指向 Firebase 服务账号 JSON 的路径（也可以把整份 JSON 内联进 serviceAccount），channelId 必须是 App 建好的通知通道 —— Android 客户端的通道名是 mizar-alerts；不填则走 App 的默认通道。步骤见 docs/deployment.md 第 10.3 节。"
+  },
+  "role": 0,
+  "accounts": {
+    "enabled": false,
+    "dataDir": "./data",
+    "adminPasswordHash": "",
+    "internalSecret": "",
+    "reportTo": "",
+    "reportId": "",
+    "publicBaseURL": "",
+    "gravatar": {
+      "enabled": true,
+      "baseURLs": [
+        "https://www.gravatar.com"
+      ]
+    },
+    "appleAudiences": [
+      "me.shirazu.dshmizar"
+    ],
+    "appleKeysURL": "https://appleid.apple.com/auth/keys",
+    "appstore": {
+      "bundleId": "me.shirazu.dshmizar",
+      "productId": "me.shirazu.dshmizar.paid.monthly",
+      "allowSandbox": true,
+      "notificationsEnabled": true
+    }
+  },
+  "_accounts": {
+    "_comment": "role=0 是免费中继，role=1 是付费/账户中继。账户服务只在 accounts.enabled=true 时开启；主力0 保持 enabled=false，并把 reportTo 指向主力1、internalSecret 配成与主力1 相同。adminPasswordHash 用 node lib/accounts/cli.js admin-secret 生成；不要在这里写明文密码。App Store 订阅的 productId 必须与 App Store Connect 和 iOS 常量一致。"
   }
 }

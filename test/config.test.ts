@@ -191,3 +191,66 @@ describe('the proxy trust setting', () => {
     expect(loadConfig(path, {}).trustProxy).toBe(false)
   })
 })
+
+describe('the relay role and account service', () => {
+  it('defaults to a free relay with no account service', async () => {
+    const home = await scratch()
+    const config = loadConfig(join(home, 'relay.config.json'), {})
+    expect(config.role).toBe(0)
+    expect(config.accounts).toBeNull()
+  })
+
+  it('reads the role and rejects anything that is not 0 or 1', async () => {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(path, JSON.stringify({ role: 1 }), 'utf8')
+    expect(loadConfig(path, {}).role).toBe(1)
+    expect(loadConfig(path, { MIZAR_RELAY_ROLE: '0' }).role).toBe(0)
+    expect(() => loadConfig(path, { MIZAR_RELAY_ROLE: '2' })).toThrow(/role/)
+    expect(() => loadConfig(path, { MIZAR_RELAY_ROLE: 'paid' })).toThrow(/role/)
+  })
+
+  it('reads the accounts block with defaults and environment overrides', async () => {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(
+      path,
+      JSON.stringify({
+        role: 1,
+        accounts: {
+          enabled: true,
+          dataDir: './state',
+          adminPasswordHash: 'scrypt$1$1$1$c2FsdA==$aGFzaA==',
+          gravatar: { enabled: false, baseURLs: ['https://mirror.test'] },
+          appstore: { productId: 'me.shirazu.dshmizar.paid.monthly' },
+        },
+      }),
+      'utf8',
+    )
+    const config = loadConfig(path, { MIZAR_ACCOUNT_REPORT_ID: 'from-env' })
+    expect(config.role).toBe(1)
+    expect(config.accounts).toMatchObject({
+      enabled: true,
+      dataDir: './state',
+      reportId: 'from-env',
+      gravatar: { enabled: false, baseURLs: ['https://mirror.test'] },
+      appleAudiences: ['me.shirazu.dshmizar'],
+      appstore: {
+        bundleId: 'me.shirazu.dshmizar',
+        productId: 'me.shirazu.dshmizar.paid.monthly',
+        allowSandbox: true,
+        notificationsEnabled: true,
+      },
+    })
+    const env = loadConfig(path, {
+      MIZAR_ACCOUNTS_ENABLED: 'false',
+      MIZAR_GRAVATAR_BASE_URLS: 'https://a.test, https://b.test',
+      MIZAR_APPLE_AUDIENCES: 'me.shirazu.dshmizar,com.example.other',
+      MIZAR_APPSTORE_ALLOW_SANDBOX: '0',
+    })
+    expect(env.accounts?.enabled).toBe(false)
+    expect(env.accounts?.gravatar.baseURLs).toEqual(['https://a.test', 'https://b.test'])
+    expect(env.accounts?.appleAudiences).toEqual(['me.shirazu.dshmizar', 'com.example.other'])
+    expect(env.accounts?.appstore.allowSandbox).toBe(false)
+  })
+})

@@ -188,6 +188,8 @@ async function boot(
             production: false,
             authority,
           },
+    role: 0,
+    accounts: null,
     ...overrides,
     fcm,
   }
@@ -230,6 +232,8 @@ describe('a key that will not parse', () => {
         topic: 'me.shirazu.dshmizar',
         production: false,
       },
+      role: 0,
+      accounts: null,
     }
     relay = await startRelay(config, (message) => lines.push(message))
 

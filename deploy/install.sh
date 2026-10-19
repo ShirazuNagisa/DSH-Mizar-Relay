@@ -149,7 +149,12 @@ UNIT
 say "wrote $SERVICE (ExecStart uses $NODE_BIN)"
 
 systemctl daemon-reload
-systemctl enable --now dsh-mizar-relay >/dev/null 2>&1 || fail "systemd could not start the service. Check: journalctl -u dsh-mizar-relay -n 40"
+# `enable --now` starts a stopped service but leaves a running one running, so
+# an upgrade would keep the old build in memory until the next reboot. This
+# installer doubles as the upgrade path ("Re-running this installer is how an
+# upgrade is applied" above), so restart unconditionally.
+systemctl enable dsh-mizar-relay >/dev/null 2>&1 || fail "systemd could not enable the service"
+systemctl restart dsh-mizar-relay || fail "systemd could not start the service. Check: journalctl -u dsh-mizar-relay -n 40"
 sleep 1
 
 if systemctl is-active --quiet dsh-mizar-relay; then

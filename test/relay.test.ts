@@ -19,6 +19,7 @@ const config = (overrides: Partial<RelayConfig> = {}): RelayConfig => ({
   port: 0,
   host: '127.0.0.1',
   tokens: [TOKEN],
+  trustProxy: true,
   maxBodyBytes: 1024 * 1024,
   maxMessageBytes: 1024 * 1024,
   maxClientsPerRoom: 8,
@@ -55,9 +56,13 @@ class FakeMac {
     })
   }
 
-  static async connect(url: string, token: string = TOKEN): Promise<FakeMac> {
+  static async connect(
+    url: string,
+    token: string = TOKEN,
+    headers: Record<string, string> = {},
+  ): Promise<FakeMac> {
     const socket = new WebSocket(`${url}/tunnel`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: { authorization: `Bearer ${token}`, ...headers },
     })
     const welcome = await new Promise<Record<string, unknown>>((resolve, reject) => {
       socket.once('message', (data: Buffer) => resolve(JSON.parse(data.toString('utf8'))))
@@ -467,6 +472,27 @@ describe('abuse limits', () => {
     await expect(
       FakeMac.connect(`ws://127.0.0.1:${relay.port}`, 'g'.repeat(43)),
     ).rejects.toThrow(/429/)
+  })
+
+  it('counts tunnels per real client address behind a local proxy', async () => {
+    // nginx forwards the upgrade to loopback and always presents itself as
+    // 127.0.0.1. The limit is a resource guard on the computer, so it has to
+    // count the address the proxy vouches for -- otherwise four households fill
+    // the relay and the fifth computer is refused with a 429 naming the proxy.
+    relay = await startRelay(
+      { ...config(), tokens: [], maxTunnelsPerIp: 1 },
+      () => undefined,
+    )
+    const url = `ws://127.0.0.1:${relay.port}`
+    await FakeMac.connect(url, 'a'.repeat(43), { 'x-real-ip': '203.0.113.7' })
+    await expect(
+      FakeMac.connect(url, 'b'.repeat(43), { 'x-real-ip': '203.0.113.7' }),
+    ).rejects.toThrow(/429/)
+    // A different computer behind the same proxy has its own allowance.
+    const other = await FakeMac.connect(url, 'c'.repeat(43), { 'x-real-ip': '198.51.100.9' })
+    expect(other.room).toMatch(/^[0-9A-HJKMNP-TV-Z]{12}$/)
+    // And the proxy's own loopback address is no longer a shared bucket.
+    expect(other.room).toBe(deriveRoom('c'.repeat(43)))
   })
 
   it('frees the slot when a tunnel goes away', async () => {

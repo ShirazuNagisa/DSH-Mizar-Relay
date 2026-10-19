@@ -25,6 +25,7 @@ import type { Duplex } from 'node:stream'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
+import { clientAddress } from './client-address.js'
 import { loadConfig, type RelayConfig } from './config.js'
 import { FcmClient } from './fcm.js'
 import { deliver, PushRegistry, readDevice, readNotification } from './push.js'
@@ -598,7 +599,16 @@ export async function startRelay(
       return
     }
 
-    const peer = request.socket.remoteAddress ?? 'unknown'
+    // Behind the documented nginx deployment every tunnel arrives from
+    // 127.0.0.1, and counting the proxy would turn this per-address limit into a
+    // global one: four computers online and the fifth refused. The headers are
+    // read only when the peer is loopback, so a relay exposed directly keeps
+    // counting the real peer. See client-address.ts.
+    const peer = clientAddress(
+      request.socket.remoteAddress,
+      request.headers,
+      config.trustProxy !== false,
+    )
     if (tunnelsPerIp.get(peer) !== undefined && (tunnelsPerIp.get(peer) ?? 0) >= config.maxTunnelsPerIp) {
       log(`relay: tunnel refused — ${peer} already has ${config.maxTunnelsPerIp} tunnels`)
       socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n')

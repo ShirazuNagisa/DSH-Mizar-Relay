@@ -165,3 +165,29 @@ describe('the FCM configuration', () => {
     expect(loadConfig(path, { MIZAR_FCM_SERVICE_ACCOUNT: 'broken' }).apns).not.toBeNull()
   })
 })
+
+describe('the proxy trust setting', () => {
+  // The documented deployment is nginx on loopback, so the default has to be
+  // on: without it the per-address tunnel limit counts the proxy and four
+  // computers fill an otherwise open relay.
+  it('defaults to on', () => {
+    expect(loadConfig('/nonexistent-relay-config.json', {}).trustProxy).toBe(true)
+  })
+
+  it('can be turned off from the environment, in the spellings a container uses', () => {
+    const path = '/nonexistent-relay-config.json'
+    // `MIZAR_RELAY_TRUST_PROXY=false` must not be read as a truthy string.
+    for (const value of ['false', '0', 'no', 'off', 'FALSE']) {
+      expect(loadConfig(path, { MIZAR_RELAY_TRUST_PROXY: value }).trustProxy).toBe(false)
+    }
+    expect(loadConfig(path, { MIZAR_RELAY_TRUST_PROXY: 'true' }).trustProxy).toBe(true)
+    expect(loadConfig(path, { MIZAR_RELAY_TRUST_PROXY: '1' }).trustProxy).toBe(true)
+  })
+
+  it('reads the file value when the environment does not override it', async () => {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(path, JSON.stringify({ trustProxy: false }), 'utf8')
+    expect(loadConfig(path, {}).trustProxy).toBe(false)
+  })
+})

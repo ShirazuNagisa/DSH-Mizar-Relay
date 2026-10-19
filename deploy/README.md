@@ -163,6 +163,7 @@ relay: tunnel for room XXXXXXXXXXXX connected
 | 手机连上又立刻断开 | **WebSocket 头没配** | 粘贴 `nginx-websocket.conf`，重载 nginx |
 | 隧道每分钟重连一次 | `proxy_read_timeout` 还是默认 60s | 见上一行，改成 `3600s` |
 | 手机 `502` | 电脑没应答 | 电脑上的 DSH 在跑吗？看插件日志 |
+| **第 5 台电脑连不上，日志 429** | 0.2.2 及更早把 nginx 的 `127.0.0.1` 当成所有隧道来源，4 条之后全站拒绝 | 升级到 0.2.3+（`install.sh` 会保留 `relay.config.json`），并确认反代传了 `X-Real-IP` |
 | 服务起不来 | 端口被占 | `journalctl -u dsh-mizar-relay -n 40` |
 | 探测口不通 | UDP 8788 被防火墙挡了 | 放行 UDP 8788（只有打洞阶段用得到） |
 

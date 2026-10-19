@@ -33,6 +33,17 @@ export interface RelayConfig {
    */
   readonly tokens: readonly string[]
   /**
+   * Whether a local reverse proxy's `X-Real-IP` / `X-Forwarded-For` may say
+   * which computer a tunnel belongs to.
+   *
+   * The documented deployment puts nginx in front and the relay on loopback, so
+   * every tunnel then arrives from `127.0.0.1`: without this, the per-address
+   * limit below counts the proxy and becomes a global cap. Only a connection
+   * whose TCP peer is loopback is ever attributed to a header, so a relay
+   * exposed directly cannot be talked out of its real peer.
+   */
+  readonly trustProxy: boolean
+  /**
    * Tunnels allowed from one address.
    *
    * The relay is open, so without this a single host can register rooms until
@@ -150,6 +161,7 @@ export function loadConfig(
     port: Number(pick(env['MIZAR_RELAY_PORT'], file.port, 8787)),
     host: pick(env['MIZAR_RELAY_HOST'], file.host, '127.0.0.1'),
     tokens,
+    trustProxy: flag(pick(env['MIZAR_RELAY_TRUST_PROXY'], file.trustProxy, true)),
     maxTunnelsPerIp: Number(pick(env['MIZAR_RELAY_MAX_TUNNELS_PER_IP'], file.maxTunnelsPerIp, 4)),
     maxRooms: Number(pick(env['MIZAR_RELAY_MAX_ROOMS'], file.maxRooms, 10_000)),
     maxBodyBytes: Number(pick(env['MIZAR_RELAY_MAX_BODY'], file.maxBodyBytes, 4 * 1024 * 1024)),
@@ -163,6 +175,21 @@ export function loadConfig(
     apns: readApns(env, file.apns ?? null),
     fcm: readFcm(env, (file.fcm ?? null) as FcmFileConfig | null),
   }
+}
+
+/**
+ * Read a boolean that arrives as a JSON `true`/`false` or as an environment
+ * string.
+ *
+ * `MIZAR_RELAY_TRUST_PROXY=0`, `false`, `no` and `off` all turn the option off;
+ * anything else on non-empty turns it on. The point is that a container's
+ * `MIZAR_RELAY_TRUST_PROXY=false` must not be read as a truthy string, which is
+ * the way a plain `Boolean(...)` gets this wrong.
+ */
+function flag(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (value === undefined || value === '') return true
+  return !['0', 'false', 'no', 'off'].includes(String(value).trim().toLowerCase())
 }
 
 /**

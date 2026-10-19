@@ -236,6 +236,7 @@ file looks like this:
   "port": 8787,
   "host": "127.0.0.1",
   "tokens": ["Zt8kQ2mR9vX4pL6cH1sB3nD7fG0jW5yA"],
+  "trustProxy": true,
   "maxBodyBytes": 4194304,
   "maxMessageBytes": 4194304,
   "maxClientsPerRoom": 8,
@@ -253,13 +254,14 @@ Every key, its environment override and its default — the authoritative list, 
 | `port` | `MIZAR_RELAY_PORT` | `8787` | TCP port for the plain-HTTP server. TLS is nginx's job, not this process's |
 | `host` | `MIZAR_RELAY_HOST` | `127.0.0.1` | interface to bind. Leave it; see 5.4 |
 | `tokens` | `MIZAR_RELAY_TOKENS` | `[]` — any credential is accepted | the bearer tokens a computer may present at `/tunnel`. One token = one computer = one room. Empty is the shipping mode: each plugin invents its own secret and the room is derived from it, so there is nothing to issue (see 4.3) |
+| `trustProxy` | `MIZAR_RELAY_TRUST_PROXY` | `true` | whether `X-Real-IP` / `X-Forwarded-For` may name the computer the **tunnel address limit** counts. Only read when the TCP peer is loopback (the nginx deployment), so a relay exposed directly still counts the real peer. Set it to `false` if you front the relay with a proxy on another host |
 | `maxBodyBytes` | `MIZAR_RELAY_MAX_BODY` | `4194304` (4 MiB) | largest body the relay carries, in either direction: a bigger request from the phone is answered `413`, a bigger answer from the computer is answered `502` |
 | `maxMessageBytes` | `MIZAR_RELAY_MAX_MESSAGE` | `4194304` (4 MiB) | largest single WebSocket message. Past it the bridge closes with code `1009` |
 | `maxClientsPerRoom` | `MIZAR_RELAY_MAX_CLIENTS` | `8` | concurrent phone connections allowed per room. A resource guard, not authentication |
 | `requestTimeoutMs` | `MIZAR_RELAY_REQUEST_TIMEOUT` | `30000` | how long a phone request waits for the computer before `502`, and how long a phone WebSocket waits for the computer to accept its upgrade before `504` |
 | `tunnelIdleMs` | `MIZAR_RELAY_TUNNEL_IDLE` | `90000` | how long a tunnel may go without answering a ping before the relay drops it. The relay pings every `tunnelIdleMs / 3` (30 s at the default), never faster than 5 s |
 | `maxRooms` | `MIZAR_RELAY_MAX_ROOMS` | `10000` | rooms served at once, and push rooms remembered. The only bound on either map |
-| `maxTunnelsPerIp` | `MIZAR_RELAY_MAX_TUNNELS_PER_IP` | `4` | tunnels one source address may hold. A resource guard, not authentication |
+| `maxTunnelsPerIp` | `MIZAR_RELAY_MAX_TUNNELS_PER_IP` | `4` | tunnels one source address may hold. A resource guard, not authentication. Behind the loopback reverse proxy the address is the client's, from `X-Real-IP` (see `trustProxy`); before 0.2.3 this counted the proxy and was effectively a global cap of four |
 | `probePort` | `MIZAR_RELAY_PROBE_PORT` | `8788` | UDP port for the endpoint probe; `0` disables it and opens no socket at all |
 
 Rules that are easy to trip over:
@@ -436,7 +438,7 @@ proxy_send_timeout 3600s;
 | `proxy_set_header Upgrade $http_upgrade` | forwards the client's `Upgrade: websocket` to the relay. Without it the relay never sees an upgrade request at all |
 | `proxy_set_header Connection "upgrade"` | tells the relay this connection is an upgrade and not a keep-alive request. **This and the line above are a pair** — with only one of them the handshake is stripped and what the client gets back is a plain HTTP response instead of `101 Switching Protocols` |
 | `proxy_set_header Host $host` | keeps the hostname the client used, rather than `127.0.0.1:8787`, in the request the computer eventually replays |
-| `proxy_set_header X-Real-IP $remote_addr` | the phone's real address. The relay forwards it to the computer as an ordinary request header (it is not a hop-by-hop header), which is the only way the computer can see who is calling — from the plugin's side the connection arrives from loopback |
+| `proxy_set_header X-Real-IP $remote_addr` | the client's real address. Two uses: on the **tunnel upgrade** it is the address `maxTunnelsPerIp` counts (otherwise every computer shares the proxy's `127.0.0.1` bucket — the relay now trusts it because the peer is loopback, see `trustProxy`); on phone requests the relay forwards it to the computer as an ordinary request header, which is the only way the computer can see who is calling — from the plugin's side the connection arrives from loopback |
 | `proxy_read_timeout 3600s` | **the one people lose an evening to.** nginx's default is 60 s: a proxied socket that says nothing for 60 s is closed. The tunnel is exactly such a socket whenever it is quiet, and the symptom is a computer that reconnects roughly every minute, forever |
 | `proxy_send_timeout 3600s` | the write-side equivalent, for a large answer being pushed to a slow phone |
 

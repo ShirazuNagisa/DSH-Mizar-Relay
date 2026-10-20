@@ -274,6 +274,9 @@ Every key, its environment override and its default — the authoritative list, 
 | `accounts.gravatar.baseURLs` | `MIZAR_GRAVATAR_BASE_URLS` | official Gravatar | ordered mirrors; the account relay in China needs `https://gravatar.loli.net,https://cn.cravatar.com,https://www.gravatar.com` |
 | `accounts.appstore.productId` | `MIZAR_APPSTORE_PRODUCT_ID` | `me.shirazu.dshmizar.paid.monthly` | auto-renewable subscription product id; must match App Store Connect and iOS |
 | `accounts.appstore.allowSandbox` | `MIZAR_APPSTORE_ALLOW_SANDBOX` | `true` | accept Sandbox StoreKit transactions |
+| `accounts.paidGate.mode` | `MIZAR_PAID_GATE` | `enforce` on a `role: 1` relay with accounts enabled, else `off` | `off` / `observe` / `enforce`. See 11.7 |
+| `accounts.paidGate.allowUnaccounted` | `MIZAR_PAID_GATE_ALLOW_UNACCOUNTED` | `false` | let phones with no account at all through the paid relay |
+| `accounts.paidGate.cacheTtlMs` | `MIZAR_PAID_GATE_CACHE_TTL` | `60000` | how long a verified paid entitlement is reused |
 
 Rules that are easy to trip over:
 
@@ -1026,8 +1029,11 @@ This section is only for the account relay (主力1). The free relay (主力0) k
 - `"role": 0` — free relay. Carries free/guest traffic and reports counters.
 - `"role": 1` — paid/account relay. Serves `/account/v1/*`, `/admin`, and the
   aggregated traffic views. Also carries whatever tunnels connect to it.
-- Role is **not** an authorization check on tunnels. A paid account may still use
-  a free relay; the value is a label and an accounting dimension.
+- Role is **not** an authorization check on tunnels: a paid account may still use
+  a free relay, and any computer may still open a tunnel to the paid one. What
+  role 1 does gate, by default, is the phone leg — see 11.7. The value itself is
+  a label and an accounting dimension; the gate is a separate setting that
+  happens to default on for role 1.
 
 ### 11.2 Node and the bundle
 
@@ -1230,7 +1236,83 @@ batches every 30 seconds to `/internal/v1/traffic` on the account relay with
 and the admin UI shows user/guest totals. A failed report is buffered in memory
 and retried; relaying itself never waits for it.
 
-### 11.7 Data, backup, and rollback
+The paid relay reads one more header, `x-mizar-session`, which carries the
+session token itself rather than its hash — the gate described in 11.7 needs to
+resolve the account, and a hash cannot be resolved. It is stripped before replay
+like the other two and never reaches the traffic ledger, which keeps bucketing by
+the hash.
+
+### 11.7 The paid gate
+
+A relay with `role: 1` is the one users are told is the high-bandwidth server.
+Without a gate that was a hostname and nothing else: any phone that knew a room
+id could put unlimited bytes through it, paying or not. The gate closes that.
+
+**How it decides.** The phone presents `x-mizar-session: <account session token>`
+on every request and on the WebSocket upgrade under `/r/<room>/`. The relay
+resolves the token against its own account store and asks one question: is
+`paidUntil` still in the future? Nothing else about the account is consulted, and
+the token is used for nothing but this check.
+
+| Situation | Status | `error` | What the phone should do |
+|---|---|---|---|
+| no `x-mizar-session` | `401` | `UNAUTHENTICATED` | sign in |
+| token unknown / expired | `401` | `UNAUTHENTICATED` | sign in again |
+| token signed out elsewhere | `401` | `SESSION_REVOKED` | sign in again |
+| account disabled | `403` | `ACCOUNT_DISABLED` | contact the operator |
+| signed in, not paying | `402` | `PAID_REQUIRED` | subscribe, or use the free relay |
+
+Refusals also carry `x-mizar-gate: <code>`, so a proxy log is enough to tell a
+paywall rejection from a network failure.
+
+**What is exempt.** `/mizar/v1/hello` and `/mizar/v1/pair` — the handshake a
+phone performs *before* it has an account. Neither carries conversation traffic,
+and `/pair` still demands a live single-use code and is rate limited by the
+plugin. Everything else, including `/mizar/v1/ws`, is gated.
+
+**What is not gated.** The computer's `/tunnel`. A tunnel moves no bytes until a
+phone asks for something, so gating it would only break the case where the
+computer's owner has not signed in anywhere — and the plugin has no account to
+sign in with. The bandwidth is protected at the phone leg, which is where it is
+actually spent.
+
+**Configuration.**
+
+```json
+"accounts": {
+  "enabled": true,
+  "paidGate": { "mode": "enforce", "allowUnaccounted": false, "cacheTtlMs": 60000 }
+}
+```
+
+| Key | Environment override | Default | What it does |
+|---|---|---|---|
+| `paidGate.mode` | `MIZAR_PAID_GATE` | `enforce` when `role=1` and accounts are enabled, else `off` | `off` does not check, `observe` counts and logs refusals but lets them through, `enforce` refuses. `true`/`false` are accepted as shorthand for `enforce`/`off` |
+| `paidGate.allowUnaccounted` | `MIZAR_PAID_GATE_ALLOW_UNACCOUNTED` | `false` | let a phone with **no** account at all through. For a client that cannot sign in yet (Android today); it does not let a free *account* through. **This is a rollout crutch, not a security setting**: the relay cannot tell an Android from anyone else who simply omits the header, so while it is on, the paywall only stops accounts that do present a token |
+| `paidGate.cacheTtlMs` | `MIZAR_PAID_GATE_CACHE_TTL` | `60000` | how long a verified entitlement is reused. A refund, sign-out or downgrade invalidates it immediately through the store's listener, so this only bounds the cost of the common case |
+
+`mode` is validated at startup: a typo throws rather than silently leaving the
+paywall down, and `enforce` with `accounts.enabled: false` is refused outright —
+a gate with no store cannot check anything, and one that reports itself as on
+while letting everybody through is worse than none.
+
+**Rolling it out.** Deploy with `"mode": "observe"` first. `/healthz` reports
+`paidGate: "observe"`, every would-be refusal is logged (at most once per ten
+seconds per reason), and the relay still carries the traffic. When the logs show
+no legitimate phone being refused — that is, when every client in the field sends
+the header — switch to `enforce` and restart. The app only sends the token to the
+host named in `AccountClient.productionBaseURL`, so a free relay never sees it.
+
+**What the gate does not do.** It decides at connection time: a socket that is
+already open is not torn down when a subscription lapses, so the next reconnect is
+refused rather than the current conversation being cut. It does not authenticate
+the phone to the computer; the pairing device token still does that, over the
+tunnel, and the relay still cannot forge it. It does not meter bytes either —
+traffic accounting is 11.6 and is deliberately non-blocking. And it does not stop
+a paying account from sharing its token; the two-device cap and revocation in the
+admin UI are the answer to that, not this.
+
+### 11.8 Data, backup, and rollback
 
 - Critical: `data/accounts.json` (users, sessions, entitlements, App Store
   bindings) and `data/invites.json`.
@@ -1244,7 +1326,7 @@ and retried; relaying itself never waits for it.
   admin UI offline. The tunnel and every free feature keep working. Reverting the
   app binary is a separate App Store action.
 
-### 11.8 Free relay (主力0) upgrade
+### 11.9 Free relay (主力0) upgrade
 
 1. Upload the same bundle and run `sudo ./install.sh` (existing config kept).
 2. Edit the `accounts` block (or use the CLI) to:
@@ -1265,7 +1347,7 @@ and retried; relaying itself never waits for it.
 4. Verify `/healthz` returns `role:0, accounts:false` and the 主力1 admin shows
    `primary-0` traffic within about 30 seconds.
 
-### 11.9 Security notes
+### 11.10 Security notes
 
 - The account service handles emails, password hashes, session token hashes, and
   App Store subscription identifiers. Treat `data/` and the config as personal

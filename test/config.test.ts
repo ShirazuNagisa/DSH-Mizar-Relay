@@ -242,6 +242,13 @@ describe('the relay role and account service', () => {
         notificationsEnabled: true,
       },
     })
+    // A paid relay that owns the account store gates by default: the whole
+    // point of naming a relay the paid one is that it carries paying accounts.
+    expect(config.accounts?.paidGate).toEqual({
+      mode: 'enforce',
+      allowUnaccounted: false,
+      cacheTtlMs: 60_000,
+    })
     const env = loadConfig(path, {
       MIZAR_ACCOUNTS_ENABLED: 'false',
       MIZAR_GRAVATAR_BASE_URLS: 'https://a.test, https://b.test',
@@ -252,5 +259,7 @@ describe('the relay role and account service', () => {
     expect(env.accounts?.gravatar.baseURLs).toEqual(['https://a.test', 'https://b.test'])
     expect(env.accounts?.appleAudiences).toEqual(['me.shirazu.dshmizar', 'com.example.other'])
     expect(env.accounts?.appstore.allowSandbox).toBe(false)
+    // No store, no gate: it must not report itself as enforcing.
+    expect(env.accounts?.paidGate.mode).toBe('off')
   })
 })

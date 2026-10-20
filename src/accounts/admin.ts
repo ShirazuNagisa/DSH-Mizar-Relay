@@ -57,6 +57,8 @@ export interface AdminOptions {
   readonly productId: string
   readonly version: string
   readonly trustProxy: boolean
+  /** The paid gate's mode, for the settings page. */
+  readonly paidGate?: string
   readonly now?: () => number
 }
 
@@ -457,6 +459,7 @@ export class AdminApi {
         bundleId: this.#options.bundleId,
         productId: this.#options.productId,
         version: this.#options.version,
+        paidGate: this.#options.paidGate ?? 'off',
       }),
     )
     return true

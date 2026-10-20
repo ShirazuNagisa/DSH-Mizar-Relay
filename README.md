@@ -19,7 +19,13 @@
 从 0.2.4 起，中继可以承担账户服务：
 
 - `role: 0` 是免费中继（主力0），`role: 1` 是付费/账户中继（主力1）。
-  role 只用于标记和流量归属，**不会拒绝隧道连接**。
+  role 本身不拒绝隧道连接 —— 拒绝的是下一条的付费门禁。
+- **付费门禁**：`role: 1` 且开启账户服务时默认 `enforce`，手机必须在
+  `x-mizar-session` 里带账户会话令牌，中继解析后只认「付费期仍在进行」的账户；
+  免费账户得 `402 PAID_REQUIRED`，未登录 `401`。`/mizar/v1/hello` 与
+  `/mizar/v1/pair` 放行（配对前还没有账户），隧道 `/tunnel` 不拦（隧道本身不产生
+  流量，带宽在手机这一侧被守住）。灰度时用 `"mode": "observe"` 只记录不拦截。
+  细节见 `docs/deployment.md` 11.7。
 - `accounts.enabled: true` 的中继提供：
   - `/account/v1/*`：注册、登录、Apple 登录、邀请码兑换、App Store 订阅校验
   - `/admin`：用户/游客/流量/邀请码/设置后台（管理员密码 + HttpOnly cookie + CSRF）

@@ -7,6 +7,11 @@
  * the user would be a second trust boundary the design does not want. The host
  * plugin never sees either header; they are stripped before replay.
  *
+ * The paid relay is the one place that does need the token itself, so a third
+ * header carries it: {@link SESSION_HEADER}. It is read by the paid gate, used
+ * for nothing else, stripped before replay, and never written to a log or a
+ * traffic file -- which is why the ledger still buckets by the hash.
+ *
  * @module dsh-mizar-relay/accounts/identity
  */
 import { createHash } from 'node:crypto'
@@ -17,8 +22,19 @@ export const CLIENT_ID_HEADER = 'x-mizar-client-id'
 /** The account-token-hash header. */
 export const ACCOUNT_HEADER = 'x-mizar-account'
 
+/**
+ * The account session token, presented to the paid relay.
+ *
+ * Only ever sent to a relay that owns the account store -- the free relay never
+ * needs it, and giving a token to a host that does not verify it is handing out
+ * a credential for nothing. Unlike {@link ACCOUNT_HEADER} this one is a real
+ * secret, so it is stripped before the request reaches the computer and it is
+ * never logged.
+ */
+export const SESSION_HEADER = 'x-mizar-session'
+
 /** The headers the relay consumes and never forwards. */
-export const PRIVATE_HEADERS: readonly string[] = [CLIENT_ID_HEADER, ACCOUNT_HEADER]
+export const PRIVATE_HEADERS: readonly string[] = [CLIENT_ID_HEADER, ACCOUNT_HEADER, SESSION_HEADER]
 
 /** The identity of one request. */
 export type RelayIdentity =

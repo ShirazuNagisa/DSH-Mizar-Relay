@@ -27,6 +27,7 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
 import { AccountApi } from './accounts/api.js'
 import { AdminApi } from './accounts/admin.js'
+import { PaidGate, isGateExempt, type GateDecision } from './accounts/gate.js'
 import { identityFor, isPrivateHeader } from './accounts/identity.js'
 import { parseHash } from './accounts/passwords.js'
 import { AccountStore } from './accounts/store.js'
@@ -205,6 +206,15 @@ export async function startRelay(
       'accounts.enabled requires a valid adminPasswordHash; run the installer or the account CLI to generate one',
     )
   }
+  // `loadConfig` already refuses this, but a caller can hand `startRelay` a
+  // config it built itself -- and a gate with no store would report itself as
+  // enforcing while letting everybody through.
+  if (accountsConfig !== null && accountsConfig.paidGate.mode !== 'off' && !accountsConfig.enabled) {
+    throw new Error(
+      `accounts.paidGate.mode is "${accountsConfig.paidGate.mode}" but accounts.enabled is false; ` +
+        'the gate has no account store to verify against',
+    )
+  }
   const accountStore =
     accountsConfig?.enabled === true
       ? await AccountStore.open({
@@ -241,6 +251,62 @@ export async function startRelay(
   accountStore?.setTrafficRemover((hashes) => {
     for (const hash of hashes) traffic.remove(`account:${hash}`)
   })
+
+  // The paid gate. It is built only when the relay both owns the account store
+  // and was told to gate; `loadConfig` refuses the combination of "enforce" and
+  // "no store", so a misconfiguration is a startup failure rather than a
+  // protection that reports itself as on and is not. The gate registers its own
+  // invalidation hook with the store, so a refund or a sign-out reaches it
+  // without this file having to remember to connect the two.
+  const gateConfig = accountsConfig?.paidGate ?? null
+  const paidGate =
+    accountStore === null || gateConfig === null || gateConfig.mode === 'off'
+      ? null
+      : new PaidGate({
+          store: accountStore,
+          mode: gateConfig.mode,
+          allowUnaccounted: gateConfig.allowUnaccounted,
+          cacheTtlMs: gateConfig.cacheTtlMs,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+
+  /**
+   * Answer a request the paid gate refused.
+   *
+   * `402` is the one a phone acts on: it means "sign in with a paying account",
+   * which is a different screen from `401` ("your session is gone"). `Retry-After`
+   * is deliberately absent -- waiting does not help a free account.
+   */
+  function refuseGate(response: ServerResponse, decision: GateDecision & { allowed: false }): void {
+    response.setHeader('x-mizar-gate', decision.code)
+    writeJson(response, decision.status, { error: decision.code, message: decision.message })
+  }
+
+  /**
+   * Answer a WebSocket upgrade the paid gate refused.
+   *
+   * A raw response rather than `wss.handleUpgrade`: the point is to never
+   * complete the handshake. The phone's URLSession surfaces the status code of a
+   * failed upgrade, which is how the app can tell "this server is for paid
+   * accounts" from "the network is down" instead of showing one message for both.
+   */
+  function refuseUpgrade(socket: Duplex, decision: GateDecision & { allowed: false }): void {
+    const body = JSON.stringify({ error: decision.code, message: decision.message })
+    const reason =
+      decision.status === 402 ? 'Payment Required' : decision.status === 403 ? 'Forbidden' : 'Unauthorized'
+    socket.write(
+      `HTTP/1.1 ${decision.status} ${reason}\r\n` +
+        'content-type: application/json; charset=utf-8\r\n' +
+        `content-length: ${Buffer.byteLength(body)}\r\n` +
+        'cache-control: no-store\r\n' +
+        `x-mizar-gate: ${decision.code}\r\n` +
+        'connection: close\r\n\r\n' +
+        body,
+    )
+    socket.destroy()
+  }
+
   const accountApi =
     accountStore === null
       ? null
@@ -264,6 +330,7 @@ export async function startRelay(
           productId: accountsConfig.appstore.productId,
           version: RELAY_VERSION,
           trustProxy: config.trustProxy,
+          paidGate: paidGate?.mode ?? 'off',
           ...(deps.now === undefined ? {} : { now: deps.now }),
         })
 
@@ -291,6 +358,10 @@ export async function startRelay(
         version: TUNNEL_PROTOCOL_VERSION,
         role: config.role,
         accounts: accountStore !== null,
+        // `off` when this relay carries anybody, which is every free relay and
+        // every paid one that has not opted in. A monitoring check can read this
+        // one field and know whether the paywall is actually up.
+        paidGate: paidGate?.mode ?? 'off',
       })
       return
     }
@@ -342,12 +413,33 @@ export async function startRelay(
       return
     }
 
+    // The paywall, before a single byte is read from the body: an unpaid caller
+    // should cost the relay a header parse and a map lookup, not a megabyte.
+    // `/hello` and `/pair` are exempt -- they are the handshake a phone needs
+    // *before* it has an account, and neither carries conversation traffic.
+    const gateDecision =
+      paidGate === null || isGateExempt(split.path) ? null : paidGate.authorize(request.headers)
+    if (gateDecision !== null && !gateDecision.allowed) {
+      refuseGate(response, gateDecision)
+      return
+    }
+
     const peer = clientAddress(request.socket.remoteAddress, request.headers, config.trustProxy !== false)
-    const identity = identityFor(request.headers, {
-      room: split.room,
-      peer,
-      userAgent: request.headers['user-agent'] ?? '',
-    })
+    // A token the gate verified is a better identity than the `x-mizar-account`
+    // hash the phone claims: one cannot be spoofed, the other can, and the hash
+    // is what decides which account pays for these bytes.
+    const verifiedHash =
+      gateDecision !== null && gateDecision.allowed && gateDecision.tokenHash !== ''
+        ? gateDecision.tokenHash
+        : null
+    const identity =
+      verifiedHash === null
+        ? identityFor(request.headers, {
+            room: split.room,
+            peer,
+            userAgent: request.headers['user-agent'] ?? '',
+          })
+        : { kind: 'account' as const, hash: verifiedHash, key: `account:${verifiedHash}` }
     const body = await readBody(request, config.maxBodyBytes)
     if (body === null) {
       writeJson(response, 413, { error: 'request body too large' })
@@ -594,12 +686,29 @@ export async function startRelay(
       return
     }
 
+    // The session socket is where every conversation byte goes, so this is the
+    // gate that matters most. It runs before a slot is taken or the computer is
+    // disturbed: an unpaid caller never causes a `ws-open` to be sent upstream.
+    const gateDecision =
+      paidGate === null || isGateExempt(split.path) ? null : paidGate.authorize(request.headers)
+    if (gateDecision !== null && !gateDecision.allowed) {
+      refuseUpgrade(socket, gateDecision)
+      return
+    }
+
     const peer = clientAddress(request.socket.remoteAddress, request.headers, config.trustProxy !== false)
-    const identity = identityFor(request.headers, {
-      room: split.room,
-      peer,
-      userAgent: request.headers['user-agent'] ?? '',
-    })
+    const verifiedHash =
+      gateDecision !== null && gateDecision.allowed && gateDecision.tokenHash !== ''
+        ? gateDecision.tokenHash
+        : null
+    const identity =
+      verifiedHash === null
+        ? identityFor(request.headers, {
+            room: split.room,
+            peer,
+            userAgent: request.headers['user-agent'] ?? '',
+          })
+        : { kind: 'account' as const, hash: verifiedHash, key: `account:${verifiedHash}` }
 
     // `maxClientsPerRoom` is the only bound on how many sockets one room holds,
     // and it counts the ones still waiting for the computer as well as the bridged
@@ -893,6 +1002,14 @@ export async function startRelay(
       ? 'relay: open registration — any plugin may register a room'
       : `relay: ${config.tokens.length} configured credential(s)`,
   )
+  if (paidGate !== null) {
+    log(
+      paidGate.mode === 'enforce'
+        ? 'relay: paid gate is enforcing — only paying accounts are carried' +
+            (gateConfig?.allowUnaccounted === true ? ' (unaccounted phones allowed)' : '')
+        : 'relay: paid gate is observing — refusals are counted and logged, nothing is blocked',
+    )
+  }
 
   const probe = startProbe(config, log)
 

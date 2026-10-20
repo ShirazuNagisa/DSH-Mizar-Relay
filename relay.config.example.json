@@ -26,6 +26,11 @@
     "reportTo": "",
     "reportId": "",
     "publicBaseURL": "",
+    "paidGate": {
+      "mode": "off",
+      "allowUnaccounted": false,
+      "cacheTtlMs": 60000
+    },
     "gravatar": {
       "enabled": true,
       "baseURLs": [
@@ -44,6 +49,6 @@
     }
   },
   "_accounts": {
-    "_comment": "role=0 是免费中继，role=1 是付费/账户中继。账户服务只在 accounts.enabled=true 时开启；主力0 保持 enabled=false，并把 reportTo 指向主力1、internalSecret 配成与主力1 相同。adminPasswordHash 用 node lib/accounts/cli.js admin-secret 生成；不要在这里写明文密码。App Store 订阅的 productId 必须与 App Store Connect 和 iOS 常量一致。"
+    "_comment": "role=0 是免费中继，role=1 是付费/账户中继。账户服务只在 accounts.enabled=true 时开启；主力0 保持 enabled=false，并把 reportTo 指向主力1、internalSecret 配成与主力1 相同。adminPasswordHash 用 node lib/accounts/cli.js admin-secret 生成；不要在这里写明文密码。App Store 订阅的 productId 必须与 App Store Connect 和 iOS 常量一致。paidGate 是付费门禁：mode=off 不校验、observe 只统计不拦截（灰度用）、enforce 拒绝非付费账户。不写这个块时，role=1 且 accounts.enabled=true 默认就是 enforce，所以这份免费中继示例显式写 off；部署到主力1 时请把 mode 改成 enforce，或直接删掉整个 paidGate 块。allowUnaccounted 放行完全没有账户的客户端（例如尚未支持登录的 Android）。"
   }
 }

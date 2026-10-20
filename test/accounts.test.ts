@@ -76,6 +76,7 @@ function config(overrides: Partial<RelayConfig> = {}): RelayConfig {
         notificationsEnabled: true,
       },
       publicBaseURL: 'https://accounts.test',
+      paidGate: { mode: 'off', allowUnaccounted: false, cacheTtlMs: 60_000 },
     },
     ...overrides,
   }

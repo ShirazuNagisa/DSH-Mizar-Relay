@@ -127,6 +127,32 @@ export interface AppStoreConfig {
   readonly notificationsEnabled: boolean
 }
 
+/**
+ * What the paid gate does with a request that is not from a paying account.
+ *
+ * `observe` exists for a rollout: it counts and logs the refusals it *would*
+ * have made and lets the request through, so an operator can watch a new build
+ * of the app reach every phone before the gate starts rejecting anything.
+ */
+export type PaidGateMode = 'off' | 'observe' | 'enforce'
+
+/** How the paid relay decides who may use its bandwidth. */
+export interface PaidGateConfig {
+  /** Whether the gate runs, counts only, or refuses. */
+  readonly mode: PaidGateMode
+  /**
+   * Whether a phone with no account at all is allowed through.
+   *
+   * Off by default: the point of the gate is that the paid relay carries paying
+   * accounts. It exists because a client that cannot sign in yet (Android
+   * today) would otherwise be locked out of a relay its computer is attached
+   * to.
+   */
+  readonly allowUnaccounted: boolean
+  /** How long a verified entitlement may be reused, in ms. */
+  readonly cacheTtlMs: number
+}
+
 /** What the account service needs to run. */
 export interface AccountsConfig {
   /** Whether this relay serves accounts/admin/traffic aggregation. */
@@ -141,6 +167,8 @@ export interface AccountsConfig {
   readonly reportTo: string
   /** This relay's id in the traffic report. */
   readonly reportId: string
+  /** How the paid relay treats a phone that is not paying for it. */
+  readonly paidGate: PaidGateConfig
   /** Gravatar lookup policy. */
   readonly gravatar: GravatarConfig
   /** Apple identity-token audiences (the bundle id). */
@@ -167,6 +195,12 @@ export interface AccountsFileConfig {
   }
   readonly appleAudiences?: readonly string[]
   readonly appleKeysURL?: string
+  readonly paidGate?: {
+    /** `true`/`false` are accepted as shorthand for `enforce`/`off`. */
+    readonly mode?: PaidGateMode | boolean
+    readonly allowUnaccounted?: boolean
+    readonly cacheTtlMs?: number
+  }
   readonly appstore?: {
     readonly bundleId?: string
     readonly productId?: string
@@ -244,6 +278,10 @@ export function loadConfig(
     .map((token) => token.trim())
     .filter((token) => token !== '')
 
+  // Resolved before the object below because the paid gate's default depends on
+  // it: only the paid relay gates, and only when it also owns the account store.
+  const role = readRole(pick(env['MIZAR_RELAY_ROLE'], file.role, 0))
+
   return {
     port: Number(pick(env['MIZAR_RELAY_PORT'], file.port, 8787)),
     host: pick(env['MIZAR_RELAY_HOST'], file.host, '127.0.0.1'),
@@ -261,8 +299,8 @@ export function loadConfig(
     probePort: Number(pick(env['MIZAR_RELAY_PROBE_PORT'], file.probePort, 8788)),
     apns: readApns(env, file.apns ?? null),
     fcm: readFcm(env, (file.fcm ?? null) as FcmFileConfig | null),
-    role: readRole(pick(env['MIZAR_RELAY_ROLE'], file.role, 0)),
-    accounts: readAccounts(env, (file.accounts ?? null) as AccountsFileConfig | null),
+    role,
+    accounts: readAccounts(env, (file.accounts ?? null) as AccountsFileConfig | null, role),
   }
 }
 
@@ -296,11 +334,13 @@ function readRole(value: unknown): 0 | 1 {
  *
  * @param env - the environment.
  * @param file - the `accounts` object from the config file, when present.
+ * @param role - the relay's role, which decides the paid gate's default.
  * @returns the configuration, or `null` when accounts are not configured.
  */
 function readAccounts(
   env: NodeJS.ProcessEnv,
   file: AccountsFileConfig | null,
+  role: 0 | 1,
 ): AccountsConfig | null {
   if (file === null) return null
   const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
@@ -316,13 +356,15 @@ function readAccounts(
 
   const gravatar = file.gravatar ?? {}
   const appstore = file.appstore ?? {}
+  const enabled = flagOr(pick(env['MIZAR_ACCOUNTS_ENABLED'], file.enabled, false), false)
   return {
-    enabled: flagOr(pick(env['MIZAR_ACCOUNTS_ENABLED'], file.enabled, false), false),
+    enabled,
     dataDir: pick(env['MIZAR_ACCOUNTS_DATA_DIR'], file.dataDir, './data'),
     adminPasswordHash: pick(env['MIZAR_ADMIN_PASSWORD_HASH'], file.adminPasswordHash, ''),
     internalSecret: pick(env['MIZAR_ACCOUNT_INTERNAL_SECRET'], file.internalSecret, ''),
     reportTo: pick(env['MIZAR_ACCOUNT_REPORT_TO'], file.reportTo, ''),
     reportId: pick(env['MIZAR_ACCOUNT_REPORT_ID'], file.reportId, ''),
+    paidGate: readPaidGate(env, file.paidGate ?? {}, role, enabled),
     gravatar: {
       enabled: flagOr(pick(env['MIZAR_ACCOUNTS_GRAVATAR'], gravatar.enabled, true), true),
       baseURLs: commaList(
@@ -354,6 +396,81 @@ function readAccounts(
     },
     publicBaseURL: pick(env['MIZAR_ACCOUNT_PUBLIC_BASE_URL'], file.publicBaseURL, ''),
   }
+}
+
+/**
+ * Resolve the paid gate.
+ *
+ * The default is the whole policy in one line: a relay that owns the account
+ * store and calls itself the paid one gates, and everything else does not. A
+ * free relay has no store to check against, so `enforce` there would be a
+ * startup failure rather than a gate that silently lets everybody through --
+ * a protection that reports itself as on and is not is worse than none.
+ *
+ * @param env - the environment.
+ * @param file - the `paidGate` object from the config file, when present.
+ * @param role - the relay's role.
+ * @param accountsEnabled - whether the account store runs on this relay.
+ * @returns the gate configuration.
+ * @throws when the gate is asked to enforce without a store to enforce with.
+ */
+function readPaidGate(
+  env: NodeJS.ProcessEnv,
+  file: NonNullable<AccountsFileConfig['paidGate']>,
+  role: 0 | 1,
+  accountsEnabled: boolean,
+): PaidGateConfig {
+  const raw = env['MIZAR_PAID_GATE'] !== undefined && env['MIZAR_PAID_GATE'] !== ''
+    ? env['MIZAR_PAID_GATE']
+    : file.mode
+  const fallback: PaidGateMode = accountsEnabled && role === 1 ? 'enforce' : 'off'
+  const mode = parsePaidGateMode(raw, fallback)
+  if (mode !== 'off' && !accountsEnabled) {
+    throw new Error(
+      `paidGate.mode is "${mode}" but accounts.enabled is false; ` +
+        'the gate has no account store to verify against. Set accounts.enabled=true, ' +
+        'or paidGate.mode="off".',
+    )
+  }
+  const ttlRaw = Number(
+    env['MIZAR_PAID_GATE_CACHE_TTL'] !== undefined && env['MIZAR_PAID_GATE_CACHE_TTL'] !== ''
+      ? env['MIZAR_PAID_GATE_CACHE_TTL']
+      : (file.cacheTtlMs ?? 60_000),
+  )
+  const cacheTtlMs = Number.isFinite(ttlRaw) ? Math.min(600_000, Math.max(0, Math.round(ttlRaw))) : 60_000
+  return {
+    mode,
+    allowUnaccounted: flagOr(
+      env['MIZAR_PAID_GATE_ALLOW_UNACCOUNTED'] !== undefined &&
+        env['MIZAR_PAID_GATE_ALLOW_UNACCOUNTED'] !== ''
+        ? env['MIZAR_PAID_GATE_ALLOW_UNACCOUNTED']
+        : (file.allowUnaccounted ?? false),
+      false,
+    ),
+    cacheTtlMs,
+  }
+}
+
+/**
+ * Read a gate mode.
+ *
+ * Booleans are accepted because `"mode": true` is the shortest thing an
+ * operator can write and means exactly what it looks like. Anything else that
+ * is not a mode is an error: a typo must not quietly disable a paywall.
+ *
+ * @param value - the file or environment value.
+ * @param fallback - the answer when nothing was set.
+ * @returns the mode.
+ * @throws when the value is not a mode.
+ */
+function parsePaidGateMode(value: unknown, fallback: PaidGateMode): PaidGateMode {
+  if (value === undefined || value === '') return fallback
+  if (typeof value === 'boolean') return value ? 'enforce' : 'off'
+  const text = String(value).trim().toLowerCase()
+  if (text === '1' || text === 'true' || text === 'yes' || text === 'on') return 'enforce'
+  if (text === '0' || text === 'false' || text === 'no' || text === 'off') return 'off'
+  if (text === 'observe' || text === 'enforce') return text
+  throw new Error(`paidGate.mode must be off, observe or enforce, got ${String(value)}`)
 }
 
 /**

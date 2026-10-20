@@ -442,6 +442,8 @@ export interface AdminSettingsData {
   readonly bundleId: string
   readonly productId: string
   readonly version: string
+  /** `off`, `observe` or `enforce`. */
+  readonly paidGate: string
 }
 
 /** The settings page. */
@@ -455,6 +457,13 @@ export function settingsPage(data: AdminSettingsData): string {
        <tr><th>公开地址</th><td class="mono">${h(data.publicBaseURL || '—')}</td></tr>
        <tr><th>App Bundle</th><td class="mono">${h(data.bundleId)}</td></tr>
        <tr><th>订阅 Product ID</th><td class="mono">${h(data.productId)}</td></tr>
+       <tr><th>付费门禁</th><td>${
+         data.paidGate === 'enforce'
+           ? 'enforce（非付费账户拒绝接入）'
+           : data.paidGate === 'observe'
+             ? 'observe（只记录，不拦截）'
+             : 'off（不校验付费状态）'
+       }</td></tr>
        <tr><th>版本</th><td class="mono">${h(data.version)}</td></tr>
      </tbody></table>
      <p class="muted" style="margin-top:16px">端口、令牌、TLS 等底层配置在 <span class="mono">relay.config.json</span> 中，后台只读展示。</p>`,

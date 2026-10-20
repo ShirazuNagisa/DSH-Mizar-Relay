@@ -149,6 +149,7 @@ function config(): RelayConfig {
         notificationsEnabled: true,
       },
       publicBaseURL: 'https://accounts.test',
+      paidGate: { mode: 'off', allowUnaccounted: false, cacheTtlMs: 60_000 },
     },
   }
 }

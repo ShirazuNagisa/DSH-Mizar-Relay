@@ -159,7 +159,16 @@ async function main() {
     check('a request reaches the tunnel and its answer comes back', false, error.message)
   }
 
-  // --- a WebSocket is bridged ----------------------------------------------
+  // --- a WebSocket is bridged, or the paid gate refuses it ------------------
+  //
+  // A role-1 relay with the paywall up refuses a phone that sent no
+  // `x-mizar-session`, and this script has no account to sign in with. That
+  // refusal is the gate working, so on an enforcing relay the check asserts the
+  // refusal instead: a gated relay that let this socket through would be the
+  // failure. Observe mode still carries the request, so the bridge proves
+  // itself there, and `allowUnaccounted` lets this account-less socket through
+  // the same way it lets an Android phone through.
+  const gated = health.paidGate === 'enforce' && health.paidGateAllowUnaccounted !== true
   const bridged = await new Promise((resolve) => {
     const phone = new WebSocket(`${wsBase}/r/${room.room}/mizar/v1/ws`)
     phone.on('message', (data) => {
@@ -170,7 +179,11 @@ async function main() {
     phone.on('error', (error) => resolve(error.message))
     setTimeout(() => resolve('timeout'), 5000)
   })
-  check('a phone WebSocket is bridged through to the tunnel', bridged === 'bridged', bridged)
+  if (gated) {
+    check('the paid gate refuses a phone WebSocket with no account session', bridged === 'HTTP 401', bridged)
+  } else {
+    check('a phone WebSocket is bridged through to the tunnel', bridged === 'bridged', bridged)
+  }
 
   // --- an unknown room is a 404, like one whose computer is away ----------------
   const unknown = await fetch(`${base}/r/AAAAAAAAAAAA/mizar/v1/hello`)

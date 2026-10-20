@@ -166,6 +166,28 @@ export interface AccountNotice {
   readonly revokedDevice: string
 }
 
+/**
+ * What one session token resolves to.
+ *
+ * The paid gate asks this on every relayed request, so it is a value rather
+ * than an exception: "not signed in", "signed out elsewhere", "expired",
+ * "disabled" and "signed in but not paying" are five different answers on the
+ * wire, and a phone acts differently on each of them.
+ */
+export type TokenEntitlement =
+  | {
+      readonly ok: true
+      readonly userId: string
+      /** End of the paid period, or `null` when there is none. */
+      readonly paidUntil: number | null
+      /** Whether the period is still running at the time of the check. */
+      readonly paid: boolean
+    }
+  | {
+      readonly ok: false
+      readonly reason: 'unknown' | 'revoked' | 'expired' | 'disabled'
+    }
+
 /** What a login/register/apple call returns. */
 export interface AuthResult {
   readonly token: string

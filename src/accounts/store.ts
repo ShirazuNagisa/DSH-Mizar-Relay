@@ -29,8 +29,17 @@ import type {
   InvitesFile,
   PublicUser,
   SessionRecord,
+  TokenEntitlement,
   UserRecord,
 } from './types.js'
+
+/**
+ * How long a session token is valid.
+ *
+ * A phone that has not opened the app in half a year signs in again, which is
+ * also the only way a token that leaked from a backup stops working on its own.
+ */
+const SESSION_MAX_AGE_MS = 180 * 86_400_000
 
 /** Everything the store needs at open. */
 export interface AccountStoreOptions {
@@ -120,10 +129,19 @@ export class AccountStore {
   readonly #queue = new MutationQueue()
   readonly #users = new Map<string, UserRecord>()
   readonly #sessions: SessionRecord[] = []
+  /**
+   * Sessions by token hash.
+   *
+   * The array is what gets persisted and iterated for per-user queries; this map
+   * is what the paid gate reads, because it runs on every relayed request and a
+   * linear scan over every session ever issued is not a per-request cost.
+   */
+  readonly #sessionsByHash = new Map<string, SessionRecord>()
   readonly #bindings = new Map<string, string>()
   readonly #processed = new Set<string>()
   readonly #invites = new Map<string, InviteRecord>()
   #onDeleteUserHashes: ((hashes: readonly string[]) => void) | null = null
+  #onEntitlementsChanged: ((userId: string) => void) | null = null
   #closed = false
 
   /** Remember one idempotency key, capped so the file cannot grow forever. */
@@ -200,6 +218,49 @@ export class AccountStore {
   /** Register the traffic ledger's cleanup hook for account deletion. */
   setTrafficRemover(remover: (hashes: readonly string[]) => void): void {
     this.#onDeleteUserHashes = remover
+  }
+
+  /**
+   * Register the paid gate's cache-invalidation hook.
+   *
+   * Without it a refund, a revoked device or an admin's downgrade would keep
+   * working until the gate's cache entry expired. The hook makes those changes
+   * take effect on the next request instead, which is what an operator who just
+   * took somebody's access away expects.
+   *
+   * @param listener - called with the account id whose access changed.
+   */
+  setEntitlementListener(listener: (userId: string) => void): void {
+    this.#onEntitlementsChanged = listener
+  }
+
+  /** Tell the gate that one account's access may have changed. */
+  #entitlementsChanged(userId: string): void {
+    this.#onEntitlementsChanged?.(userId)
+  }
+
+  /**
+   * Resolve a raw session token to its account's paid state.
+   *
+   * Deliberately synchronous and side-effect free: it runs before a relayed
+   * request is forwarded, so it must not touch the disk, the mutation queue or
+   * `lastSeenAt`. `/me` remains the endpoint that records activity.
+   *
+   * @param token - the session token as the phone presented it.
+   * @returns the entitlement, or why the token is not usable.
+   */
+  tokenEntitlement(token: string): TokenEntitlement {
+    if (typeof token !== 'string' || token === '') return { ok: false, reason: 'unknown' }
+    const session = this.#sessionsByHash.get(hashToken(token))
+    if (session === undefined) return { ok: false, reason: 'unknown' }
+    if (session.revokedAt !== null) return { ok: false, reason: 'revoked' }
+    const now = this.#now()
+    if (now - session.createdAt > SESSION_MAX_AGE_MS) return { ok: false, reason: 'expired' }
+    const user = this.#users.get(session.userId)
+    if (user === undefined) return { ok: false, reason: 'unknown' }
+    if (user.disabled) return { ok: false, reason: 'disabled' }
+    const paidUntil = effectivePaidUntil(user)
+    return { ok: true, userId: user.id, paidUntil, paid: paidUntil !== null && paidUntil > now }
   }
 
   /** Every session token hash this user has ever had, for traffic lookup. */
@@ -289,6 +350,9 @@ export class AccountStore {
       user.lastSeenAt = now
       user.updatedAt = now
       const issued = this.#issueSession(user, device, now, user.appleSub === null)
+      // A new sign-in can revoke the oldest device's session, and the gate may
+      // be holding that token as allowed.
+      this.#entitlementsChanged(user.id)
       await this.#saveAccounts()
       return { token: issued.token, user: this.#public(user, device.id, now), ...(issued.notice === undefined ? {} : { notice: issued.notice }) }
     })
@@ -349,6 +413,7 @@ export class AccountStore {
       user.lastSeenAt = now
       user.updatedAt = now
       const issued = this.#issueSession(user, device, now, false)
+      this.#entitlementsChanged(user.id)
       await this.#saveAccounts()
       return { token: issued.token, user: this.#public(user, device.id, now), ...(issued.notice === undefined ? {} : { notice: issued.notice }) }
     })
@@ -389,6 +454,7 @@ export class AccountStore {
       const user = this.#users.get(session.userId)
       const device = user?.devices.find((candidate) => candidate.id === session.deviceId)
       if (device !== undefined) device.revokedAt = now
+      this.#entitlementsChanged(session.userId)
       await this.#saveAccounts()
     })
   }
@@ -419,6 +485,7 @@ export class AccountStore {
       }
       await this.#saveAccounts()
       this.#onDeleteUserHashes?.(hashes)
+      this.#entitlementsChanged(session.userId)
       await this.#audit('account-deleted', { userId: session.userId })
     })
   }
@@ -454,6 +521,7 @@ export class AccountStore {
       user.updatedAt = now
       invite.uses += 1
       invite.redemptions.push({ userId: user.id, at: now })
+      this.#entitlementsChanged(user.id)
       await this.#saveAccounts()
       await this.#saveInvites()
       await this.#audit('invite-redeemed', { code: invite.code, userId: user.id, days: invite.days })
@@ -470,6 +538,7 @@ export class AccountStore {
       user.entitlements.grantedPaidUntil =
         days === null ? null : Math.max(now, user.entitlements.grantedPaidUntil ?? 0) + days * 86_400_000
       user.updatedAt = now
+      this.#entitlementsChanged(userId)
       await this.#saveAccounts()
       await this.#audit('grant-changed', { userId, days })
       return this.#public(user, null, now)
@@ -494,6 +563,7 @@ export class AccountStore {
       }
       await this.#saveAccounts()
       await this.#audit('account-disabled', { userId, disabled })
+      this.#entitlementsChanged(userId)
       return this.#public(user, null, now)
     })
   }
@@ -517,6 +587,7 @@ export class AccountStore {
       }
       await this.#saveAccounts()
       await this.#audit('device-revoked', { userId, deviceId })
+      if (revoked) this.#entitlementsChanged(userId)
       return revoked
     })
   }
@@ -543,6 +614,7 @@ export class AccountStore {
       }
       applyTransaction(user, transaction, now)
       this.#rememberProcessed(transaction.transactionId)
+      this.#entitlementsChanged(user.id)
       await this.#saveAccounts()
       await this.#audit('appstore-transaction', {
         userId: user.id,
@@ -582,6 +654,7 @@ export class AccountStore {
       }
       await this.#saveAccounts()
       await this.#audit('appstore-sync', { userId: user.id, count: transactions.length })
+      this.#entitlementsChanged(user.id)
       return this.#public(user, session.deviceId, now)
     })
   }
@@ -617,6 +690,7 @@ export class AccountStore {
         userId: user.id,
         type: notification.notificationType,
       })
+      this.#entitlementsChanged(user.id)
       return true
     })
   }
@@ -740,7 +814,10 @@ export class AccountStore {
       this.#users.set(user.id, user)
       this.#indexes(user)
     }
-    for (const session of file.sessions ?? []) this.#sessions.push(session)
+    for (const session of file.sessions ?? []) {
+      this.#sessions.push(session)
+      this.#sessionsByHash.set(session.tokenHash, session)
+    }
     for (const binding of file.appStoreBindings ?? []) {
       this.#bindings.set(binding.originalTransactionId, binding.userId)
     }
@@ -826,7 +903,7 @@ export class AccountStore {
       }
     }
     const token = `mza_${randomBytes(32).toString('base64url')}`
-    this.#sessions.push({
+    const issued: SessionRecord = {
       tokenHash: hashToken(token),
       userId: user.id,
       deviceId: device.id,
@@ -834,7 +911,9 @@ export class AccountStore {
       lastSeenAt: now,
       revokedAt: null,
       revokedReason: null,
-    })
+    }
+    this.#sessions.push(issued)
+    this.#sessionsByHash.set(issued.tokenHash, issued)
     let notice: AccountNotice | undefined
     if (enforceLimit && user.appleSub === null) {
       const activeDevices = [...new Set(
@@ -874,7 +953,7 @@ export class AccountStore {
       throw new AccountError('SESSION_REVOKED', 'this session was signed out elsewhere', 401)
     }
     const now = this.#now()
-    if (now - session.createdAt > 180 * 86_400_000) {
+    if (now - session.createdAt > SESSION_MAX_AGE_MS) {
       session.revokedAt = now
       session.revokedReason = 'expired'
       throw new AccountError('UNAUTHENTICATED', 'this session has expired', 401)

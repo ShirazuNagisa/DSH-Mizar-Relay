@@ -6,7 +6,7 @@
   "maxTunnelsPerIp": 4,
   "maxRooms": 10000,
   "maxBodyBytes": 4194304,
-  "maxMessageBytes": 4194304,
+  "maxMessageBytes": 921600,
   "maxClientsPerRoom": 8,
   "requestTimeoutMs": 30000,
   "tunnelIdleMs": 90000,

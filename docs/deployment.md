@@ -238,7 +238,7 @@ file looks like this:
   "tokens": ["Zt8kQ2mR9vX4pL6cH1sB3nD7fG0jW5yA"],
   "trustProxy": true,
   "maxBodyBytes": 4194304,
-  "maxMessageBytes": 4194304,
+  "maxMessageBytes": 921600,
   "maxClientsPerRoom": 8,
   "requestTimeoutMs": 30000,
   "tunnelIdleMs": 90000,
@@ -256,7 +256,7 @@ Every key, its environment override and its default — the authoritative list, 
 | `tokens` | `MIZAR_RELAY_TOKENS` | `[]` — any credential is accepted | the bearer tokens a computer may present at `/tunnel`. One token = one computer = one room. Empty is the shipping mode: each plugin invents its own secret and the room is derived from it, so there is nothing to issue (see 4.3) |
 | `trustProxy` | `MIZAR_RELAY_TRUST_PROXY` | `true` | whether `X-Real-IP` / `X-Forwarded-For` may name the computer the **tunnel address limit** counts. Only read when the TCP peer is loopback (the nginx deployment), so a relay exposed directly still counts the real peer. Set it to `false` if you front the relay with a proxy on another host |
 | `maxBodyBytes` | `MIZAR_RELAY_MAX_BODY` | `4194304` (4 MiB) | largest body the relay carries, in either direction: a bigger request from the phone is answered `413`, a bigger answer from the computer is answered `502` |
-| `maxMessageBytes` | `MIZAR_RELAY_MAX_MESSAGE` | `4194304` (4 MiB) | largest single WebSocket message. Past it the bridge closes with code `1009` |
+| `maxMessageBytes` | `MIZAR_RELAY_MAX_MESSAGE` | `921600` (900 KiB) | largest single WebSocket message. Past it the bridge closes with code `1009`. Keep it under iOS's 1 MiB ceiling: exceeding that does not truncate the message, it closes the socket |
 | `maxClientsPerRoom` | `MIZAR_RELAY_MAX_CLIENTS` | `8` | concurrent phone connections allowed per room. A resource guard, not authentication |
 | `requestTimeoutMs` | `MIZAR_RELAY_REQUEST_TIMEOUT` | `30000` | how long a phone request waits for the computer before `502`, and how long a phone WebSocket waits for the computer to accept its upgrade before `504` |
 | `tunnelIdleMs` | `MIZAR_RELAY_TUNNEL_IDLE` | `90000` | how long a tunnel may go without answering a ping before the relay drops it. The relay pings every `tunnelIdleMs / 3` (30 s at the default), never faster than 5 s |

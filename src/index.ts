@@ -30,10 +30,17 @@ import { AdminApi } from './accounts/admin.js'
 import { PaidGate, isGateExempt, type GateDecision } from './accounts/gate.js'
 import { identityFor, isPrivateHeader } from './accounts/identity.js'
 import { parseHash } from './accounts/passwords.js'
+import { DataQuota } from './accounts/quota.js'
 import { AccountStore } from './accounts/store.js'
 import { TrafficLedger, isValidDay, isValidIdentity } from './accounts/traffic.js'
 import { clientAddress } from './client-address.js'
-import { loadConfig, type RelayConfig } from './config.js'
+import {
+  gateStartupChecks,
+  loadConfig,
+  resolveAbuse,
+  type AbuseLimits,
+  type RelayConfig,
+} from './config.js'
 import { FcmClient } from './fcm.js'
 import { parseJsonObject, readBody, writeJson } from './http.js'
 import { deliver, PushRegistry, readDevice, readNotification } from './push.js'
@@ -173,6 +180,8 @@ export async function startRelay(
   /** Live tunnels per source address. Not a security boundary, a resource one. */
   const tunnelsPerIp = new Map<string, number>()
   const wss = new WebSocketServer({ noServer: true })
+  /** The data-plane abuse limits, resolved once and used by the meter and the probe. */
+  const abuse: AbuseLimits = resolveAbuse(config)
   /** Every room's notification endpoints. See `push.ts` for why this is memory. */
   const pushRegistry = new PushRegistry()
   // A key that will not parse is a configuration mistake, not a reason for the
@@ -244,6 +253,8 @@ export async function startRelay(
     role: config.role,
     reportTo: accountsConfig?.reportTo ?? '',
     internalSecret: accountsConfig?.internalSecret ?? '',
+    alertBytesPerDay: abuse.trafficAlertBytesPerDay,
+    alertGrowthFactor: abuse.trafficAlertGrowthFactor,
     ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
     log,
@@ -270,6 +281,36 @@ export async function startRelay(
           ...(deps.now === undefined ? {} : { now: deps.now }),
           log,
         })
+
+  // The paid gate's production posture. `observe` and `allowUnaccounted` are
+  // rollout tools that silently give away the bandwidth this relay sells, so a
+  // paid relay that runs either way is a billing hole wearing a config file.
+  // `strict` turns that from a warning into a start-up refusal; without it the
+  // problems are named loudly and the relay still starts, because a rollout
+  // that cannot be watched is not a rollout.
+  const gateProblems = gateStartupChecks(config)
+  if (gateProblems.length > 0) {
+    const strict = gateConfig?.strict === true
+    for (const problem of gateProblems) {
+      log(`relay: ${strict ? 'REFUSING TO START' : 'WARNING'} — ${problem}`)
+    }
+    if (strict) {
+      throw new Error(
+        `the paid gate is not enforcing and paidGate.strict is on:\n  - ${gateProblems.join('\n  - ')}`,
+      )
+    }
+  }
+
+  // The data-plane meter. One instance, keyed by the same identity keys the
+  // traffic ledger uses, so a caller cannot get a fresh budget by rotating
+  // headers and the two agree on who spent what.
+  const quota = new DataQuota({
+    requestsPerMinute: abuse.requestsPerMinute,
+    ...(abuse.burst > 0 ? { burst: abuse.burst } : {}),
+    bytesPerDay: abuse.bytesPerDay,
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+    log,
+  })
 
   /**
    * Answer a request the paid gate refused.
@@ -362,6 +403,19 @@ export async function startRelay(
         // every paid one that has not opted in. A monitoring check can read this
         // one field and know whether the paywall is actually up.
         paidGate: paidGate?.mode ?? 'off',
+        // The two ways a paywall ships open, spelled out so a monitor can alert
+        // on either without parsing the config. `gateEnforced` is the single
+        // boolean that is true only when both are right.
+        paidGateAllowUnaccounted: accountsConfig?.paidGate.allowUnaccounted ?? false,
+        gateEnforced:
+          paidGate?.mode === 'enforce' && (accountsConfig?.paidGate.allowUnaccounted ?? false) === false,
+        // The data-plane meter, so an operator can see refusals climbing without
+        // reading logs. `entries` is the number of identities being metered.
+        quota: {
+          entries: quota.stats.entries,
+          refusedRate: quota.stats.refusedRate,
+          refusedBudget: quota.stats.refusedBudget,
+        },
       })
       return
     }
@@ -446,6 +500,25 @@ export async function startRelay(
       return
     }
 
+    // The data-plane meter, charged before the bytes are replayed. `admit` costs
+    // a map lookup and refuses an over-quota caller here rather than after the
+    // megabyte has crossed the uplink; the byte count is the request body plus
+    // the answer the relay already knows it will carry.
+    const decision = quota.admit(identity.key, body.length)
+    if (!decision.allowed) {
+      const status = 429
+      response.setHeader('retry-after', String(decision.retryAfterSeconds ?? 60))
+      response.setHeader('x-mizar-quota', decision.reason ?? 'rate')
+      writeJson(response, status, {
+        error: 'QUOTA_EXCEEDED',
+        message:
+          decision.reason === 'budget'
+            ? 'this account has spent its daily traffic allowance'
+            : 'too many requests from this account',
+      })
+      return
+    }
+
     try {
       const result = await tunnel.request(
         request.method ?? 'GET',
@@ -470,6 +543,10 @@ export async function startRelay(
       }
       const payload = result.body === null ? Buffer.alloc(0) : Buffer.from(result.body, 'base64')
       traffic.record(identity.key, body.length, carried)
+      // The answer's bytes were not known at admission time, so they are charged
+      // after the fact. The budget still refuses the *next* request once it is
+      // spent; nothing already delivered is recalled.
+      quota.charge(identity.key, carried)
       response.writeHead(result.status, {
         ...result.headers,
         'content-length': String(payload.length),
@@ -724,6 +801,23 @@ export async function startRelay(
       socket.destroy()
       return
     }
+
+    // The data-plane meter, charged one request for the upgrade itself. The
+    // frames are then charged individually in `bridgePhone`, which is where the
+    // real bytes are. Checking here means a caller that has spent its request
+    // budget cannot even take a phone slot.
+    const quotaDecision = quota.admit(identity.key, 0)
+    if (!quotaDecision.allowed) {
+      socket.write(
+        'HTTP/1.1 429 Too Many Requests\r\n' +
+          `retry-after: ${quotaDecision.retryAfterSeconds ?? 60}\r\n` +
+          `x-mizar-quota: ${quotaDecision.reason ?? 'rate'}\r\n` +
+          'connection: close\r\n\r\n',
+      )
+      socket.destroy()
+      return
+    }
+
     phoneSlots.set(split.room, held + 1)
     // One release per socket, on whichever of its events comes first. The raw
     // Duplex outlives the upgrade -- `ws` wraps it rather than replacing it --
@@ -823,6 +917,11 @@ export async function startRelay(
           return
         }
         traffic.record(identity.key, 0, data.length)
+        // Computer -> phone bytes spend the same daily budget. Refusing here is
+        // dropping the frame rather than the connection: the caller is over its
+        // allowance, but the session the phone already holds should survive
+        // until the day turns over.
+        if (!quota.admit(identity.key, data.length).allowed) return
         opened.phone?.send(data, { binary })
       },
       onClose: (code, reason) => {
@@ -852,6 +951,15 @@ export async function startRelay(
       if (data.length > config.maxMessageBytes) {
         phone.close(1009, 'message too large')
         stream.close(1009, 'message too large')
+        return
+      }
+      // Phone -> computer bytes spend the budget too. This direction is closed
+      // rather than dropped when it is over: a phone that keeps talking past its
+      // allowance is exactly the flood the meter exists to stop, and leaving the
+      // stream open would let it keep paying tokens for frames that go nowhere.
+      if (!quota.admit(identity.key, data.length).allowed) {
+        phone.close(1008, 'traffic allowance spent')
+        stream.close(1008, 'traffic allowance spent')
         return
       }
       traffic.record(identity.key, data.length, 0)
@@ -1044,23 +1152,76 @@ export async function startRelay(
  * project's own code and a readable answer is worth more here than
  * interoperability with a browser.
  *
+ * It is also the relay's one spoofable surface: UDP source addresses can be
+ * forged, so an unthrottled responder is a reflection amplifier pointed at
+ * whoever an attacker names. Two limits keep it from being one -- a per-source
+ * cap for the ordinary case and a global cap that a distributed spoof cannot
+ * walk past -- plus a hard bound on how large a reply grows, so the
+ * amplification factor stays near one instead of near the ratio an attacker
+ * would choose.
+ *
  * @param config - the relay configuration.
  * @param log - where to report.
  * @returns the socket, or `null` when the probe is disabled.
  */
 function startProbe(config: RelayConfig, log: (message: string) => void): UdpSocket | null {
   if (config.probePort <= 0) return null
+  const abuse = resolveAbuse(config)
   const socket = createSocket('udp4')
+
+  // Two token buckets: one per source address and one for the socket. Both are
+  // refilled by wall-clock rather than counted in a window, so a steady trickle
+  // at the limit is allowed and a flood is shed instead of queued.
+  const perSource = new Map<string, number>()
+  let globalTokens = abuse.probeRepliesPerSecond
+  let lastRefill = Date.now()
+  const refill = (): void => {
+    const now = Date.now()
+    const elapsed = Math.max(0, now - lastRefill)
+    lastRefill = now
+    globalTokens = Math.min(
+      abuse.probeRepliesPerSecond,
+      globalTokens + (elapsed / 1000) * abuse.probeRepliesPerSecond,
+    )
+    if (perSource.size > 10_000) perSource.clear()
+    for (const [address, tokens] of perSource) {
+      const next = Math.min(
+        abuse.probeRepliesPerSecondPerSource,
+        tokens + (elapsed / 1000) * abuse.probeRepliesPerSecondPerSource,
+      )
+      if (next >= abuse.probeRepliesPerSecondPerSource) perSource.delete(address)
+      else perSource.set(address, next)
+    }
+  }
+
   socket.on('message', (data: Buffer, from) => {
+    refill()
     // Any payload earns an answer; the peer wants its own address back, not a
-    // handshake.
+    // handshake. Both buckets must have room, and the global one is checked
+    // first so a single spoofed source cannot exhaust it against one victim.
+    if (globalTokens < 1) return
+    const sourceTokens = perSource.get(from.address) ?? abuse.probeRepliesPerSecondPerSource
+    if (sourceTokens < 1) return
+    globalTokens -= 1
+    perSource.set(from.address, sourceTokens - 1)
+
+    // The token is echoed so a peer can match an answer to its own probe. It is
+    // capped and the reply is otherwise fixed-size, which is what keeps the
+    // amplification factor near one: a request of any size earns at most this
+    // many bytes back, so the reflector is not worth an attacker's bandwidth.
+    const MAX_ECHO_BYTES = 32
+    const echoed = data.length > 0 && data.length <= MAX_ECHO_BYTES ? data.toString('utf8') : null
     const reply = JSON.stringify({
       address: from.address,
       port: from.port,
-      // Echoed so a peer can match an answer to its own probe.
-      token: data.length > 0 && data.length <= 64 ? data.toString('utf8') : null,
+      token: echoed,
     })
-    socket.send(Buffer.from(reply, 'utf8'), from.port, from.address)
+    const payload = Buffer.from(reply, 'utf8')
+    // A final hard bound, independent of the fields above: under one MTU and
+    // always smaller than a maximal request, so the reply can never be the
+    // larger half of the exchange.
+    if (payload.length > 512) return
+    socket.send(payload, from.port, from.address)
   })
   socket.on('error', (error) => log(`relay: probe socket error: ${error.message}`))
   socket.bind(config.probePort, '0.0.0.0', () => {

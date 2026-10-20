@@ -101,6 +101,12 @@ export interface RelayConfig {
    * relay over `/internal/v1/traffic`.
    */
   readonly accounts: AccountsConfig | null
+  /**
+   * Data-plane abuse limits. Optional on the type so a hand-written config or
+   * an older test fixture keeps compiling; `loadConfig` always fills it, and
+   * {@link resolveAbuse} fills the defaults when a caller left it out.
+   */
+  readonly abuse?: AbuseLimits
 }
 
 /** Gravatar lookup policy. */
@@ -151,6 +157,73 @@ export interface PaidGateConfig {
   readonly allowUnaccounted: boolean
   /** How long a verified entitlement may be reused, in ms. */
   readonly cacheTtlMs: number
+  /**
+   * Refuse to start a paid relay whose gate is not actually protecting it.
+   *
+   * The rollout modes are deliberate and useful, which is exactly why they are
+   * also the way a paywall ships turned off: `observe` counts instead of
+   * refusing, and `allowUnaccounted` waves through callers with no account. A
+   * relay that calls itself the paid one and runs either way is billing its
+   * owners for bandwidth it gives away. When this is on, that combination is a
+   * start-up failure instead of a log line an operator has to notice.
+   */
+  readonly strict?: boolean
+}
+
+/**
+ * The data-plane abuse limits, and the traffic anomaly threshold.
+ *
+ * These are the knobs that turn the relay from "records every byte of a theft"
+ * into "refuses the theft as it happens". They are optional on
+ * {@link RelayConfig} so a hand-written config or an older test fixture keeps
+ * working; {@link resolveAbuse} fills the safe defaults when the block is
+ * absent. The defaults enforce rather than observe -- a limit that defaults to
+ * off is a limit nobody turns on.
+ */
+export interface AbuseLimits {
+  /** Sustained data-plane requests per minute per identity. `0` disables. */
+  readonly requestsPerMinute: number
+  /** Burst allowance for the request bucket; `0` picks a derived default. */
+  readonly burst: number
+  /** Carried bytes per identity per UTC day. `0` disables. */
+  readonly bytesPerDay: number
+  /** Global UDP probe replies per second. Bounds a spoofed-source reflector. */
+  readonly probeRepliesPerSecond: number
+  /** UDP probe replies per source address per second. */
+  readonly probeRepliesPerSecondPerSource: number
+  /** Per-identity bytes in one day that raises a traffic anomaly. `0` disables. */
+  readonly trafficAlertBytesPerDay: number
+  /** Day-over-day growth multiple that raises a spike anomaly. */
+  readonly trafficAlertGrowthFactor: number
+}
+
+/** The `abuse` block as it appears in the config file; every field optional. */
+export interface AbuseFileConfig {
+  readonly requestsPerMinute?: number
+  readonly burst?: number
+  readonly bytesPerDay?: number
+  readonly probeRepliesPerSecond?: number
+  readonly probeRepliesPerSecondPerSource?: number
+  readonly trafficAlertBytesPerDay?: number
+  readonly trafficAlertGrowthFactor?: number
+}
+
+/**
+ * The enforced defaults for {@link AbuseLimits}.
+ *
+ * One identity may move 2 GiB a day and make 300 requests a minute -- generous
+ * for a conversation, far below what saturates an uplink. The probe is capped
+ * hard because it answers a spoofable UDP packet, and the traffic alert is set
+ * to notice 2 GiB a day, which is a person, not a bot.
+ */
+export const DEFAULT_ABUSE: AbuseLimits = {
+  requestsPerMinute: 300,
+  burst: 0,
+  bytesPerDay: 2 * 1024 * 1024 * 1024,
+  probeRepliesPerSecond: 200,
+  probeRepliesPerSecondPerSource: 5,
+  trafficAlertBytesPerDay: 2 * 1024 * 1024 * 1024,
+  trafficAlertGrowthFactor: 8,
 }
 
 /** What the account service needs to run. */
@@ -200,6 +273,11 @@ export interface AccountsFileConfig {
     readonly mode?: PaidGateMode | boolean
     readonly allowUnaccounted?: boolean
     readonly cacheTtlMs?: number
+    /**
+     * Refuse to start when the gate is not actually protecting a paid relay.
+     * See {@link gateStartupChecks}.
+     */
+    readonly strict?: boolean
   }
   readonly appstore?: {
     readonly bundleId?: string
@@ -301,7 +379,108 @@ export function loadConfig(
     fcm: readFcm(env, (file.fcm ?? null) as FcmFileConfig | null),
     role,
     accounts: readAccounts(env, (file.accounts ?? null) as AccountsFileConfig | null, role),
+    abuse: readAbuse(env, (file.abuse ?? null) as AbuseFileConfig | null),
   }
+}
+
+/**
+ * Resolve the data-plane abuse limits.
+ *
+ * An absent block is the normal state for every deployment that predates the
+ * limits, so it resolves to {@link DEFAULT_ABUSE} rather than to "no limits":
+ * a limit that defaults to off is a limit nobody turns on. `0` is the explicit
+ * way to disable one of them, which an operator has to type.
+ */
+function readAbuse(env: NodeJS.ProcessEnv, file: AbuseFileConfig | null): AbuseLimits {
+  const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
+    fromEnv !== undefined && fromEnv !== '' ? (fromEnv as unknown as T) : (fromFile ?? fallback)
+  const num = (fromEnv: string | undefined, fromFile: number | undefined, fallback: number): number => {
+    const value = Number(pick(fromEnv, fromFile, fallback))
+    return Number.isFinite(value) && value >= 0 ? value : fallback
+  }
+  return {
+    requestsPerMinute: num(
+      env['MIZAR_ABUSE_REQUESTS_PER_MINUTE'],
+      file?.requestsPerMinute,
+      DEFAULT_ABUSE.requestsPerMinute,
+    ),
+    burst: num(env['MIZAR_ABUSE_BURST'], file?.burst, DEFAULT_ABUSE.burst),
+    bytesPerDay: num(env['MIZAR_ABUSE_BYTES_PER_DAY'], file?.bytesPerDay, DEFAULT_ABUSE.bytesPerDay),
+    probeRepliesPerSecond: num(
+      env['MIZAR_ABUSE_PROBE_REPLIES_PER_SECOND'],
+      file?.probeRepliesPerSecond,
+      DEFAULT_ABUSE.probeRepliesPerSecond,
+    ),
+    probeRepliesPerSecondPerSource: num(
+      env['MIZAR_ABUSE_PROBE_REPLIES_PER_SOURCE'],
+      file?.probeRepliesPerSecondPerSource,
+      DEFAULT_ABUSE.probeRepliesPerSecondPerSource,
+    ),
+    trafficAlertBytesPerDay: num(
+      env['MIZAR_ABUSE_TRAFFIC_ALERT_BYTES'],
+      file?.trafficAlertBytesPerDay,
+      DEFAULT_ABUSE.trafficAlertBytesPerDay,
+    ),
+    trafficAlertGrowthFactor: num(
+      env['MIZAR_ABUSE_TRAFFIC_ALERT_GROWTH'],
+      file?.trafficAlertGrowthFactor,
+      DEFAULT_ABUSE.trafficAlertGrowthFactor,
+    ),
+  }
+}
+
+/**
+ * Fill the abuse limits for a config that was built by hand.
+ *
+ * `loadConfig` always produces them, but tests and embedders construct
+ * `RelayConfig` literals. Rather than making the field required -- which would
+ * break every one of those literals for a block most of them do not care about
+ * -- the relay asks for its limits through this and gets the enforced defaults.
+ */
+export function resolveAbuse(config: RelayConfig): AbuseLimits {
+  return config.abuse ?? DEFAULT_ABUSE
+}
+
+/**
+ * Whether a paid relay's gate is actually protecting it.
+ *
+ * The two ways a paywall ships open are `observe` (counts and lets through) and
+ * `allowUnaccounted` (waves callers with no account through). Both are
+ * deliberate rollout tools and both silently give away the bandwidth the relay
+ * is supposed to sell, so this is the check that turns either one from a log
+ * line into a start-up refusal when the operator asks for it with
+ * `paidGate.strict`.
+ *
+ * @param config - the resolved configuration.
+ * @returns the problems found, empty when the gate is enforcing. Each string is
+ *   specific enough to act on without reading the code.
+ */
+export function gateStartupChecks(config: RelayConfig): string[] {
+  const accounts = config.accounts
+  if (accounts === null || !accounts.enabled) return []
+  // A free relay (role 0) is not supposed to gate -- it has no paid users to
+  // gate for -- so its gate state is not a problem, whatever it is.
+  if (config.role !== 1) return []
+  const problems: string[] = []
+  const gate = accounts.paidGate
+  if (gate.mode === 'off') {
+    problems.push(
+      'paidGate.mode is "off": this relay calls itself the paid one and carries every caller, ' +
+        'paying or not. Set paidGate.mode="enforce" (or delete the paidGate block, which defaults to enforce).',
+    )
+  } else if (gate.mode === 'observe') {
+    problems.push(
+      'paidGate.mode is "observe": the gate counts refusals but lets them through, which is a ' +
+        'rollout tool and not a paywall. Switch to "enforce" once the phones have been watched.',
+    )
+  }
+  if (gate.allowUnaccounted) {
+    problems.push(
+      'paidGate.allowUnaccounted is true: any caller with no account at all is carried for free. ' +
+        'Turn it off unless a client that cannot sign in yet has to reach this relay.',
+    )
+  }
+  return problems
 }
 
 /**
@@ -448,6 +627,12 @@ function readPaidGate(
       false,
     ),
     cacheTtlMs,
+    strict: flagOr(
+      env['MIZAR_PAID_GATE_STRICT'] !== undefined && env['MIZAR_PAID_GATE_STRICT'] !== ''
+        ? env['MIZAR_PAID_GATE_STRICT']
+        : (file.strict ?? false),
+      false,
+    ),
   }
 }
 

@@ -13,7 +13,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { loadConfig } from '../src/config.js'
+import { gateStartupChecks, loadConfig, resolveAbuse, DEFAULT_ABUSE } from '../src/config.js'
 
 let dir = ''
 afterEach(async () => {
@@ -248,6 +248,7 @@ describe('the relay role and account service', () => {
       mode: 'enforce',
       allowUnaccounted: false,
       cacheTtlMs: 60_000,
+      strict: false,
     })
     const env = loadConfig(path, {
       MIZAR_ACCOUNTS_ENABLED: 'false',
@@ -261,5 +262,78 @@ describe('the relay role and account service', () => {
     expect(env.accounts?.appstore.allowSandbox).toBe(false)
     // No store, no gate: it must not report itself as enforcing.
     expect(env.accounts?.paidGate.mode).toBe('off')
+  })
+})
+
+describe('the paid gate production posture', () => {
+  /** A paid relay that owns the account store, as a full config. */
+  async function paidRelay(paidGate: Record<string, unknown>): Promise<ReturnType<typeof loadConfig>> {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(
+      path,
+      JSON.stringify({
+        role: 1,
+        accounts: {
+          enabled: true,
+          adminPasswordHash: 'scrypt$1$1$1$c2FsdA==$aGFzaA==',
+          paidGate,
+        },
+      }),
+      'utf8',
+    )
+    return loadConfig(path, {})
+  }
+
+  it('is silent when the gate is enforcing and nothing is waved through', async () => {
+    const config = await paidRelay({ mode: 'enforce', allowUnaccounted: false })
+    expect(gateStartupChecks(config)).toEqual([])
+  })
+
+  it('names the two ways a paywall ships open', async () => {
+    // `observe` counts instead of refusing, and `allowUnaccounted` waves callers
+    // with no account through. Both give away the bandwidth the relay sells, so
+    // each is named specifically enough to act on.
+    expect(gateStartupChecks(await paidRelay({ mode: 'observe' }))).toHaveLength(1)
+    expect(gateStartupChecks(await paidRelay({ mode: 'enforce', allowUnaccounted: true }))).toHaveLength(1)
+    const both = gateStartupChecks(await paidRelay({ mode: 'off', allowUnaccounted: true }))
+    expect(both).toHaveLength(2)
+  })
+
+  it('says nothing about a free relay, which is not supposed to gate', async () => {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(path, JSON.stringify({ role: 0 }), 'utf8')
+    expect(gateStartupChecks(loadConfig(path, {}))).toEqual([])
+  })
+})
+
+describe('the data-plane abuse limits', () => {
+  it('enforce by default rather than waiting to be turned on', async () => {
+    const home = await scratch()
+    // No abuse block at all: the limits a deployment gets are the enforcing
+    // ones, because a limit that defaults to off is a limit nobody turns on.
+    const config = loadConfig(join(home, 'relay.config.json'), {})
+    expect(config.abuse).toEqual(DEFAULT_ABUSE)
+    expect(resolveAbuse(config).bytesPerDay).toBeGreaterThan(0)
+  })
+
+  it('take the environment over the file, and accept 0 as a real value', async () => {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(path, JSON.stringify({ abuse: { requestsPerMinute: 10, bytesPerDay: 1000 } }), 'utf8')
+    expect(loadConfig(path, {}).abuse).toMatchObject({ requestsPerMinute: 10, bytesPerDay: 1000 })
+    // `0` disables a limit and must survive the trip through the environment;
+    // an empty string is still "unset".
+    expect(loadConfig(path, { MIZAR_ABUSE_REQUESTS_PER_MINUTE: '0' }).abuse).toMatchObject({
+      requestsPerMinute: 0,
+    })
+  })
+
+  it('fall back to the defaults for a config built by hand', () => {
+    // Tests and embedders construct RelayConfig literals without the block;
+    // the meter asks through resolveAbuse and still gets enforcing limits.
+    const bare = { abuse: undefined } as Parameters<typeof resolveAbuse>[0]
+    expect(resolveAbuse(bare)).toEqual(DEFAULT_ABUSE)
   })
 })

@@ -233,19 +233,38 @@ describe('invites and admin', () => {
     const created = await fetch(`${base}/admin/invites`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
-      body: new URLSearchParams({ _csrf: csrf, code: 'MZ-TEST', days: '30', maxUses: '2' }),
+      body: new URLSearchParams({ _csrf: csrf, code: 'MZ-TESTCODE', days: '30', maxUses: '2' }),
       redirect: 'manual',
     })
     expect(created.status).toBe(303)
 
-    const first = await json(base, '/account/v1/invite/redeem', { code: 'MZ-TEST' }, token)
+    const first = await json(base, '/account/v1/invite/redeem', { code: 'MZ-TESTCODE' }, token)
     expect(first.status).toBe(200)
     expect((first.body['user'] as Record<string, unknown>)['plan']).toBe('paid')
-    const second = await json(base, '/account/v1/invite/redeem', { code: 'MZ-TEST' }, token)
+    const second = await json(base, '/account/v1/invite/redeem', { code: 'MZ-TESTCODE' }, token)
     expect(second.status).toBe(200)
     const paidUntil = (second.body['user'] as Record<string, unknown>)['paidUntil'] as number
     expect(paidUntil).toBeGreaterThan(NOW + 59 * 86_400_000)
     expect(user['plan']).toBe('free')
+  })
+
+  it('refuses to mint an invite code too short to guess-resistant', async () => {
+    // A code is a bearer capability for paid days, so it is held to the same
+    // bar the generated ones are: a four-character code is 20 bits and the
+    // redeem endpoint is reachable by any signed-in account.
+    const base = await boot()
+    await register(base)
+    const cookie = await adminLogin(base)
+    const csrf = await csrfFor(base, cookie)
+    const short = await fetch(`${base}/admin/invites`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
+      body: new URLSearchParams({ _csrf: csrf, code: 'ABCD', days: '30', maxUses: '1' }),
+      redirect: 'manual',
+    })
+    // Rejected before it reaches the store: the admin form answers with a
+    // notice rather than minting a guessable code.
+    expect(short.status).toBeGreaterThanOrEqual(400)
   })
 
   it('serves the admin user and traffic pages without leaking secrets', async () => {

@@ -11,7 +11,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { clientAddress } from '../client-address.js'
 import type { AccountStore } from './store.js'
-import { validateDevice } from './store.js'
+import { hashToken, validateDevice } from './store.js'
 import { AccountError, type DeviceInput } from './types.js'
 import { RateWindow } from './rate.js'
 import { readBody, writeJson, parseJsonObject, stringField } from '../http.js'
@@ -48,6 +48,17 @@ export class AccountApi {
   readonly #ipWindow = new RateWindow(120, 60_000)
   readonly #registerWindow = new RateWindow(10, 60 * 60_000)
   readonly #loginWindow = new RateWindow(10, 15 * 60_000)
+  /**
+   * Invite redemptions, keyed by account.
+   *
+   * A code is a bearer capability for paid days, so the thing worth rate
+   * limiting is the guessing of one. Keyed by the account rather than the
+   * address: a phone that moves between networks keeps its budget, and an
+   * attacker who spreads attempts across addresses still hits the ceiling of
+   * whichever account they signed in to. Five attempts an hour is far more than
+   * a person mistypes a code and far less than a scanner reads them.
+   */
+  readonly #redeemWindow = new RateWindow(5, 60 * 60_000)
 
   constructor(options: AccountApiOptions) {
     this.#store = options.store
@@ -193,7 +204,15 @@ export class AccountApi {
     const body = await this.#json(context)
     if (body === null) return
     const code = requireString(body, 'code')
-    const user = await this.#store.redeemInvite(bearer(context.request), code)
+    const token = bearer(context.request)
+    // Keyed on the account's token hash rather than the raw token: the window
+    // holds these strings for an hour and a session token is a live credential.
+    const key = hashToken(token)
+    if (!this.#redeemWindow.check(key)) {
+      this.#tooMany(context, 'too many invite redemptions; try again later')
+      return
+    }
+    const user = await this.#store.redeemInvite(token, code)
     writeJson(context.response, 200, { user })
   }
 

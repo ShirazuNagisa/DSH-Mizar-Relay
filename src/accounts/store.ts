@@ -745,8 +745,19 @@ export class AccountStore {
       throw new AccountError('INVALID_INPUT', 'maxUses must be between 1 and 1000', 400)
     }
     const code = input.code === undefined || input.code.trim() === '' ? generateInviteCode() : normalizeInviteCode(input.code)
-    if (!/^[A-Z0-9_-]{4,64}$/.test(code)) {
-      throw new AccountError('INVALID_INPUT', 'invite codes are 4-64 characters of A-Z, 0-9, _ and -', 400)
+    // A custom code is a capability: whoever types it collects paid days. The
+    // generated ones are twelve base32 characters, which is 60 bits and cannot
+    // be guessed; a custom one has to be held to the same bar or it becomes the
+    // cheapest way to mint free entitlements. Eight characters of this alphabet
+    // is 40 bits -- enough that a redeem endpoint limited to a handful of tries
+    // a minute cannot be walked -- and the alphabet excludes the letters a
+    // person confuses, so a code read aloud still works.
+    if (!/^[A-Z0-9_-]{8,64}$/.test(code)) {
+      throw new AccountError(
+        'INVALID_INPUT',
+        'invite codes are 8-64 characters of A-Z, 0-9, _ and -',
+        400,
+      )
     }
     const now = this.#now()
     return this.#queue.run(async () => {

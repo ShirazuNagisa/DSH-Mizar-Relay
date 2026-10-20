@@ -140,3 +140,80 @@ describe('the ledger', () => {
     await ledger.close()
   })
 })
+
+describe('traffic anomaly detection', () => {
+  const ID = 'account:' + 'a'.repeat(64)
+
+  it('raises a volume anomaly once an identity passes its daily ceiling', async () => {
+    const now = Date.parse('2026-10-19T12:00:00Z')
+    const logged: string[] = []
+    const ledger = await TrafficLedger.open({
+      dataDir: null,
+      relayId: 'primary-1',
+      role: 1,
+      reportTo: '',
+      internalSecret: '',
+      now: () => now,
+      alertBytesPerDay: 1000,
+      alertGrowthFactor: 0,
+      log: (message) => logged.push(message),
+    })
+    // Under the ceiling: quiet.
+    ledger.record(ID, 400, 400)
+    expect(ledger.anomalies()).toHaveLength(0)
+    // Crossing it is noticed, and only once for the day however many frames
+    // follow -- a burst must be one alert, not one per request.
+    ledger.record(ID, 200, 200)
+    ledger.record(ID, 200, 200)
+    const anomalies = ledger.anomalies()
+    expect(anomalies).toHaveLength(1)
+    expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'volume' })
+    expect(logged.some((line) => line.includes('ANOMALY'))).toBe(true)
+    await ledger.close()
+  })
+
+  it('raises a spike anomaly when today dwarfs the identity own trailing average', async () => {
+    let now = Date.parse('2026-10-12T12:00:00Z')
+    const ledger = await TrafficLedger.open({
+      dataDir: null,
+      relayId: 'primary-1',
+      role: 1,
+      reportTo: '',
+      internalSecret: '',
+      now: () => now,
+      alertBytesPerDay: 0,
+      alertGrowthFactor: 8,
+    })
+    // Seven quiet days at 2MiB establish the baseline.
+    for (let day = 0; day < 7; day += 1) {
+      ledger.record(ID, 1024 * 1024, 1024 * 1024)
+      now += 86_400_000
+    }
+    expect(ledger.anomalies()).toHaveLength(0)
+    // Today is far past 8x that baseline.
+    ledger.record(ID, 20 * 1024 * 1024, 20 * 1024 * 1024)
+    const anomalies = ledger.anomalies()
+    expect(anomalies).toHaveLength(1)
+    expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'spike' })
+    await ledger.close()
+  })
+
+  it('stays quiet for a new identity whose first bytes are small', async () => {
+    const now = Date.parse('2026-10-19T12:00:00Z')
+    const ledger = await TrafficLedger.open({
+      dataDir: null,
+      relayId: 'primary-1',
+      role: 1,
+      reportTo: '',
+      internalSecret: '',
+      now: () => now,
+      alertBytesPerDay: 0,
+      alertGrowthFactor: 8,
+    })
+    // A brand-new account moving its first megabytes is a person signing in,
+    // not a bot: growth only counts past a meaningful absolute size.
+    ledger.record(ID, 512 * 1024, 512 * 1024)
+    expect(ledger.anomalies()).toHaveLength(0)
+    await ledger.close()
+  })
+})

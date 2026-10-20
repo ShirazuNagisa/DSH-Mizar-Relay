@@ -74,6 +74,37 @@ export interface TrafficOptions {
   readonly fetchImpl?: typeof fetch
   /** Logger. */
   readonly log?: (message: string) => void
+  /**
+   * Per-identity bytes in one UTC day that raise a volume anomaly, or `0` to
+   * disable. Defaults to 2 GiB -- a person's heavy day, far past a bot's.
+   */
+  readonly alertBytesPerDay?: number
+  /**
+   * How many times larger than an identity's own trailing daily average today's
+   * total must be to raise a spike anomaly. Defaults to 8. `0` disables.
+   */
+  readonly alertGrowthFactor?: number
+}
+
+/**
+ * One traffic anomaly the ledger noticed.
+ *
+ * Detection is deliberately simple and auditable: a volume threshold and a
+ * self-relative spike. There is no model and no baseline shared between
+ * identities, because the question an operator asks is narrow -- "is this
+ * account doing something it was not doing yesterday" -- and a moving average
+ * of an account's own days answers it without inventing a profile of what
+ * normal looks like for everybody else.
+ */
+export interface TrafficAnomaly {
+  readonly identity: string
+  readonly day: string
+  /** Bytes the identity carried that day at detection time. */
+  readonly bytes: number
+  readonly reason: 'volume' | 'spike'
+  /** For `spike`, the trailing average it broke away from. */
+  readonly baseline: number
+  readonly at: number
 }
 
 /** How often the ledger persists/reports. */
@@ -84,6 +115,12 @@ const RETENTION_DAYS = 90
 
 /** How many identities are kept; a cap against a client-id flood. */
 const MAX_IDENTITIES = 50_000
+
+/** How many anomalies are kept for the admin pages. */
+const MAX_ANOMALIES = 200
+
+/** How many trailing days the spike baseline averages. */
+const BASELINE_DAYS = 7
 
 /** One identity/day pending report. */
 interface PendingReport {
@@ -107,6 +144,12 @@ export class TrafficLedger {
   readonly #identities = new Map<string, IdentityTraffic>()
   readonly #relays = new Map<string, RelayInfo>()
   readonly #pending = new Map<string, PendingReport>()
+  readonly #alertBytesPerDay: number
+  readonly #alertGrowthFactor: number
+  /** Recent anomalies, newest last, bounded. */
+  readonly #anomalies: TrafficAnomaly[] = []
+  /** Identity/day pairs already reported, so one burst is one alert. */
+  readonly #anomalySeen = new Set<string>()
   #timer: NodeJS.Timeout | null = null
   #closed = false
   #lastReportFailure = 0
@@ -121,6 +164,8 @@ export class TrafficLedger {
     this.#now = options.now ?? Date.now
     this.#fetch = options.fetchImpl ?? fetch
     this.#log = options.log ?? (() => undefined)
+    this.#alertBytesPerDay = Math.max(0, options.alertBytesPerDay ?? 2 * 1024 * 1024 * 1024)
+    this.#alertGrowthFactor = Math.max(0, options.alertGrowthFactor ?? 8)
   }
 
   /**
@@ -187,6 +232,7 @@ export class TrafficLedger {
       perRelay.in += incoming
       perRelay.out += outgoing
     }
+    this.#checkAnomaly(identity, day)
     if (this.#reportTo !== '') {
       const key = `${identity}\n${day}`
       const pending = this.#pending.get(key)
@@ -241,7 +287,65 @@ export class TrafficLedger {
       const perRelay = perDay[report.relayId] ?? (perDay[report.relayId] = { in: 0, out: 0 })
       perRelay.in += incoming
       perRelay.out += outgoing
+      this.#checkAnomaly(entry.identity, entry.day)
     }
+  }
+
+  /**
+   * Notice when one identity's day stops looking like its own recent past.
+   *
+   * Two independent detectors, both cheap and both boring on purpose:
+   *
+   *   - **Volume.** The identity moved more than `alertBytesPerDay` in one UTC
+   *     day. This is an absolute ceiling -- a person's heavy day -- so it fires
+   *     on a runaway account regardless of what that account usually does.
+   *   - **Spike.** Today is more than `alertGrowthFactor` times the identity's
+   *     own trailing daily average. This catches a sudden ramp from a small
+   *     baseline, which volume alone would miss because the total is still
+   *     modest.
+   *
+   * Each identity/day is reported at most once, so a burst is one alert rather
+   * than one per frame. Both are heuristics meant to make an operator look, not
+   * to block: nothing is refused here, because a false positive must not take
+   * away somebody's connection.
+   */
+  #checkAnomaly(identity: string, day: string): void {
+    if (this.#alertBytesPerDay === 0 && this.#alertGrowthFactor === 0) return
+    const key = `${identity}\n${day}`
+    if (this.#anomalySeen.has(key)) return
+    const value = this.#identities.get(identity)
+    if (value === undefined) return
+    const today = dayTotal(value.days[day])
+    const at = this.#now()
+
+    let anomaly: TrafficAnomaly | null = null
+    if (this.#alertBytesPerDay > 0 && today > this.#alertBytesPerDay) {
+      anomaly = { identity, day, bytes: today, reason: 'volume', baseline: this.#alertBytesPerDay, at }
+    } else if (this.#alertGrowthFactor > 0) {
+      const baseline = trailingAverage(value.days, day, BASELINE_DAYS)
+      // A tiny baseline makes any byte look like a spike, so growth only counts
+      // once an identity is actually moving a meaningful amount -- 1 MiB, the
+      // size of one frame, keeps a new account's first request from alerting.
+      if (baseline > 1024 * 1024 && today > baseline * this.#alertGrowthFactor) {
+        anomaly = { identity, day, bytes: today, reason: 'spike', baseline, at }
+      }
+    }
+    if (anomaly === null) return
+
+    this.#anomalySeen.add(key)
+    this.#anomalies.push(anomaly)
+    if (this.#anomalies.length > MAX_ANOMALIES) this.#anomalies.splice(0, this.#anomalies.length - MAX_ANOMALIES)
+    const label = identity.length > 28 ? `${identity.slice(0, 28)}…` : identity
+    this.#log(
+      anomaly.reason === 'volume'
+        ? `traffic: ANOMALY ${label} carried ${formatMiB(anomaly.bytes)} on ${day}, over the ${formatMiB(this.#alertBytesPerDay)} ceiling`
+        : `traffic: ANOMALY ${label} carried ${formatMiB(anomaly.bytes)} on ${day}, over ${this.#alertGrowthFactor}× its ${formatMiB(anomaly.baseline)} average`,
+    )
+  }
+
+  /** The anomalies noticed so far, newest last. */
+  anomalies(): readonly TrafficAnomaly[] {
+    return this.#anomalies
   }
 
   /** A read-only copy for the admin pages. */
@@ -371,6 +475,39 @@ export class TrafficLedger {
 /** The UTC day key. */
 export function dayKey(epochMs: number): string {
   return new Date(epochMs).toISOString().slice(0, 10)
+}
+
+/** Sum one day's in+out across every relay that reported it. */
+function dayTotal(perRelay: Record<string, RelayCounters> | undefined): number {
+  if (perRelay === undefined) return 0
+  let total = 0
+  for (const counters of Object.values(perRelay)) total += counters.in + counters.out
+  return total
+}
+
+/**
+ * The mean daily total over the `count` days before `day`.
+ *
+ * Days the identity did not appear count as zero, which is what makes a ramp
+ * from silence look like a ramp: averaging only the busy days would make a
+ * once-a-month account's heavy day look routine.
+ */
+function trailingAverage(
+  days: Record<string, Record<string, RelayCounters>>,
+  day: string,
+  count: number,
+): number {
+  const end = Date.parse(`${day}T00:00:00Z`)
+  let total = 0
+  for (let index = 1; index <= count; index += 1) {
+    total += dayTotal(days[dayKey(end - index * 86_400_000)])
+  }
+  return total / count
+}
+
+/** MiB with one decimal, for log lines an operator reads at a glance. */
+function formatMiB(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MiB`
 }
 
 /** Whether an identity key is one this relay understands. */

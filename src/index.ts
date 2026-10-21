@@ -165,6 +165,30 @@ function createFcmOrWarn(
 }
 
 /**
+ * How often each bridged phone socket is pinged, in ms — and, twice over, how
+ * long it may stay silent before the relay drops it.
+ *
+ * The tunnels have an application-level ping and the phones used to have
+ * nothing, and the gap showed in the field: a phone that is only waiting for
+ * the computer's answer sends nothing, so a proxy that closes idle connections
+ * — nginx's sixty-second read-timeout default — kills the leg mid-request, and
+ * the phone spends its own request timeout reconnecting for an answer that was
+ * never coming down the old socket. Thirty seconds feeds every standard proxy
+ * comfortably.
+ *
+ * The ping is protocol-level rather than a frame: every WebSocket peer answers
+ * it below the application (iOS's `URLSessionWebSocketTask` and Android's
+ * OkHttp both do), so it costs the phone nothing and says nothing to the Mizar
+ * protocol this relay declines to interpret.
+ */
+function phoneKeepaliveMs(): number {
+  return Math.max(
+    1_000,
+    Number(process.env['MIZAR_RELAY_PHONE_KEEPALIVE']) || 30_000,
+  )
+}
+
+/**
  * Start the relay.
  *
  * @param config - the resolved configuration.
@@ -947,6 +971,11 @@ export async function startRelay(
     stream: TunnelStream,
     identity: ReturnType<typeof identityFor>,
   ): void {
+    // The phone joins the keepalive round here. Its silence is measured from
+    // now rather than from the epoch, so a socket that never answers is dropped
+    // on the round after the one that first pings it.
+    phones.set(phone, Date.now())
+    phone.on('pong', () => phones.set(phone, Date.now()))
     phone.on('message', (data: Buffer, isBinary: boolean) => {
       if (data.length > config.maxMessageBytes) {
         phone.close(1009, 'message too large')
@@ -969,9 +998,11 @@ export async function startRelay(
       // The phone's code is forwarded, and a `close` handler is given reserved
       // codes like 1006 that must not be sent on. Replaying one unexamined took
       // the plugin down with a TypeError.
+      phones.delete(phone)
       stream.close(saneCloseCode(code), reason.toString('utf8'))
     })
     phone.on('error', () => {
+      phones.delete(phone)
       stream.close(1011, 'phone socket error')
     })
   }
@@ -1092,6 +1123,34 @@ export async function startRelay(
     }
   }, interval)
   sweeper.unref?.()
+
+  /**
+   * Keep every phone awake, and drop the ones that stop answering.
+   *
+   * The sibling of the tunnel sweeper above, one hop closer to the operator.
+   * The value carried per socket is the last time it gave any sign of life: a
+   * pong, mostly, since the ping asks for one, and any unsolicited pong counts
+   * too. A phone whose answer is more than two intervals old is not a slow
+   * phone — a live one answers within a round trip — it is a socket only this
+   * side still believes in, one that holds its stream, and the computer's local
+   * end of it, open for nothing. Terminating it is what lets both ends clean up
+   * instead of waiting out a timeout that never fires.
+   */
+  const keepaliveMs = phoneKeepaliveMs()
+  const phones = new Map<WebSocket, number>()
+  const phoneSweeper = setInterval(() => {
+    const now = Date.now()
+    for (const [phone, lastAnswer] of phones) {
+      if (now - lastAnswer > keepaliveMs * 2) {
+        log('relay: a phone stopped answering its keepalive; dropping it')
+        phones.delete(phone)
+        phone.terminate()
+        continue
+      }
+      phone.ping()
+    }
+  }, keepaliveMs)
+  phoneSweeper.unref?.()
 
   // Awaited so the returned port is the real one. Binding port 0 is how the
   // tests avoid colliding with a relay someone is actually running, and a

@@ -88,7 +88,7 @@ export class GitHubOAuth {
   async exchange(code: string): Promise<string> {
     let response: Response
     try {
-      response = await this.#fetch('https://github.com/login/oauth/access_token', {
+      response = await this.#fetchWithRetry('https://github.com/login/oauth/access_token', {
         method: 'POST',
         headers: {
           accept: 'application/json',
@@ -128,6 +128,43 @@ export class GitHubOAuth {
   }
 
   /**
+   * One fetch with a small retry budget.
+   *
+   * github.com answers from mainland China intermittently: a request that
+   * connects one second can time out the next, and the OAuth exchange is the
+   * one call a person is waiting on. Three attempts with a short pause turn a
+   * transient edge into a successful sign-in, while a refusal (4xx) is
+   * returned immediately -- retrying a bad code would only burn the round-trip.
+   *
+   * @param url - the absolute URL.
+   * @param init - the request, minus the timeout signal (each attempt gets a fresh one).
+   * @returns the response, for the caller to interpret.
+   * @throws the last network failure when every attempt failed.
+   */
+  async #fetchWithRetry(url: string, init: RequestInit = {}): Promise<Response> {
+    let last: unknown = new Error('no attempt was made')
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await this.#fetch(url, {
+          ...init,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        })
+        // 5xx/429 are the upstream having a moment; retry them. A 4xx is an
+        // answer (a bad code, a bad token) and is returned to the caller.
+        if (response.status >= 500 || response.status === 429) {
+          last = new Error(`GitHub answered ${response.status}`)
+        } else {
+          return response
+        }
+      } catch (error) {
+        last = error
+      }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)))
+    }
+    throw last
+  }
+
+  /**
    * Read the identity behind an access token.
    *
    * The email travels in its own call because GitHub keeps it out of the
@@ -163,7 +200,7 @@ export class GitHubOAuth {
   async #get(url: string, accessToken: string): Promise<Record<string, unknown>> {
     let response: Response
     try {
-      response = await this.#fetch(url, {
+      response = await this.#fetchWithRetry(url, {
         headers: {
           accept: 'application/vnd.github+json',
           authorization: `Bearer ${accessToken}`,
@@ -196,7 +233,7 @@ export class GitHubOAuth {
   async #verifiedEmail(accessToken: string): Promise<{ email: string; primary: boolean } | undefined> {
     let response: Response
     try {
-      response = await this.#fetch('https://api.github.com/user/emails', {
+      response = await this.#fetchWithRetry('https://api.github.com/user/emails', {
         headers: {
           accept: 'application/vnd.github+json',
           authorization: `Bearer ${accessToken}`,

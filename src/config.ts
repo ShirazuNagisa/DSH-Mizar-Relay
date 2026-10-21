@@ -252,6 +252,24 @@ export interface AccountsConfig {
   readonly appstore: AppStoreConfig
   /** Public origin used in admin/docs, without a trailing slash. */
   readonly publicBaseURL: string
+  /** GitHub sign-in, or `null` when it is off. */
+  readonly github: GitHubConfig | null
+}
+
+/** The file-shaped `github` object, where every field is optional. */
+export interface GitHubFileConfig {
+  readonly enabled?: boolean
+  readonly clientId?: string
+  readonly clientSecret?: string
+  readonly callbackURL?: string
+}
+
+/** The GitHub sign-in policy, resolved. */
+export interface GitHubConfig {
+  readonly enabled: boolean
+  readonly clientId: string
+  readonly clientSecret: string
+  readonly callbackURL: string
 }
 
 /** The file-shaped `accounts` object, where every field is optional. */
@@ -286,6 +304,7 @@ export interface AccountsFileConfig {
     readonly notificationsEnabled?: boolean
   }
   readonly publicBaseURL?: string
+  readonly github?: GitHubFileConfig
 }
 
 /**
@@ -536,6 +555,37 @@ function readAccounts(
   const gravatar = file.gravatar ?? {}
   const appstore = file.appstore ?? {}
   const enabled = flagOr(pick(env['MIZAR_ACCOUNTS_ENABLED'], file.enabled, false), false)
+  const publicBaseURL = pick(env['MIZAR_ACCOUNT_PUBLIC_BASE_URL'], file.publicBaseURL, '')
+  const githubFile = file.github ?? {}
+  const githubEnabled = flagOr(pick(env['MIZAR_GITHUB_ENABLED'], githubFile.enabled, false), false)
+  const githubClientId = pick(env['MIZAR_GITHUB_CLIENT_ID'], githubFile.clientId, '')
+  const githubClientSecret = pick(env['MIZAR_GITHUB_CLIENT_SECRET'], githubFile.clientSecret, '')
+  // The callback lives on the same origin the accounts surface does, so a
+  // deployment that already told the relay its public origin gets the right
+  // default; the manual still pins the exact URL in the OAuth App.
+  const githubCallbackURL = pick(
+    env['MIZAR_GITHUB_CALLBACK_URL'],
+    githubFile.callbackURL,
+    publicBaseURL === '' ? '' : `${publicBaseURL}/account/v1/github/callback`,
+  )
+  if (githubEnabled) {
+    const missing: string[] = []
+    if (githubClientId === '') missing.push('clientId')
+    if (githubClientSecret === '') missing.push('clientSecret')
+    if (githubCallbackURL === '') missing.push('callbackURL')
+    if (missing.length > 0) {
+      throw new Error(
+        `accounts.github needs clientId, clientSecret and callbackURL; missing: ${missing.join(', ')}`,
+      )
+    }
+  }
+  if (githubFile.clientSecret !== undefined && githubFile.clientSecret !== '') {
+    // The manual's rule: the secret lives in the environment file with mode 600,
+    // not in a config file that is easier to copy or commit by accident.
+    console.warn(
+      'accounts.github.clientSecret is set in the config file; prefer MIZAR_GITHUB_CLIENT_SECRET in the environment',
+    )
+  }
   return {
     enabled,
     dataDir: pick(env['MIZAR_ACCOUNTS_DATA_DIR'], file.dataDir, './data'),
@@ -573,7 +623,10 @@ function readAccounts(
         true,
       ),
     },
-    publicBaseURL: pick(env['MIZAR_ACCOUNT_PUBLIC_BASE_URL'], file.publicBaseURL, ''),
+    publicBaseURL,
+    github: githubEnabled
+      ? { enabled: true, clientId: githubClientId, clientSecret: githubClientSecret, callbackURL: githubCallbackURL }
+      : null,
   }
 }
 

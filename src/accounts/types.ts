@@ -67,6 +67,8 @@ export interface UserRecord {
   emailVerified: boolean
   readonly passwordHash: string | null
   appleSub: string | null
+  githubId: string | null
+  githubLogin: string | null
   readonly avatar: AvatarSpec
   disabled: boolean
   readonly createdAt: number
@@ -155,6 +157,10 @@ export interface PublicUser {
   readonly avatar: AvatarSpec
   /** Whether the account is linked to Sign in with Apple. */
   readonly apple: boolean
+  /** Whether the account is linked to GitHub. */
+  readonly github: boolean
+  /** The GitHub handle the account is linked to, when it is. */
+  readonly githubLogin: string | null
   readonly createdAt: number
   readonly lastSeenAt: number
   readonly devices: readonly PublicDevice[]
@@ -193,6 +199,18 @@ export interface AuthResult {
   readonly token: string
   readonly user: PublicUser
   readonly notice?: AccountNotice
+}
+
+/** A verified GitHub identity, as the OAuth half reports it. */
+export interface GitHubIdentity {
+  /** GitHub's stable numeric account id, as a string. */
+  readonly id: string
+  /** The handle, which the user may rename at will. */
+  readonly login: string
+  /** A **verified** email, when GitHub carries one; never an unverified claim. */
+  readonly email: string | null
+  /** Always `true` when `email` is set. */
+  readonly emailVerified: boolean
 }
 
 /** A device descriptor sent by the app. */

@@ -187,6 +187,8 @@ export function publicUser(
     appStore: publicAppStore(user.entitlements.appStore),
     avatar: user.avatar,
     apple: user.appleSub !== null,
+    github: user.githubId !== null,
+    githubLogin: user.githubLogin,
     createdAt: user.createdAt,
     lastSeenAt: user.lastSeenAt,
     devices: user.devices.map((device) => ({

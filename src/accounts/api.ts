@@ -8,13 +8,15 @@
  *
  * @module dsh-mizar-relay/accounts/api
  */
+import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { clientAddress } from '../client-address.js'
 import type { AccountStore } from './store.js'
 import { hashToken, validateDevice } from './store.js'
-import { AccountError, type DeviceInput } from './types.js'
+import { AccountError, type DeviceInput, type GitHubIdentity } from './types.js'
 import { RateWindow } from './rate.js'
-import { readBody, writeJson, parseJsonObject, stringField } from '../http.js'
+import { GitHubOAuth, githubBoundPage, githubDonePage, githubErrorPage } from './github.js'
+import { readBody, writeJson, writeHtml, redirect, parseJsonObject, stringField } from '../http.js'
 
 /** The largest account request body. */
 const MAX_BODY_BYTES = 64 * 1024
@@ -22,12 +24,30 @@ const MAX_BODY_BYTES = 64 * 1024
 /** The largest App Store notification body. Apple's envelopes are small. */
 const MAX_NOTIFICATION_BYTES = 256 * 1024
 
+/** How long a pending GitHub round-trip survives the browser. */
+const GITHUB_PENDING_TTL_MS = 10 * 60_000
+
+/** How long a handoff code waits for the phone that will claim it. */
+const GITHUB_HANDOFF_TTL_MS = 10 * 60_000
+
+/** The shape of a handoff code, `MZ-XXXX-XXXX`, unambiguous alphabet. */
+const GITHUB_HANDOFF_SHAPE = /^MZ-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{4}$/
+
 /** What the API needs. */
 export interface AccountApiOptions {
   readonly store: AccountStore
   readonly trustProxy: boolean
   /** Whether App Store Server Notifications V2 are accepted. */
   readonly notificationsEnabled?: boolean
+  /**
+   * GitHub sign-in, when this relay is configured for it. Absent answers
+   * `GITHUB_NOT_CONFIGURED` on every `/github/*` route.
+   */
+  readonly github?: { readonly clientId: string; readonly clientSecret: string; readonly callbackURL: string }
+  /** Clock, injectable for the pending/handoff TTLs. */
+  readonly now?: () => number
+  /** Fetch implementation for GitHub's OAuth endpoints; injectable for tests. */
+  readonly fetchImpl?: typeof fetch
   readonly log?: (message: string) => void
 }
 
@@ -59,12 +79,35 @@ export class AccountApi {
    * a person mistypes a code and far less than a scanner reads them.
    */
   readonly #redeemWindow = new RateWindow(5, 60 * 60_000)
+  readonly #github: GitHubOAuth | null
+  /**
+   * The browser round-trip's memory: the state GitHub echoes back, and the
+   * handoff codes waiting for a phone. Both live in memory only and die with
+   * the process -- a restart simply asks the operator to start again, which
+   * the ten-minute TTL already asks.
+   */
+  readonly #githubPending = new Map<
+    string,
+    { kind: 'login'; device: DeviceInput; expiresAt: number } | { kind: 'bind'; userId: string; expiresAt: number }
+  >()
+  readonly #githubHandoff = new Map<string, { userId: string; expiresAt: number }>()
+  readonly #githubStartWindow = new RateWindow(10, 60_000)
+  readonly #githubHandoffWindow = new RateWindow(20, 60_000)
+  readonly #now: () => number
 
   constructor(options: AccountApiOptions) {
     this.#store = options.store
     this.#trustProxy = options.trustProxy
     this.#notificationsEnabled = options.notificationsEnabled ?? true
     this.#log = options.log ?? (() => undefined)
+    this.#now = options.now ?? Date.now
+    this.#github =
+      options.github === undefined
+        ? null
+        : new GitHubOAuth({
+            ...options.github,
+            ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+          })
   }
 
   /**
@@ -94,6 +137,18 @@ export class AccountApi {
           break
         case 'POST /apple':
           await this.#apple(context)
+          break
+        case 'POST /github/start':
+          await this.#githubStart(context)
+          break
+        case 'GET /github/callback':
+          await this.#githubCallback(context, url)
+          break
+        case 'GET /github/done':
+          await this.#githubDone(context, url)
+          break
+        case 'POST /github/handoff':
+          await this.#githubHandoffRoute(context)
           break
         case 'GET /me':
           await this.#me(context)
@@ -258,6 +313,180 @@ export class AccountApi {
     writeJson(context.response, 200, { ok: true })
   }
 
+  // MARK: - GitHub
+
+  /** Guard shared by every /github/* route: the feature must be configured. */
+  #githubOr404(context: RequestContext): GitHubOAuth | null {
+    if (this.#github === null) {
+      writeJson(context.response, 404, {
+        error: 'GITHUB_NOT_CONFIGURED',
+        message: 'GitHub sign-in is not configured on this relay',
+      })
+      return null
+    }
+    return this.#github
+  }
+
+  async #githubStart(context: RequestContext): Promise<void> {
+    const github = this.#githubOr404(context)
+    if (github === null) return
+    if (!this.#githubStartWindow.check(context.ip)) {
+      this.#tooMany(context, 'too many GitHub sign-in attempts')
+      return
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const device = deviceOf(body)
+    const now = this.#now()
+    this.#pruneGithub(now)
+    // A request that carries a session is the account page asking to LINK a
+    // GitHub identity; anonymous requests are signing in or signing up.
+    const token = bearerOrUndefined(context.request)
+    const pending =
+      token === undefined
+        ? { kind: 'login' as const, device, expiresAt: now + GITHUB_PENDING_TTL_MS }
+        : { kind: 'bind' as const, userId: (await this.#store.me(token, null)).id, expiresAt: now + GITHUB_PENDING_TTL_MS }
+    const state = randomBytes(16).toString('hex')
+    this.#githubPending.set(state, pending)
+    writeJson(context.response, 200, {
+      authorizeUrl: github.authorizeURL(state),
+      state,
+      expiresAt: pending.expiresAt,
+    })
+  }
+
+  async #githubCallback(context: RequestContext, url: URL): Promise<void> {
+    const github = this.#githubOr404(context)
+    if (github === null) return
+    const now = this.#now()
+    this.#pruneGithub(now)
+    const fail = (code: string, message: string, status = 400): void => {
+      writeHtml(context.response, status, githubErrorPage(code, message))
+    }
+    // GitHub itself can refuse at the authorize step (access_denied, a redirect
+    // mismatch) -- the manual's troubleshooting table starts here.
+    const refused = url.searchParams.get('error')
+    if (refused !== null) {
+      fail('GITHUB_EXCHANGE_FAILED', `GitHub sent the callback back with an error: ${refused}`)
+      return
+    }
+    const code = url.searchParams.get('code')
+    const state = url.searchParams.get('state')
+    if (code === null || state === null) {
+      fail('GITHUB_INVALID_STATE', 'the callback arrived without a code or a state; start the sign-in again')
+      return
+    }
+    const pending = this.#githubPending.get(state)
+    if (pending === undefined || pending.expiresAt <= now) {
+      this.#githubPending.delete(state)
+      fail('GITHUB_INVALID_STATE', 'this sign-in round-trip is unknown or has expired; start again')
+      return
+    }
+    // One round-trip, one consumption: a replayed callback cannot mint a second
+    // handoff code for the same identity.
+    this.#githubPending.delete(state)
+    let identity: GitHubIdentity
+    try {
+      const accessToken = await github.exchange(code)
+      identity = await github.identity(accessToken)
+    } catch (error) {
+      if (error instanceof AccountError) {
+        fail(error.code, error.message, error.status)
+        return
+      }
+      this.#log(`accounts: github exchange failed: ${String(error)}`)
+      fail('GITHUB_EXCHANGE_FAILED', 'the GitHub exchange failed')
+      return
+    }
+    try {
+      if (pending.kind === 'bind') {
+        await this.#store.linkGitHubIdentity({ userId: pending.userId, identity })
+        redirect(context.response, this.#doneURL('bound=1'))
+        return
+      }
+      const { userId } = await this.#store.resolveGitHubIdentity(identity)
+      const handoff = this.#newHandoff(userId, now)
+      redirect(context.response, this.#doneURL(`handoff=${encodeURIComponent(handoff.code)}`))
+    } catch (error) {
+      if (error instanceof AccountError) {
+        fail(error.code, error.message, error.status)
+        return
+      }
+      this.#log(`accounts: github callback failed: ${String(error)}`)
+      fail('INTERNAL', 'the account service failed', 500)
+    }
+  }
+
+  async #githubDone(context: RequestContext, url: URL): Promise<void> {
+    if (url.searchParams.get('bound') === '1') {
+      writeHtml(context.response, 200, githubBoundPage())
+      return
+    }
+    const handoff = url.searchParams.get('handoff')
+    if (handoff === null || !GITHUB_HANDOFF_SHAPE.test(handoff)) {
+      writeHtml(
+        context.response,
+        400,
+        githubErrorPage('GITHUB_INVALID_STATE', 'this handoff code is not shaped right; start the sign-in again'),
+      )
+      return
+    }
+    writeHtml(context.response, 200, githubDonePage(handoff))
+  }
+
+  async #githubHandoffRoute(context: RequestContext): Promise<void> {
+    const github = this.#githubOr404(context)
+    if (github === null) return
+    if (!this.#githubHandoffWindow.check(context.ip)) {
+      this.#tooMany(context, 'too many handoff attempts')
+      return
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const code = requireString(body, 'code')
+    const device = deviceOf(body)
+    if (!GITHUB_HANDOFF_SHAPE.test(code)) {
+      throw new AccountError('GITHUB_HANDOFF_INVALID', 'that sign-in code is not shaped right', 400)
+    }
+    const now = this.#now()
+    this.#pruneGithub(now)
+    const key = hashToken(code)
+    const entry = this.#githubHandoff.get(key)
+    if (entry === undefined || entry.expiresAt <= now) {
+      this.#githubHandoff.delete(key)
+      throw new AccountError('GITHUB_HANDOFF_INVALID', 'that sign-in code is unknown or has expired; start again', 400)
+    }
+    this.#githubHandoff.delete(key)
+    const result = await this.#store.createSession({ userId: entry.userId, device })
+    writeJson(context.response, 200, result)
+  }
+
+  #doneURL(query: string): string {
+    // The callback URL shares the deployment origin the done page lives on,
+    // which is what makes a same-origin redirect safe to build from it.
+    const done = new URL('/account/v1/github/done', this.#github?.callbackURL ?? 'https://relay.invalid')
+    done.search = query
+    return done.toString()
+  }
+
+  #newHandoff(userId: string, now: number): { code: string; expiresAt: number } {
+    const alphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'
+    const pick = (): string => alphabet.charAt(randomBytes(1)[0]! % alphabet.length)
+    const chunk = (): string => `${pick()}${pick()}${pick()}${pick()}`
+    const code = `MZ-${chunk()}-${chunk()}`
+    this.#githubHandoff.set(hashToken(code), { userId, expiresAt: now + GITHUB_HANDOFF_TTL_MS })
+    return { code, expiresAt: now + GITHUB_HANDOFF_TTL_MS }
+  }
+
+  #pruneGithub(now: number): void {
+    for (const [state, pending] of this.#githubPending) {
+      if (pending.expiresAt <= now) this.#githubPending.delete(state)
+    }
+    for (const [key, entry] of this.#githubHandoff) {
+      if (entry.expiresAt <= now) this.#githubHandoff.delete(key)
+    }
+  }
+
   // MARK: - Internals
 
   /** Read and parse a JSON body, answering the request on failure. */
@@ -290,6 +519,15 @@ export class AccountApi {
     context.response.setHeader('retry-after', '60')
     writeJson(context.response, 429, { error: 'RATE_LIMITED', message })
   }
+}
+
+/** The bearer token, when the request carries a well-formed one. */
+function bearerOrUndefined(request: IncomingMessage): string | undefined {
+  const header = request.headers.authorization
+  if (typeof header !== 'string' || header.trim() === '') return undefined
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim())
+  if (match === null || match[1] === undefined || match[1] === '') return undefined
+  return match[1].trim()
 }
 
 /** Extract the bearer token. */

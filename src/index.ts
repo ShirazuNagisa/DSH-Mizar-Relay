@@ -379,6 +379,11 @@ export async function startRelay(
           store: accountStore,
           trustProxy: config.trustProxy,
           notificationsEnabled: accountsConfig?.appstore.notificationsEnabled ?? true,
+          ...(accountsConfig?.github === undefined || accountsConfig.github === null
+            ? {}
+            : { github: accountsConfig.github }),
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
           log,
         })
   const adminApi =

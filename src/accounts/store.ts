@@ -25,6 +25,7 @@ import type {
   DeviceInput,
   DeviceRecord,
   Entitlements,
+  GitHubIdentity,
   InviteRecord,
   InvitesFile,
   PublicUser,
@@ -94,6 +95,18 @@ export interface AppleSignInInput {
   readonly nonce?: string
   readonly device: DeviceInput
   readonly fullName?: string
+}
+
+/** Link a GitHub identity to an existing account, from the account page. */
+export interface GitHubLinkInput {
+  readonly userId: string
+  readonly identity: GitHubIdentity
+}
+
+/** Issue a session for an account the browser flow has already resolved. */
+export interface GitHubSessionInput {
+  readonly userId: string
+  readonly device: DeviceInput
 }
 
 /** Admin pagination. */
@@ -308,6 +321,8 @@ export class AccountStore {
         emailVerified: false,
         passwordHash,
         appleSub: null,
+        githubId: null,
+        githubLogin: null,
         avatar,
         disabled: false,
         createdAt: now,
@@ -398,6 +413,8 @@ export class AccountStore {
           emailVerified: identity.emailVerified,
           passwordHash: null,
           appleSub: identity.sub,
+          githubId: null,
+          githubLogin: null,
           avatar,
           disabled: false,
           createdAt: now,
@@ -409,6 +426,152 @@ export class AccountStore {
         this.#users.set(user.id, user)
         this.#indexes(user)
       }
+      if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
+      user.lastSeenAt = now
+      user.updatedAt = now
+      const issued = this.#issueSession(user, device, now, false)
+      this.#entitlementsChanged(user.id)
+      await this.#saveAccounts()
+      return { token: issued.token, user: this.#public(user, device.id, now), ...(issued.notice === undefined ? {} : { notice: issued.notice }) }
+    })
+  }
+
+  /**
+   * Resolve one verified GitHub identity to an account, without issuing a session.
+   *
+   * The browser flow resolves the account at the callback; the session itself is
+   * issued later, when the phone claims the handoff code -- that is the device
+   * the session actually binds to. The resolution rules mirror Sign in with
+   * Apple: the GitHub id wins; a **verified** GitHub email links an existing
+   * account that carries it; anything else creates a passwordless account of
+   * its own.
+   *
+   * @param identity - the verified identity from the OAuth half.
+   * @returns the resolved account's id.
+   */
+  async resolveGitHubIdentity(identity: GitHubIdentity): Promise<{ userId: string }> {
+    const now = this.#now()
+    return this.#queue.run(async () => {
+      let user = this.#findByGitHubId(identity.id)
+      if (user === undefined && identity.email !== null && identity.emailVerified) {
+        const existing = this.#findByEmailKey(normalizeEmail(identity.email))
+        if (existing !== undefined) {
+          if (existing.githubId === identity.id) {
+            user = existing
+          } else if (existing.githubId === null && existing.emailVerified) {
+            existing.githubId = identity.id
+            existing.githubLogin = identity.login
+            existing.updatedAt = now
+            user = existing
+          } else {
+            // The email is claimed by an account this login cannot safely become:
+            // one that never verified the address (anyone could have registered
+            // it), or one already linked to a different GitHub identity. The way
+            // through is the password and the account page's link button.
+            throw new AccountError(
+              'GITHUB_EMAIL_CONFLICT',
+              'that email is already registered by an account that cannot be auto-linked; sign in with the password and link GitHub from the account page',
+              409,
+            )
+          }
+        }
+      }
+      if (user === undefined) {
+        const email = identity.email
+        const username = this.#uniqueUsername(deriveUsername(identity.login, email, identity.id))
+        const avatar = await avatarFor(email, identity.login, {
+          enabled: this.#gravatar.enabled,
+          baseURLs: this.#gravatar.baseURLs,
+          fetchImpl: this.#fetch,
+          seed: email ?? identity.id,
+        })
+        user = {
+          id: randomUUID(),
+          username,
+          usernameKey: username.toLowerCase(),
+          email,
+          emailKey: email === null ? null : normalizeEmail(email),
+          emailVerified: identity.emailVerified,
+          passwordHash: null,
+          appleSub: null,
+          githubId: identity.id,
+          githubLogin: identity.login,
+          avatar,
+          disabled: false,
+          createdAt: now,
+          updatedAt: now,
+          lastSeenAt: now,
+          devices: [],
+          entitlements: { grantedPaidUntil: null, appStore: null },
+        }
+        this.#users.set(user.id, user)
+        this.#indexes(user)
+      }
+      if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
+      user.lastSeenAt = now
+      user.updatedAt = now
+      if (user.githubLogin !== identity.login) user.githubLogin = identity.login
+      await this.#saveAccounts()
+      await this.#audit('github-sign-in', { userId: user.id, login: identity.login })
+      return { userId: user.id }
+    })
+  }
+
+  /**
+   * Link a GitHub identity to an existing account, from the account page.
+   *
+   * Both directions refuse: an account already wearing another GitHub identity,
+   * and a GitHub identity already living on another account.
+   *
+   * @param input - the signed-in account's id and the verified identity.
+   * @returns the public user.
+   */
+  async linkGitHubIdentity(input: GitHubLinkInput): Promise<PublicUser> {
+    const now = this.#now()
+    return this.#queue.run(async () => {
+      const user = this.#users.get(input.userId)
+      if (user === undefined) throw new AccountError('UNAUTHENTICATED', 'this account no longer exists', 401)
+      if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
+      if (user.githubId !== null && user.githubId !== input.identity.id) {
+        throw new AccountError('GITHUB_ALREADY_BOUND', 'this account is already linked to another GitHub account', 409)
+      }
+      const other = this.#findByGitHubId(input.identity.id)
+      if (other !== undefined && other.id !== user.id) {
+        throw new AccountError('GITHUB_IDENTITY_TAKEN', 'that GitHub account is already linked to another Mizar account', 409)
+      }
+      user.githubId = input.identity.id
+      user.githubLogin = input.identity.login
+      if (
+        input.identity.email !== null &&
+        input.identity.emailVerified &&
+        user.emailKey === normalizeEmail(input.identity.email)
+      ) {
+        user.emailVerified = true
+      }
+      user.updatedAt = now
+      await this.#saveAccounts()
+      await this.#audit('github-linked', { userId: user.id, login: input.identity.login })
+      return this.#public(user, null, now)
+    })
+  }
+
+  /**
+   * Issue a session for an account the browser flow has already resolved.
+   *
+   * The GitHub handoff is the one login path whose device is known only at the
+   * end: the browser resolved the account, and whichever device presents the
+   * handoff code is the device the session binds to. Like Apple, a linked
+   * account is exempt from the device cap.
+   *
+   * @param input - the resolved account's id and the claiming device.
+   * @returns the session token and public user.
+   */
+  async createSession(input: GitHubSessionInput): Promise<AuthResult> {
+    const device = validateDevice(input.device)
+    const now = this.#now()
+    return this.#queue.run(async () => {
+      const user = this.#users.get(input.userId)
+      if (user === undefined) throw new AccountError('UNAUTHENTICATED', 'this account no longer exists', 401)
       if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
       user.lastSeenAt = now
       user.updatedAt = now
@@ -821,7 +984,15 @@ export class AccountStore {
   /** Load and index the account file. */
   #loadAccounts(file: AccountsFile): void {
     if (file.version !== 1) throw new Error(`unsupported accounts.json version ${String(file.version)}`)
-    for (const user of file.users ?? []) {
+    for (const record of file.users ?? []) {
+      // 0.2.6 added the GitHub link; accounts written by 0.2.5 have neither
+      // field. Normalize on load rather than making every reader remember that
+      // `undefined` and `null` mean the same "not linked" here.
+      const user: UserRecord = {
+        ...record,
+        githubId: record.githubId ?? null,
+        githubLogin: record.githubLogin ?? null,
+      }
       this.#users.set(user.id, user)
       this.#indexes(user)
     }
@@ -863,6 +1034,12 @@ export class AccountStore {
   /** Find by Apple subject. */
   #findByAppleSub(sub: string): UserRecord | undefined {
     for (const user of this.#users.values()) if (user.appleSub === sub) return user
+    return undefined
+  }
+
+  /** Find by GitHub id. */
+  #findByGitHubId(id: string): UserRecord | undefined {
+    for (const user of this.#users.values()) if (user.githubId === id) return user
     return undefined
   }
 

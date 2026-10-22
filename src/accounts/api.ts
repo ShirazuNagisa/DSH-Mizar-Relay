@@ -11,9 +11,12 @@
 import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { clientAddress } from '../client-address.js'
+import { normalizeEmail } from './avatar.js'
+import type { MailClient } from '../mail/client.js'
 import type { AccountStore } from './store.js'
-import { hashToken, validateDevice } from './store.js'
+import { hashToken, validateDevice, validateEmail, validatePassword, validateUsername } from './store.js'
 import { AccountError, type DeviceInput, type GitHubIdentity } from './types.js'
+import type { VerificationCodes } from './verification.js'
 import { RateWindow } from './rate.js'
 import { GitHubOAuth, githubBoundPage, githubDonePage, githubErrorPage } from './github.js'
 import { readBody, writeJson, writeHtml, redirect, parseJsonObject, stringField } from '../http.js'
@@ -49,6 +52,12 @@ export interface AccountApiOptions {
   /** Fetch implementation for GitHub's OAuth endpoints; injectable for tests. */
   readonly fetchImpl?: typeof fetch
   readonly log?: (message: string) => void
+  /** The code store, when email verification is enabled. */
+  readonly verification?: VerificationCodes | null
+  /** The mail client, when this relay can send. */
+  readonly mail?: MailClient | null
+  /** Appeal address printed on `ACCOUNT_DISABLED`. */
+  readonly contact?: string
 }
 
 /** Per-request facts. */
@@ -94,6 +103,11 @@ export class AccountApi {
   readonly #githubStartWindow = new RateWindow(10, 60_000)
   readonly #githubHandoffWindow = new RateWindow(20, 60_000)
   readonly #now: () => number
+  readonly #verification: VerificationCodes | null
+  readonly #mail: MailClient | null
+  readonly #contact: string
+  /** Password-reset starts, per address; a reset is a mail-bombing surface too. */
+  readonly #resetWindow = new RateWindow(5, 60 * 60_000)
 
   constructor(options: AccountApiOptions) {
     this.#store = options.store
@@ -101,6 +115,9 @@ export class AccountApi {
     this.#notificationsEnabled = options.notificationsEnabled ?? true
     this.#log = options.log ?? (() => undefined)
     this.#now = options.now ?? Date.now
+    this.#verification = options.verification ?? null
+    this.#mail = options.mail ?? null
+    this.#contact = options.contact ?? 'shirazunagisa@icloud.com'
     this.#github =
       options.github === undefined
         ? null
@@ -129,8 +146,17 @@ export class AccountApi {
         return true
       }
       switch (`${request.method ?? 'GET'} ${path}`) {
+        case 'POST /register/start':
+          await this.#registerStart(context)
+          break
         case 'POST /register':
           await this.#register(context)
+          break
+        case 'POST /password/reset/start':
+          await this.#resetStart(context)
+          break
+        case 'POST /password/reset/complete':
+          await this.#resetComplete(context)
           break
         case 'POST /login':
           await this.#login(context)
@@ -182,6 +208,42 @@ export class AccountApi {
 
   // MARK: - Routes
 
+  /**
+   * Send the code that starts an email+password registration.
+   *
+   * Nothing is created here: the account exists only after `/register` presents
+   * the code. That ordering is what makes "验证之后才可以注册" true rather than
+   * a client-side promise.
+   */
+  async #registerStart(context: RequestContext): Promise<void> {
+    if (!this.#registerWindow.check(context.ip)) {
+      this.#tooMany(context, 'registration rate limit reached')
+      return
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const username = requireString(body, 'username')
+    const email = requireString(body, 'email')
+    const password = requireString(body, 'password')
+    validateUsername(username)
+    validateEmail(email)
+    validatePassword(password)
+    const verification = this.#verification
+    const mail = this.#mail
+    if (verification === null || mail === null) {
+      throw new AccountError('MAIL_UNAVAILABLE', 'email verification is not configured on this server', 503)
+    }
+    this.#store.assertRegistrationAvailable(username, email)
+    const emailKey = normalizeEmail(email)
+    const issued = await verification.issue(emailKey, 'register')
+    await mail.sendVerification(email.trim(), issued.code, 10)
+    writeJson(context.response, 200, {
+      email: email.trim(),
+      expiresAt: issued.expiresAt,
+      resendAfterSeconds: issued.resendAfterSeconds,
+    })
+  }
+
   async #register(context: RequestContext): Promise<void> {
     if (!this.#registerWindow.check(context.ip)) {
       this.#tooMany(context, 'registration rate limit reached')
@@ -193,7 +255,77 @@ export class AccountApi {
     const email = requireString(body, 'email')
     const password = requireString(body, 'password')
     const device = deviceOf(body)
-    const result = await this.#store.register({ username, email, password, device })
+    const code = stringField(body, 'code')
+    if (this.#verification !== null) {
+      if (code === undefined || code.trim() === '') {
+        throw new AccountError(
+          'EMAIL_VERIFICATION_REQUIRED',
+          'request a code with /register/start and send it as "code"',
+          428,
+        )
+      }
+      const emailKey = normalizeEmail(validateEmail(email))
+      await this.#verification.verify(emailKey, 'register', code.trim())
+    }
+    const result = await this.#store.register({
+      username,
+      email,
+      password,
+      device,
+      emailVerified: this.#verification !== null,
+    })
+    writeJson(context.response, 200, result)
+  }
+
+  /**
+   * Start a password reset.
+   *
+   * The answer is the same whether or not the address exists: a reset endpoint
+   * that says "no such account" is an account-enumeration oracle.
+   */
+  async #resetStart(context: RequestContext): Promise<void> {
+    const body = await this.#json(context)
+    if (body === null) return
+    const email = requireString(body, 'email')
+    validateEmail(email)
+    const key = normalizeEmail(email)
+    if (!this.#resetWindow.check(key)) {
+      this.#tooMany(context, 'too many reset requests for this address')
+      return
+    }
+    const verification = this.#verification
+    const mail = this.#mail
+    const user = this.#store.findUserByEmail(email)
+    let expiresAt = this.#now() + 10 * 60_000
+    if (verification !== null && mail !== null && user !== undefined) {
+      const issued = await verification.issue(key, 'reset')
+      expiresAt = issued.expiresAt
+      try {
+        await mail.sendVerification(email.trim(), issued.code, 10)
+      } catch (error) {
+        // Keep the uniform answer; an operator sees the failure in the log.
+        this.#log(`accounts: reset mail failed: ${(error as Error).message}`)
+      }
+    }
+    writeJson(context.response, 200, { ok: true, expiresAt, resendAfterSeconds: 60 })
+  }
+
+  /** Finish a password reset and issue a session for the claiming device. */
+  async #resetComplete(context: RequestContext): Promise<void> {
+    const body = await this.#json(context)
+    if (body === null) return
+    const email = requireString(body, 'email')
+    const code = requireString(body, 'code')
+    const password = requireString(body, 'password')
+    const device = deviceOf(body)
+    validateEmail(email)
+    validatePassword(password)
+    if (this.#verification === null) {
+      throw new AccountError('MAIL_UNAVAILABLE', 'email verification is not configured on this server', 503)
+    }
+    const emailKey = normalizeEmail(email)
+    await this.#verification.verify(emailKey, 'reset', code.trim())
+    const result = await this.#store.resetPassword(email, password, device)
     writeJson(context.response, 200, result)
   }
 
@@ -507,7 +639,12 @@ export class AccountApi {
   /** Translate an exception into the wire error shape. */
   #fail(context: RequestContext, error: unknown): void {
     if (error instanceof AccountError) {
-      writeJson(context.response, error.status, { error: error.code, message: error.message })
+      const contact = error.contact ?? (error.code === 'ACCOUNT_DISABLED' ? this.#contact : undefined)
+      writeJson(context.response, error.status, {
+        error: error.code,
+        message: error.message,
+        ...(contact === undefined ? {} : { contact }),
+      })
       return
     }
     this.#log(`accounts: ${context.request.method ?? 'GET'} ${context.path} failed: ${String(error)}`)

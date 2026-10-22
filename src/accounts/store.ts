@@ -22,6 +22,7 @@ import type {
   AccountNotice,
   AccountsFile,
   AuthResult,
+  BanRecord,
   DeviceInput,
   DeviceRecord,
   Entitlements,
@@ -31,6 +32,7 @@ import type {
   PublicUser,
   SessionRecord,
   TokenEntitlement,
+  TrafficWarning,
   UserRecord,
 } from './types.js'
 
@@ -80,6 +82,14 @@ export interface RegisterInput {
   readonly email: string
   readonly password: string
   readonly device: DeviceInput
+  /**
+   * Whether the address was proved by a code before this call.
+   *
+   * The HTTP API sets it after `verifications.verify`; the CLI demo-account
+   * command sets it for an operator-created account. Anything that bypasses
+   * verification leaves it `false`, which is what the warning-mail policy reads.
+   */
+  readonly emailVerified?: boolean
 }
 
 /** A validated login request. */
@@ -281,6 +291,59 @@ export class AccountStore {
     return this.#sessions.filter((session) => session.userId === userId).map((session) => session.tokenHash)
   }
 
+  /**
+   * The account behind one session-token hash, if any.
+   *
+   * The traffic ledger keys identities by `account:<sha256(token)>`; this is the
+   * reverse lookup that lets a warning or a ban name a person instead of a hash.
+   * Synchronous on purpose: it runs inside the ledger's ingest path.
+   *
+   * @param hash - lowercase SHA-256 of a session token.
+   * @returns the account, or `undefined` when the hash names no session.
+   */
+  findUserBySessionHash(hash: string): UserRecord | undefined {
+    const session = this.#sessionsByHash.get(hash)
+    return session === undefined ? undefined : this.#users.get(session.userId)
+  }
+
+  /**
+   * Whether the account behind a session hash is on the paid plan.
+   *
+   * @param hash - lowercase SHA-256 of a session token.
+   * @returns `'paid'`, `'free'`, or `null` when the hash is unknown.
+   */
+  planForSessionHash(hash: string): 'paid' | 'free' | null {
+    const user = this.findUserBySessionHash(hash)
+    if (user === undefined) return null
+    const paidUntil = effectivePaidUntil(user)
+    return paidUntil !== null && paidUntil > this.#now() ? 'paid' : 'free'
+  }
+
+  /** Find an account by email, for password reset. */
+  findUserByEmail(email: string): UserRecord | undefined {
+    return this.#findByEmailKey(normalizeEmail(validateEmail(email)))
+  }
+
+  /**
+   * Refuse a registration that would collide, without creating anything.
+   *
+   * `/register/start` runs this before it sends a code: there is no point
+   * mailing a six-digit code for an account that cannot be created.
+   *
+   * @param username - the requested display name.
+   * @param email - the requested address.
+   */
+  assertRegistrationAvailable(username: string, email: string): void {
+    const name = validateUsername(username)
+    const address = validateEmail(email)
+    if (this.#findByUsernameKey(name.toLowerCase()) !== undefined) {
+      throw new AccountError('USERNAME_TAKEN', 'that username is already in use', 409)
+    }
+    if (this.#findByEmailKey(normalizeEmail(address)) !== undefined) {
+      throw new AccountError('EMAIL_TAKEN', 'that email is already registered', 409)
+    }
+  }
+
   // MARK: - Authentication
 
   /**
@@ -318,13 +381,15 @@ export class AccountStore {
         usernameKey,
         email,
         emailKey,
-        emailVerified: false,
+        emailVerified: input.emailVerified === true,
         passwordHash,
         appleSub: null,
         githubId: null,
         githubLogin: null,
         avatar,
         disabled: false,
+        warnings: [],
+        ban: null,
         createdAt: now,
         updatedAt: now,
         lastSeenAt: now,
@@ -417,6 +482,8 @@ export class AccountStore {
           githubLogin: null,
           avatar,
           disabled: false,
+          warnings: [],
+          ban: null,
           createdAt: now,
           updatedAt: now,
           lastSeenAt: now,
@@ -498,6 +565,8 @@ export class AccountStore {
           githubLogin: identity.login,
           avatar,
           disabled: false,
+          warnings: [],
+          ban: null,
           createdAt: now,
           updatedAt: now,
           lastSeenAt: now,
@@ -708,8 +777,17 @@ export class AccountStore {
     })
   }
 
-  /** Admin: disable or enable an account, revoking sessions on disable. */
-  async setDisabled(userId: string, disabled: boolean): Promise<PublicUser> {
+  /**
+   * Admin: disable or enable an account, revoking sessions on disable.
+   *
+   * Enabling is also the unban path: the traffic policy's warnings are cleared
+   * with it, which is what "解封时警告清零" means to the person on the other end.
+   */
+  async setDisabled(
+    userId: string,
+    disabled: boolean,
+    meta?: { readonly reason?: string; readonly bytes?: number; readonly by?: 'auto' | 'admin' },
+  ): Promise<PublicUser> {
     const now = this.#now()
     return this.#queue.run(async () => {
       const user = this.#users.get(userId)
@@ -717,17 +795,143 @@ export class AccountStore {
       user.disabled = disabled
       user.updatedAt = now
       if (disabled) {
+        user.ban = {
+          at: now,
+          reason: meta?.reason ?? 'admin',
+          bytes: meta?.bytes ?? 0,
+          by: meta?.by ?? 'admin',
+        }
         for (const session of this.#sessions) {
           if (session.userId === userId) {
             session.revokedAt = now
             session.revokedReason = 'account-disabled'
           }
         }
+      } else {
+        // Enabling clears the policy's history, so a restored account is not one
+        // anomaly away from being banned again.
+        user.ban = null
+        user.warnings = []
       }
       await this.#saveAccounts()
-      await this.#audit('account-disabled', { userId, disabled })
+      await this.#audit(disabled ? 'account-disabled' : 'account-enabled', {
+        userId,
+        disabled,
+        ...(disabled ? { reason: user.ban?.reason, by: user.ban?.by } : {}),
+      })
       this.#entitlementsChanged(userId)
       return this.#public(user, null, now)
+    })
+  }
+
+  /**
+   * Record one traffic warning.
+   *
+   * Only the trailing 30-day window is kept; an account whose warnings have all
+   * aged out is back to zero, which is the "30 天清零" half of the rule.
+   *
+   * @param userId - the account.
+   * @param warning - what happened.
+   * @returns the number of warnings now inside the window.
+   */
+  async addWarning(userId: string, warning: TrafficWarning): Promise<number> {
+    const now = this.#now()
+    return this.#queue.run(async () => {
+      const user = this.#users.get(userId)
+      if (user === undefined) throw new AccountError('INVALID_INPUT', 'no such account', 404)
+      const cutoff = now - 30 * 86_400_000
+      user.warnings = user.warnings.filter((entry) => entry.at >= cutoff)
+      user.warnings.push(warning)
+      user.updatedAt = now
+      await this.#saveAccounts()
+      await this.#audit('traffic-warning', {
+        userId,
+        count: user.warnings.length,
+        reason: warning.reason,
+        bytes: warning.bytes,
+        day: warning.day,
+      })
+      return user.warnings.length
+    })
+  }
+
+  /** Warnings inside the trailing 30-day window, oldest first. */
+  warningsFor(user: UserRecord): TrafficWarning[] {
+    const cutoff = this.#now() - 30 * 86_400_000
+    return user.warnings.filter((entry) => entry.at >= cutoff)
+  }
+
+  /** Admin: clear the warning history without changing the account's state. */
+  async resetWarnings(userId: string): Promise<PublicUser> {
+    const now = this.#now()
+    return this.#queue.run(async () => {
+      const user = this.#users.get(userId)
+      if (user === undefined) throw new AccountError('INVALID_INPUT', 'no such account', 404)
+      user.warnings = []
+      user.updatedAt = now
+      await this.#saveAccounts()
+      await this.#audit('traffic-warnings-cleared', { userId })
+      return this.#public(user, null, now)
+    })
+  }
+
+  /** Admin: ban through the traffic policy, keeping a reason. */
+  async banUser(userId: string, meta: { reason: string; bytes: number }): Promise<PublicUser> {
+    return this.setDisabled(userId, true, { ...meta, by: 'auto' })
+  }
+
+  /**
+   * Set a new password after an email-code reset.
+   *
+   * Every other device is signed out: a password reset is the one moment an
+   * operator expects a stolen session to stop working.
+   *
+   * @param email - the address that received the code.
+   * @param password - the new password.
+   * @param device - the device claiming the reset.
+   * @returns a fresh session for that device.
+   */
+  async resetPassword(email: string, password: string, device: DeviceInput): Promise<AuthResult> {
+    validatePassword(password)
+    const normalized = validateDevice(device)
+    const now = this.#now()
+    return this.#queue.run(async () => {
+      const user = this.#findByEmailKey(normalizeEmail(validateEmail(email)))
+      if (user === undefined) {
+        throw new AccountError('VERIFICATION_INVALID', 'that code is not valid', 400)
+      }
+      if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
+      user.passwordHash = await hashPassword(password, this.#passwordParams)
+      user.emailVerified = true
+      user.updatedAt = now
+      for (const session of this.#sessions) {
+        if (session.userId === user.id && session.deviceId !== normalized.id && session.revokedAt === null) {
+          session.revokedAt = now
+          session.revokedReason = 'password-reset'
+        }
+      }
+      const issued = this.#issueSession(user, normalized, now, false)
+      this.#entitlementsChanged(user.id)
+      await this.#saveAccounts()
+      await this.#audit('password-reset', { userId: user.id })
+      return {
+        token: issued.token,
+        user: this.#public(user, normalized.id, now),
+        ...(issued.notice === undefined ? {} : { notice: issued.notice }),
+      }
+    })
+  }
+
+  /** Mark an address as proved, used by the verified registration path. */
+  async markEmailVerified(userId: string): Promise<void> {
+    const now = this.#now()
+    await this.#queue.run(async () => {
+      const user = this.#users.get(userId)
+      if (user === undefined) return
+      if (user.emailVerified) return
+      user.emailVerified = true
+      user.updatedAt = now
+      await this.#saveAccounts()
     })
   }
 
@@ -982,6 +1186,51 @@ export class AccountStore {
   // MARK: - Internals
 
   /** Load and index the account file. */
+  /**
+   * Collapse the device roster to one row per physical device.
+   *
+   * Signing out marks a device revoked and signing back in with the same
+   * install id reuses that record -- but an install id that changed (a
+   * reinstall that lost its defaults, an older build) used to leave the revoked
+   * row behind and add a second one with the same name and model. The account
+   * screen then showed two identical devices, one of them dead. Here they are
+   * collapsed: a live record wins over its revoked twins, and when every twin is
+   * revoked the newest one is the row that stays.
+   */
+  #normalizeDevices(user: UserRecord): void {
+    const byId = new Map<string, DeviceRecord>()
+    for (const device of user.devices) {
+      const existing = byId.get(device.id)
+      if (existing === undefined || device.loginAt >= existing.loginAt) byId.set(device.id, device)
+    }
+    const byPhysical = new Map<string, DeviceRecord[]>()
+    for (const device of byId.values()) {
+      const key = `${device.name}\u0000${device.model}\u0000${device.platform}`
+      const list = byPhysical.get(key) ?? []
+      list.push(device)
+      byPhysical.set(key, list)
+    }
+    const kept: DeviceRecord[] = []
+    for (const list of byPhysical.values()) {
+      if (list.length === 1) {
+        kept.push(list[0]!)
+        continue
+      }
+      const live = list.filter((device) => device.revokedAt === null)
+      if (live.length >= 2) {
+        // Two phones that happen to share a name are two phones. Only a single
+        // live record absorbs the revoked twins beside it.
+        kept.push(...list)
+        continue
+      }
+      const pool = live.length === 1 ? live : list
+      pool.sort((a, b) => b.loginAt - a.loginAt)
+      kept.push(pool[0]!)
+    }
+    kept.sort((a, b) => a.loginAt - b.loginAt)
+    user.devices = kept
+  }
+
   #loadAccounts(file: AccountsFile): void {
     if (file.version !== 1) throw new Error(`unsupported accounts.json version ${String(file.version)}`)
     for (const record of file.users ?? []) {
@@ -992,7 +1241,12 @@ export class AccountStore {
         ...record,
         githubId: record.githubId ?? null,
         githubLogin: record.githubLogin ?? null,
+        // Files written before the traffic policy have neither field; an absent
+        // warning list is "no warnings", not a reason to refuse to boot.
+        warnings: record.warnings ?? [],
+        ban: record.ban ?? null,
       }
+      this.#normalizeDevices(user)
       this.#users.set(user.id, user)
       this.#indexes(user)
     }
@@ -1126,6 +1380,9 @@ export class AccountStore {
         }
       }
     }
+    // A sign-in under a new install id for the same physical phone must not
+    // leave the revoked twin on the roster.
+    this.#normalizeDevices(user)
     return { token, ...(notice === undefined ? {} : { notice }) }
   }
 

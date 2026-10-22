@@ -57,6 +57,26 @@ export interface Entitlements {
   appStore: AppStoreEntitlement | null
 }
 
+/** One traffic warning a user has received. */
+export interface TrafficWarning {
+  readonly at: number
+  /** UTC day the anomaly belonged to. */
+  readonly day: string
+  /** Bytes carried that day at detection time. */
+  readonly bytes: number
+  readonly reason: 'volume' | 'spike' | 'quota'
+}
+
+/** Why an account was disabled by the traffic policy. */
+export interface BanRecord {
+  readonly at: number
+  /** The reason the policy acted, as a short machine word. */
+  readonly reason: string
+  /** Bytes carried on the day that triggered it. */
+  readonly bytes: number
+  readonly by: 'auto' | 'admin'
+}
+
 /** One stored account. */
 export interface UserRecord {
   readonly id: string
@@ -65,16 +85,22 @@ export interface UserRecord {
   readonly email: string | null
   readonly emailKey: string | null
   emailVerified: boolean
-  readonly passwordHash: string | null
+  /** Changed by a password reset, so not `readonly`. */
+  passwordHash: string | null
   appleSub: string | null
   githubId: string | null
   githubLogin: string | null
   readonly avatar: AvatarSpec
   disabled: boolean
+  /** Traffic warnings inside the trailing 30-day window, oldest first. */
+  warnings: TrafficWarning[]
+  /** Set when the traffic policy disabled the account; `null` otherwise. */
+  ban: BanRecord | null
   readonly createdAt: number
   updatedAt: number
   lastSeenAt: number
-  readonly devices: DeviceRecord[]
+  /** The device roster; rewritten by `#normalizeDevices` on load and sign-in. */
+  devices: DeviceRecord[]
   entitlements: Entitlements
 }
 
@@ -258,6 +284,13 @@ export class AccountError extends Error {
     readonly code: string,
     message: string,
     readonly status: number,
+    /**
+     * A contact address the phone may show beside the message.
+     *
+     * Only used by `ACCOUNT_DISABLED`: a banned account needs somewhere to
+     * appeal to, and the phone cannot know that address on its own.
+     */
+    readonly contact?: string,
   ) {
     super(message)
     this.name = 'AccountError'

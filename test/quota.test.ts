@@ -42,7 +42,10 @@ describe('the request rate', () => {
   })
 
   it('counts a fresh identity separately', () => {
-    const quota = new DataQuota({ requestsPerMinute: 1, burst: 1, bytesPerDay: 0 })
+    // `burst` has a floor of two requests (see `DataQuota`), so a fresh
+    // identity is served twice and paced from the third request on.
+    const quota = new DataQuota({ requestsPerMinute: 1, burst: 2, bytesPerDay: 0 })
+    expect(quota.admit(ID).allowed).toBe(true)
     expect(quota.admit(ID).allowed).toBe(true)
     expect(quota.admit(ID).allowed).toBe(false)
     // Another account has its own budget; the limit is per identity, not global.

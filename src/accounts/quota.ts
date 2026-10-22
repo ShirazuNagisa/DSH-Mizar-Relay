@@ -67,6 +67,15 @@ export interface DataQuotaOptions {
   readonly now?: () => number
   /** Where to report a spent budget, at most once an hour per identity. */
   readonly log?: (message: string) => void
+  /**
+   * Called once per identity/day when the byte budget is spent.
+   *
+   * The traffic ledger only sees bytes that were *carried*, and the meter
+   * refuses the request that would cross the line -- so without this hook the
+   * day the cap is hit would be the one day the warning policy never hears
+   * about. The account relay turns this into a `quota` anomaly.
+   */
+  readonly onExhausted?: (identity: string, bytes: number, day: string) => void
 }
 
 /** One identity's counters. */
@@ -83,6 +92,8 @@ interface QuotaEntry {
   touchedAt: number
   /** When the spent-budget warning was last logged. */
   warnedAt: number
+  /** The UTC day the exhaustion callback last fired. */
+  exhaustedDay: string
 }
 
 /** Longest a `Retry-After` is ever advertised. */
@@ -101,6 +112,7 @@ export class DataQuota {
   readonly #maxEntries: number
   readonly #now: () => number
   readonly #log: (message: string) => void
+  readonly #onExhausted: ((identity: string, bytes: number, day: string) => void) | null
   readonly #entries = new Map<string, QuotaEntry>()
   #refusedRate = 0
   #refusedBudget = 0
@@ -111,17 +123,19 @@ export class DataQuota {
   constructor(options: DataQuotaOptions) {
     this.#requestsPerMinute = Math.max(0, Math.floor(options.requestsPerMinute))
     // A bucket that cannot burst is a hard gate every 60/rate seconds, which
-    // stalls a normal conversation's request/response pairs. One second of rate
-    // as the burst floor, twice the rate as the default, keeps ordinary traffic
-    // smooth while still bounding a flood.
+    // stalls a normal conversation's request/response pairs. Two seconds of
+    // rate as the burst floor, a sixth of the rate as the default (50 for the
+    // usual 300/min), keeps a launch burst -- the list, the titles, the stats,
+    // the interactions -- from looking like a flood.
     this.#burst = Math.max(
-      1,
-      Math.floor(options.burst ?? Math.max(2, (this.#requestsPerMinute * 2) / 60)),
+      2,
+      Math.floor(options.burst ?? Math.max(2, this.#requestsPerMinute / 6)),
     )
     this.#bytesPerDay = Math.max(0, Math.floor(options.bytesPerDay))
     this.#maxEntries = Math.max(16, options.maxEntries ?? 20_000)
     this.#now = options.now ?? Date.now
     this.#log = options.log ?? (() => undefined)
+    this.#onExhausted = options.onExhausted ?? null
   }
 
   /** Counters for `/healthz` and the admin pages. */
@@ -184,10 +198,12 @@ export class DataQuota {
         entry.day = day
         entry.bytes = 0
         entry.warnedAt = 0
+        entry.exhaustedDay = ''
       }
       if (entry.bytes + bytes > this.#bytesPerDay) {
         this.#refusedBudget += 1
         this.#warnSpend(identity, entry, now)
+        this.#noteExhausted(identity, entry, now)
         return {
           allowed: false,
           reason: 'budget',
@@ -220,10 +236,14 @@ export class DataQuota {
       entry.day = day
       entry.bytes = 0
       entry.warnedAt = 0
+      entry.exhaustedDay = ''
     }
     entry.bytes += Math.floor(bytes)
     entry.touchedAt = now
-    if (entry.bytes > this.#bytesPerDay) this.#warnSpend(identity, entry, now)
+    if (entry.bytes > this.#bytesPerDay) {
+      this.#warnSpend(identity, entry, now)
+      this.#noteExhausted(identity, entry, now)
+    }
   }
 
   /** Forget one identity, used when an account is deleted. */
@@ -261,6 +281,7 @@ export class DataQuota {
       bytes: 0,
       touchedAt: now,
       warnedAt: 0,
+      exhaustedDay: '',
     }
     this.#entries.set(identity, entry)
     return entry
@@ -297,6 +318,18 @@ export class DataQuota {
       `quota: ${label} spent its ${Math.round(this.#bytesPerDay / (1024 * 1024))}MiB daily budget ` +
         `(${Math.round(entry.bytes / (1024 * 1024))}MiB); further requests are refused until the day turns over`,
     )
+  }
+
+  /** Tell the policy once per identity/day that the budget is gone. */
+  #noteExhausted(identity: string, entry: QuotaEntry, now: number): void {
+    const day = dayKey(now)
+    if (entry.exhaustedDay === day) return
+    entry.exhaustedDay = day
+    try {
+      this.#onExhausted?.(identity, entry.bytes, day)
+    } catch {
+      // A policy that throws must not refuse a request twice.
+    }
   }
 }
 

@@ -107,6 +107,54 @@ export interface RelayConfig {
    * {@link resolveAbuse} fills the defaults when a caller left it out.
    */
   readonly abuse?: AbuseLimits
+  /**
+   * Transactional mail, or `null` when this relay sends none.
+   *
+   * The free relay runs the SMTP/API sender (`role: "service"`); the account
+   * relay runs a client that posts to it (`role: "client"`). A relay that does
+   * neither leaves it out. Optional on the type so the many hand-built configs
+   * in tests and embedders keep compiling.
+   */
+  readonly mail?: MailConfig | null
+}
+
+/** What this relay does with mail. */
+export type MailRole = 'service' | 'client' | 'off'
+
+/** How the mail service reaches the outside world. */
+export type MailTransportKind = 'smtp' | 'tencent-ses'
+
+/** One transactional mail configuration. */
+export interface MailConfig {
+  readonly role: MailRole
+  readonly transport: MailTransportKind
+  /** Where clients post, and who may call the service. */
+  readonly service: {
+    readonly url: string
+    readonly token: string
+    readonly allowFrom: readonly string[]
+  }
+  readonly smtp: {
+    readonly host: string
+    readonly port: number
+    readonly secure: boolean
+    readonly user: string
+    readonly password: string
+  }
+  readonly tencent: {
+    readonly secretId: string
+    readonly secretKey: string
+    readonly region: string
+    readonly templateIds: {
+      readonly verification: number
+      readonly warning: number
+      readonly banned: number
+    }
+  }
+  readonly from: { readonly address: string; readonly name: string }
+  /** The appeal address printed in a ban mail and shown by the phone. */
+  readonly contact: string
+  readonly limits: { readonly perRecipientPerHour: number; readonly globalPerHour: number }
 }
 
 /** Gravatar lookup policy. */
@@ -193,6 +241,8 @@ export interface AbuseLimits {
   readonly probeRepliesPerSecondPerSource: number
   /** Per-identity bytes in one day that raises a traffic anomaly. `0` disables. */
   readonly trafficAlertBytesPerDay: number
+  /** The same threshold for a paid account; free accounts use the field above. */
+  readonly trafficAlertBytesPerDayPaid: number
   /** Day-over-day growth multiple that raises a spike anomaly. */
   readonly trafficAlertGrowthFactor: number
 }
@@ -205,24 +255,27 @@ export interface AbuseFileConfig {
   readonly probeRepliesPerSecond?: number
   readonly probeRepliesPerSecondPerSource?: number
   readonly trafficAlertBytesPerDay?: number
+  readonly trafficAlertBytesPerDayPaid?: number
   readonly trafficAlertGrowthFactor?: number
 }
 
 /**
  * The enforced defaults for {@link AbuseLimits}.
  *
- * One identity may move 2 GiB a day and make 300 requests a minute -- generous
- * for a conversation, far below what saturates an uplink. The probe is capped
- * hard because it answers a spoofable UDP packet, and the traffic alert is set
- * to notice 2 GiB a day, which is a person, not a bot.
+ * One identity may move 500 MiB a day and make 300 requests a minute -- the
+ * free plan's allowance, which is far below what saturates an uplink. A paid
+ * relay raises `bytesPerDay` to 5 GiB in its own config; its warning threshold
+ * for paid accounts is `trafficAlertBytesPerDayPaid`, while free accounts it
+ * aggregates from the free relay stay on the 500 MiB default.
  */
 export const DEFAULT_ABUSE: AbuseLimits = {
   requestsPerMinute: 300,
   burst: 0,
-  bytesPerDay: 2 * 1024 * 1024 * 1024,
+  bytesPerDay: 500 * 1024 * 1024,
   probeRepliesPerSecond: 200,
   probeRepliesPerSecondPerSource: 5,
-  trafficAlertBytesPerDay: 2 * 1024 * 1024 * 1024,
+  trafficAlertBytesPerDay: 500 * 1024 * 1024,
+  trafficAlertBytesPerDayPaid: 5 * 1024 * 1024 * 1024,
   trafficAlertGrowthFactor: 8,
 }
 
@@ -399,7 +452,126 @@ export function loadConfig(
     role,
     accounts: readAccounts(env, (file.accounts ?? null) as AccountsFileConfig | null, role),
     abuse: readAbuse(env, (file.abuse ?? null) as AbuseFileConfig | null),
+    mail: readMail(env, (file.mail ?? null) as MailFileConfig | null),
   }
+}
+
+/** The `mail` block as it appears in the config file; every field optional. */
+interface MailFileConfig {
+  readonly role?: MailRole
+  readonly transport?: MailTransportKind
+  readonly service?: {
+    readonly url?: string
+    readonly token?: string
+    readonly allowFrom?: readonly string[]
+  }
+  readonly smtp?: {
+    readonly host?: string
+    readonly port?: number
+    readonly secure?: boolean
+    readonly user?: string
+  }
+  readonly tencent?: {
+    readonly secretId?: string
+    readonly region?: string
+    readonly templateIds?: {
+      readonly verification?: number
+      readonly warning?: number
+      readonly banned?: number
+    }
+  }
+  readonly from?: { readonly address?: string; readonly name?: string }
+  readonly contact?: string
+  readonly limits?: { readonly perRecipientPerHour?: number; readonly globalPerHour?: number }
+}
+
+/**
+ * Resolve the mail block.
+ *
+ * Secrets are read from the environment first so a config file can be committed
+ * without a password in it. An absent block is `null`: no mail, no editor.
+ */
+function readMail(env: NodeJS.ProcessEnv, file: MailFileConfig | null): MailConfig | null {
+  const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
+    fromEnv !== undefined && fromEnv !== '' ? (fromEnv as unknown as T) : (fromFile ?? fallback)
+  const role = pick(env['MIZAR_MAIL_ROLE'], file?.role, 'off')
+  if (role === 'off') return null
+  const transport = pick(env['MIZAR_MAIL_TRANSPORT'], file?.transport, 'tencent-ses')
+  const allowFrom = (env['MIZAR_MAIL_ALLOW_FROM'] ?? file?.service?.allowFrom?.join(',') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value !== '')
+  const config: MailConfig = {
+    role,
+    transport,
+    service: {
+      url: (env['MIZAR_MAIL_SERVICE_URL'] ?? file?.service?.url ?? '').replace(/\/+$/, ''),
+      token: env['MIZAR_MAIL_SERVICE_TOKEN'] ?? file?.service?.token ?? '',
+      allowFrom,
+    },
+    smtp: {
+      host: env['MIZAR_SMTP_HOST'] ?? file?.smtp?.host ?? '',
+      port: Number(pick(env['MIZAR_SMTP_PORT'], file?.smtp?.port, 465)),
+      secure: flag(pick(env['MIZAR_SMTP_SECURE'], file?.smtp?.secure, true)),
+      user: env['MIZAR_SMTP_USER'] ?? file?.smtp?.user ?? '',
+      password: env['MIZAR_SMTP_PASSWORD'] ?? '',
+    },
+    tencent: {
+      secretId: env['MIZAR_TENCENT_SECRET_ID'] ?? file?.tencent?.secretId ?? '',
+      secretKey: env['MIZAR_TENCENT_SECRET_KEY'] ?? '',
+      region: env['MIZAR_TENCENT_REGION'] ?? file?.tencent?.region ?? 'ap-hongkong',
+      templateIds: {
+        verification: Number(
+          pick(
+            env['MIZAR_TENCENT_TEMPLATE_VERIFICATION'],
+            file?.tencent?.templateIds?.verification,
+            0,
+          ),
+        ),
+        warning: Number(
+          pick(env['MIZAR_TENCENT_TEMPLATE_WARNING'], file?.tencent?.templateIds?.warning, 0),
+        ),
+        banned: Number(
+          pick(env['MIZAR_TENCENT_TEMPLATE_BANNED'], file?.tencent?.templateIds?.banned, 0),
+        ),
+      },
+    },
+    from: {
+      address: env['MIZAR_MAIL_FROM_ADDRESS'] ?? file?.from?.address ?? 'noreply@shirazu-nagisa.com',
+      name: env['MIZAR_MAIL_FROM_NAME'] ?? file?.from?.name ?? 'DSH-Mizar',
+    },
+    contact: env['MIZAR_MAIL_CONTACT'] ?? file?.contact ?? 'shirazunagisa@icloud.com',
+    limits: {
+      perRecipientPerHour: Number(
+        pick(env['MIZAR_MAIL_PER_RECIPIENT_HOUR'], file?.limits?.perRecipientPerHour, 5),
+      ),
+      globalPerHour: Number(
+        pick(env['MIZAR_MAIL_GLOBAL_HOUR'], file?.limits?.globalPerHour, 200),
+      ),
+    },
+  }
+  if (role === 'client') {
+    if (config.service.url === '' || config.service.token === '') {
+      throw new Error('mail.role is "client" but mail.service.url/token are missing')
+    }
+  }
+  if (role === 'service') {
+    if (config.transport === 'tencent-ses') {
+      const missing = [
+        config.tencent.secretId === '' ? 'secretId' : '',
+        config.tencent.secretKey === '' ? 'secretKey' : '',
+        config.tencent.templateIds.verification === 0 ? 'templateIds.verification' : '',
+        config.tencent.templateIds.warning === 0 ? 'templateIds.warning' : '',
+        config.tencent.templateIds.banned === 0 ? 'templateIds.banned' : '',
+      ].filter((value) => value !== '')
+      if (missing.length > 0) {
+        throw new Error(`mail service (tencent-ses) is missing: ${missing.join(', ')}`)
+      }
+    } else if (config.smtp.host === '' || config.smtp.user === '' || config.smtp.password === '') {
+      throw new Error('mail service (smtp) needs host, user and MIZAR_SMTP_PASSWORD')
+    }
+  }
+  return config
 }
 
 /**
@@ -439,6 +611,11 @@ function readAbuse(env: NodeJS.ProcessEnv, file: AbuseFileConfig | null): AbuseL
       env['MIZAR_ABUSE_TRAFFIC_ALERT_BYTES'],
       file?.trafficAlertBytesPerDay,
       DEFAULT_ABUSE.trafficAlertBytesPerDay,
+    ),
+    trafficAlertBytesPerDayPaid: num(
+      env['MIZAR_ABUSE_TRAFFIC_ALERT_BYTES_PAID'],
+      file?.trafficAlertBytesPerDayPaid,
+      DEFAULT_ABUSE.trafficAlertBytesPerDayPaid,
     ),
     trafficAlertGrowthFactor: num(
       env['MIZAR_ABUSE_TRAFFIC_ALERT_GROWTH'],

@@ -15,8 +15,10 @@
  */
 import { randomBytes } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { loadConfig } from '../config.js'
 import { hashPassword } from './passwords.js'
 import { writeJsonAtomic } from './state.js'
+import { AccountStore } from './store.js'
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2)
@@ -41,10 +43,64 @@ async function main(): Promise<void> {
       await configure(rest)
       return
     }
+    case 'create-user': {
+      await createUser(rest)
+      return
+    }
     default:
       throw new Error(
-        'usage: cli.js <hash-password|admin-secret|generate-code|configure> ...',
+        'usage: cli.js <hash-password|admin-secret|generate-code|configure|create-user> ...',
       )
+  }
+}
+
+/**
+ * Create one verified account, for App Review and for support.
+ *
+ * The password reset flow needs a mailbox; a reviewer does not have one, so the
+ * demo account is made here with `emailVerified: true` and never goes through
+ * the code path.
+ */
+async function createUser(args: readonly string[]): Promise<void> {
+  const options = parseFlags(args)
+  const configPath = options.get('config')
+  const username = options.get('username')
+  const email = options.get('email')
+  const password = options.get('password')
+  if (configPath === undefined || username === undefined || email === undefined || password === undefined) {
+    throw new Error('usage: create-user --config <relay.config.json> --username <name> --email <address> --password <password>')
+  }
+  const config = loadConfig(configPath)
+  const accounts = config.accounts
+  if (accounts === null) throw new Error('accounts are not enabled in that config')
+  const store = await AccountStore.open({
+    dataDir: accounts.dataDir,
+    gravatar: accounts.gravatar,
+    apple: { audiences: accounts.appleAudiences, keysURL: accounts.appleKeysURL },
+    appstore: {
+      bundleId: accounts.appstore.bundleId,
+      productId: accounts.appstore.productId,
+      allowSandbox: accounts.appstore.allowSandbox,
+    },
+    log: (message) => process.stderr.write(`${message}\n`),
+  })
+  try {
+    const result = await store.register({
+      username,
+      email,
+      password,
+      emailVerified: true,
+      device: {
+        id: 'review-demo-01',
+        name: 'App Review',
+        model: 'iPhone',
+        platform: 'ios',
+        appVersion: '0.9.5',
+      },
+    })
+    process.stdout.write(`${JSON.stringify({ userId: result.user.id, username: result.user.username })}\n`)
+  } finally {
+    await store.close()
   }
 }
 

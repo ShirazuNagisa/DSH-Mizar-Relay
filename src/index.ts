@@ -27,12 +27,14 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
 import { AccountApi } from './accounts/api.js'
 import { AdminApi } from './accounts/admin.js'
+import { Enforcement } from './accounts/enforcement.js'
 import { PaidGate, isGateExempt, type GateDecision } from './accounts/gate.js'
 import { identityFor, isPrivateHeader } from './accounts/identity.js'
 import { parseHash } from './accounts/passwords.js'
 import { DataQuota } from './accounts/quota.js'
 import { AccountStore } from './accounts/store.js'
 import { TrafficLedger, isValidDay, isValidIdentity } from './accounts/traffic.js'
+import { VerificationCodes } from './accounts/verification.js'
 import { clientAddress } from './client-address.js'
 import {
   gateStartupChecks,
@@ -43,6 +45,11 @@ import {
 } from './config.js'
 import { FcmClient } from './fcm.js'
 import { parseJsonObject, readBody, writeJson } from './http.js'
+import { handleMailRequest, MAIL_PATH } from './mail/api.js'
+import { MailClient } from './mail/client.js'
+import { MailService } from './mail/service.js'
+import { SmtpMailTransport } from './mail/smtp.js'
+import { TencentMailTransport } from './mail/tencent.js'
 import { deliver, PushRegistry, readDevice, readNotification } from './push.js'
 import { deriveRoom, secretsEqual } from './room.js'
 import { RoomRegistry, Tunnel, saneCloseCode, type TunnelStream } from './tunnel.js'
@@ -269,6 +276,72 @@ export async function startRelay(
           log,
         })
       : null
+  // Mail. A `service` process owns the transport (主力0); the account relay owns
+  // only a client that posts to it. Both can be absent: the tunnel never needs
+  // mail to move a byte.
+  const mailConfig = config.mail ?? null
+  const mailService =
+    mailConfig !== null && mailConfig.role === 'service'
+      ? await MailService.open({
+          dataDir: accountsConfig?.dataDir ?? './data',
+          transport:
+            mailConfig.transport === 'smtp'
+              ? new SmtpMailTransport({
+                  host: mailConfig.smtp.host,
+                  port: mailConfig.smtp.port,
+                  secure: mailConfig.smtp.secure,
+                  user: mailConfig.smtp.user,
+                  password: mailConfig.smtp.password,
+                  from: mailConfig.from.address,
+                  replyTo: mailConfig.contact,
+                  log,
+                })
+              : new TencentMailTransport({
+                  secretId: mailConfig.tencent.secretId,
+                  secretKey: mailConfig.tencent.secretKey,
+                  region: mailConfig.tencent.region,
+                  from: `${mailConfig.from.name} <${mailConfig.from.address}>`,
+                  replyTo: mailConfig.contact,
+                }),
+          templateIds: mailConfig.tencent.templateIds,
+          limits: mailConfig.limits,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+      : null
+  const mailClient =
+    mailConfig !== null && mailConfig.role === 'client'
+      ? new MailClient({ url: mailConfig.service.url, token: mailConfig.service.token })
+      : null
+
+  // Codes live on the account relay, next to the accounts they protect.
+  const verification =
+    accountStore === null || accountsConfig === null
+      ? null
+      : await VerificationCodes.open({
+          dataDir: accountsConfig.dataDir,
+          secret:
+            accountsConfig.internalSecret !== ''
+              ? accountsConfig.internalSecret
+              : accountsConfig.adminPasswordHash,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+
+  // The traffic policy. It records warnings even when mail is unavailable, so a
+  // deployment without a sender still bans after three warnings -- it just
+  // cannot tell the person why.
+  const enforcement =
+    accountStore === null
+      ? null
+      : new Enforcement({
+          store: accountStore,
+          mail: mailClient,
+          contact: mailConfig?.contact ?? 'shirazunagisa@icloud.com',
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+
   const traffic = await TrafficLedger.open({
     dataDir: accountsConfig?.enabled === true ? accountsConfig.dataDir : null,
     relayId: accountsConfig?.reportId === undefined || accountsConfig.reportId === ''
@@ -279,6 +352,23 @@ export async function startRelay(
     internalSecret: accountsConfig?.internalSecret ?? '',
     alertBytesPerDay: abuse.trafficAlertBytesPerDay,
     alertGrowthFactor: abuse.trafficAlertGrowthFactor,
+    ...(accountStore === null
+      ? {}
+      : {
+          // Free accounts keep the 500 MB ceiling even when their traffic was
+          // reported by the free relay; paid accounts get 5 GB.
+          thresholdFor: (identity: string): number => {
+            const plan = identity.startsWith('account:')
+              ? accountStore.planForSessionHash(identity.slice('account:'.length))
+              : null
+            return plan === 'paid'
+              ? (abuse.trafficAlertBytesPerDayPaid ?? 5 * 1024 * 1024 * 1024)
+              : abuse.trafficAlertBytesPerDay
+          },
+          onAnomaly: (anomaly) => {
+            enforcement?.observe(anomaly)
+          },
+        }),
     ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
     log,
@@ -332,6 +422,13 @@ export async function startRelay(
     requestsPerMinute: abuse.requestsPerMinute,
     ...(abuse.burst > 0 ? { burst: abuse.burst } : {}),
     bytesPerDay: abuse.bytesPerDay,
+    onExhausted: (identity: string, bytes: number, day: string) => {
+      // Recorded for the report as well as for the policy: a free relay's
+      // account lives on the account relay, and it can only warn if the
+      // spending is reported.
+      traffic.noteExhausted(identity, day, bytes)
+      enforcement?.observe({ identity, bytes, day, reason: 'quota' })
+    },
     ...(deps.now === undefined ? {} : { now: deps.now }),
     log,
   })
@@ -382,6 +479,12 @@ export async function startRelay(
           ...(accountsConfig?.github === undefined || accountsConfig.github === null
             ? {}
             : { github: accountsConfig.github }),
+          // Verification is on only when this relay can actually send: a
+          // deployment without a mail client keeps the pre-verification
+          // behaviour rather than refusing every registration.
+          verification: mailClient === null ? null : verification,
+          mail: mailClient,
+          ...(mailConfig === null ? {} : { contact: mailConfig.contact }),
           ...(deps.now === undefined ? {} : { now: deps.now }),
           ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
           log,
@@ -445,6 +548,9 @@ export async function startRelay(
           refusedRate: quota.stats.refusedRate,
           refusedBudget: quota.stats.refusedBudget,
         },
+        // Whether this relay can mail, and what is waiting. `null` on a relay
+        // that neither sends nor asks the other one to.
+        mail: mailService?.status ?? (mailClient === null ? null : { role: 'client' }),
       })
       return
     }
@@ -471,6 +577,19 @@ export async function startRelay(
     }
     if (parsedUrl.pathname === '/internal/v1/traffic') {
       await handleTrafficReport(request, response)
+      return
+    }
+    if (parsedUrl.pathname === MAIL_PATH) {
+      if (mailService === null || mailConfig === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      await handleMailRequest(request, response, parsedUrl.pathname, {
+        service: mailService,
+        token: mailConfig.service.token,
+        allowFrom: mailConfig.service.allowFrom,
+        log,
+      })
       return
     }
     if (parsedUrl.pathname === '/admin' || parsedUrl.pathname.startsWith('/admin/')) {
@@ -623,12 +742,17 @@ export async function startRelay(
     }
     const relayId = typeof parsed['relayId'] === 'string' ? parsed['relayId'] : ''
     const role = parsed['role']
-    const entries = parsed['entries']
+    const entries = parsed['entries'] ?? []
+    const exhaustedRaw = parsed['exhausted'] ?? []
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(relayId) || (role !== 0 && role !== 1) || !Array.isArray(entries)) {
       writeJson(response, 400, { error: 'relayId, role and entries are required' })
       return
     }
-    if (entries.length > 500) {
+    if (!Array.isArray(exhaustedRaw)) {
+      writeJson(response, 400, { error: 'exhausted must be an array' })
+      return
+    }
+    if (entries.length > 500 || exhaustedRaw.length > 500) {
       writeJson(response, 413, { error: 'at most 500 entries per report' })
       return
     }
@@ -644,8 +768,23 @@ export async function startRelay(
       if (!Number.isFinite(bytesIn) || !Number.isFinite(bytesOut) || bytesIn < 0 || bytesOut < 0) return []
       return [{ identity, day, in: bytesIn, out: bytesOut }]
     })
-    traffic.ingest({ relayId, role, entries: clean })
-    writeJson(response, 200, { ok: true, accepted: clean.length })
+    const cleanExhausted = exhaustedRaw.flatMap((item) => {
+      if (typeof item !== 'object' || item === null) return []
+      const record = item as Record<string, unknown>
+      const identity = record['identity']
+      const day = record['day']
+      const bytes = record['bytes']
+      if (!isValidIdentity(identity) || !isValidDay(day)) return []
+      if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return []
+      return [{ identity, day, bytes }]
+    })
+    traffic.ingest({
+      relayId,
+      role,
+      entries: clean,
+      exhausted: cleanExhausted,
+    })
+    writeJson(response, 200, { ok: true, accepted: clean.length, exhausted: cleanExhausted.length })
   }
 
   /**
@@ -987,13 +1126,18 @@ export async function startRelay(
         stream.close(1009, 'message too large')
         return
       }
-      // Phone -> computer bytes spend the budget too. This direction is closed
-      // rather than dropped when it is over: a phone that keeps talking past its
-      // allowance is exactly the flood the meter exists to stop, and leaving the
-      // stream open would let it keep paying tokens for frames that go nowhere.
-      if (!quota.admit(identity.key, data.length).allowed) {
-        phone.close(1008, 'traffic allowance spent')
-        stream.close(1008, 'traffic allowance spent')
+      // Phone -> computer bytes spend the budget too. A *budget* refusal closes
+      // the socket: the day is genuinely over for this account. A *rate*
+      // refusal does not: a launch burst of frames is not somebody spending
+      // their traffic, and closing with "traffic allowance spent" made the app
+      // tell people their quota was gone when it was not. The frame is dropped
+      // and the socket stays, exactly like the computer -> phone direction.
+      const decision = quota.admit(identity.key, data.length)
+      if (!decision.allowed) {
+        if (decision.reason === 'budget') {
+          phone.close(1008, 'traffic allowance spent')
+          stream.close(1008, 'traffic allowance spent')
+        }
         return
       }
       traffic.record(identity.key, data.length, 0)
@@ -1190,6 +1334,7 @@ export async function startRelay(
     close: async () => {
       clearInterval(sweeper)
       await traffic.close()
+      await mailService?.close()
       await accountStore?.close()
       for (const entry of waiting) clearTimeout(entry.timer)
       waiting.clear()

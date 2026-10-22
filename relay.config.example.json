@@ -18,6 +18,52 @@
     "_comment": "Android 推送（FCM）同样是可选的：在 relay.config.json 里加一个 fcm 块。serviceAccountFile 指向 Firebase 服务账号 JSON 的路径（也可以把整份 JSON 内联进 serviceAccount），channelId 必须是 App 建好的通知通道 —— Android 客户端的通道名是 mizar-alerts；不填则走 App 的默认通道。步骤见 docs/deployment.md 第 10.3 节。"
   },
   "role": 0,
+  "_mail": {
+    "_comment": "Transactional mail (verification codes, traffic warnings, ban notices). 主力0 runs role=service with Tencent SES; 主力1 runs role=client pointing at it. Secrets live in /etc/dsh-mizar/mail.env (600), never here. transport=smtp is only for enterprise/legacy accounts that may use SMTP submission."
+  },
+  "mail": {
+    "role": "off",
+    "transport": "tencent-ses",
+    "service": {
+      "url": "",
+      "token": "",
+      "allowFrom": []
+    },
+    "smtp": {
+      "host": "",
+      "port": 465,
+      "secure": true,
+      "user": ""
+    },
+    "tencent": {
+      "secretId": "",
+      "region": "ap-hongkong",
+      "templateIds": {
+        "verification": 0,
+        "warning": 0,
+        "banned": 0
+      }
+    },
+    "from": {
+      "address": "noreply@shirazu-nagisa.com",
+      "name": "DSH-Mizar"
+    },
+    "contact": "shirazunagisa@icloud.com",
+    "limits": {
+      "perRecipientPerHour": 5,
+      "globalPerHour": 200
+    }
+  },
+  "abuse": {
+    "requestsPerMinute": 300,
+    "bytesPerDay": 524288000,
+    "trafficAlertBytesPerDay": 524288000,
+    "trafficAlertBytesPerDayPaid": 5368709120,
+    "trafficAlertGrowthFactor": 8
+  },
+  "_abuse": {
+    "_comment": "bytesPerDay is the hard cap that refuses traffic (free relay 500MB, paid relay 5GB); the two alert thresholds are when a warning is raised, tier-aware on the account relay. The paid relay's config sets bytesPerDay=5368709120."
+  },
   "accounts": {
     "enabled": false,
     "dataDir": "./data",

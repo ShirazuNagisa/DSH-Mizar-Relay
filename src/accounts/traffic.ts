@@ -54,6 +54,21 @@ export interface TrafficReport {
   relayId: string
   role: 0 | 1
   entries: readonly TrafficEntry[]
+  /**
+   * Identities that hit the relay's hard daily cap.
+   *
+   * The cap refuses the request that would cross it, so carried bytes never
+   * reach a warning threshold on the free relay. Without this the day an
+   * account is stopped would be the one day the policy hears nothing about.
+   */
+  exhausted?: readonly TrafficExhaustion[]
+}
+
+/** One identity that spent its hard daily allowance. */
+export interface TrafficExhaustion {
+  readonly identity: string
+  readonly day: string
+  readonly bytes: number
 }
 
 /** Options for the ledger. */
@@ -76,7 +91,7 @@ export interface TrafficOptions {
   readonly log?: (message: string) => void
   /**
    * Per-identity bytes in one UTC day that raise a volume anomaly, or `0` to
-   * disable. Defaults to 2 GiB -- a person's heavy day, far past a bot's.
+   * disable. Defaults to 500 MB -- the free plan's allowance.
    */
   readonly alertBytesPerDay?: number
   /**
@@ -84,6 +99,15 @@ export interface TrafficOptions {
    * total must be to raise a spike anomaly. Defaults to 8. `0` disables.
    */
   readonly alertGrowthFactor?: number
+  /**
+   * The daily ceiling for one identity, when it depends on the plan.
+   *
+   * The account relay passes a function that resolves `account:<hash>` to the
+   * owner's plan; a free relay can leave it out and use `alertBytesPerDay`.
+   */
+  readonly thresholdFor?: (identity: string) => number
+  /** Called once per identity/day when an anomaly is noticed. */
+  readonly onAnomaly?: (anomaly: TrafficAnomaly) => void
 }
 
 /**
@@ -101,7 +125,7 @@ export interface TrafficAnomaly {
   readonly day: string
   /** Bytes the identity carried that day at detection time. */
   readonly bytes: number
-  readonly reason: 'volume' | 'spike'
+  readonly reason: 'volume' | 'spike' | 'quota'
   /** For `spike`, the trailing average it broke away from. */
   readonly baseline: number
   readonly at: number
@@ -144,8 +168,12 @@ export class TrafficLedger {
   readonly #identities = new Map<string, IdentityTraffic>()
   readonly #relays = new Map<string, RelayInfo>()
   readonly #pending = new Map<string, PendingReport>()
+  /** Identity/day pairs that spent their hard cap, waiting for the next report. */
+  readonly #pendingExhausted = new Map<string, TrafficExhaustion>()
   readonly #alertBytesPerDay: number
   readonly #alertGrowthFactor: number
+  readonly #thresholdFor: ((identity: string) => number) | null
+  readonly #onAnomaly: ((anomaly: TrafficAnomaly) => void) | null
   /** Recent anomalies, newest last, bounded. */
   readonly #anomalies: TrafficAnomaly[] = []
   /** Identity/day pairs already reported, so one burst is one alert. */
@@ -164,8 +192,10 @@ export class TrafficLedger {
     this.#now = options.now ?? Date.now
     this.#fetch = options.fetchImpl ?? fetch
     this.#log = options.log ?? (() => undefined)
-    this.#alertBytesPerDay = Math.max(0, options.alertBytesPerDay ?? 2 * 1024 * 1024 * 1024)
+    this.#alertBytesPerDay = Math.max(0, options.alertBytesPerDay ?? 500 * 1024 * 1024)
     this.#alertGrowthFactor = Math.max(0, options.alertGrowthFactor ?? 8)
+    this.#thresholdFor = options.thresholdFor ?? null
+    this.#onAnomaly = options.onAnomaly ?? null
   }
 
   /**
@@ -257,6 +287,21 @@ export class TrafficLedger {
   }
 
   /**
+   * Note that an identity hit this relay's hard daily cap.
+   *
+   * Only a reporting relay needs this: the account relay sees the same identity
+   * through its own meter and through {@link ingest}.
+   *
+   * @param identity - the traffic identity key.
+   * @param day - the UTC day.
+   * @param bytes - bytes carried when the cap was reached.
+   */
+  noteExhausted(identity: string, day: string, bytes: number): void {
+    if (this.#closed || this.#reportTo === '') return
+    this.#pendingExhausted.set(`${identity}\n${day}`, { identity, day, bytes: Math.max(0, bytes) })
+  }
+
+  /**
    * Merge one relay's report.
    *
    * @param report - a validated report from a free relay.
@@ -289,6 +334,19 @@ export class TrafficLedger {
       perRelay.out += outgoing
       this.#checkAnomaly(entry.identity, entry.day)
     }
+    // A relay that spent its hard cap says so; the request that would have
+    // crossed the line was refused, so its bytes are never in `entries`.
+    for (const exhaustion of report.exhausted ?? []) {
+      if (!isValidIdentity(exhaustion.identity) || !isValidDay(exhaustion.day)) continue
+      this.#emit({
+        identity: exhaustion.identity,
+        day: exhaustion.day,
+        bytes: Math.max(0, Math.floor(exhaustion.bytes)),
+        reason: 'quota',
+        baseline: 0,
+        at: now,
+      })
+    }
   }
 
   /**
@@ -310,7 +368,8 @@ export class TrafficLedger {
    * away somebody's connection.
    */
   #checkAnomaly(identity: string, day: string): void {
-    if (this.#alertBytesPerDay === 0 && this.#alertGrowthFactor === 0) return
+    const ceiling = this.#thresholdFor === null ? this.#alertBytesPerDay : this.#thresholdFor(identity)
+    if (ceiling <= 0 && this.#alertGrowthFactor === 0) return
     const key = `${identity}\n${day}`
     if (this.#anomalySeen.has(key)) return
     const value = this.#identities.get(identity)
@@ -319,8 +378,8 @@ export class TrafficLedger {
     const at = this.#now()
 
     let anomaly: TrafficAnomaly | null = null
-    if (this.#alertBytesPerDay > 0 && today > this.#alertBytesPerDay) {
-      anomaly = { identity, day, bytes: today, reason: 'volume', baseline: this.#alertBytesPerDay, at }
+    if (ceiling > 0 && today > ceiling) {
+      anomaly = { identity, day, bytes: today, reason: 'volume', baseline: ceiling, at }
     } else if (this.#alertGrowthFactor > 0) {
       const baseline = trailingAverage(value.days, day, BASELINE_DAYS)
       // A tiny baseline makes any byte look like a spike, so growth only counts
@@ -331,16 +390,34 @@ export class TrafficLedger {
       }
     }
     if (anomaly === null) return
+    this.#emit(anomaly)
+  }
 
+  /**
+   * Record one anomaly and tell the policy, once per identity/day.
+   *
+   * The listener is the enforcement policy, which persists and mails. It must
+   * never be able to fail the meter.
+   */
+  #emit(anomaly: TrafficAnomaly): void {
+    const key = `${anomaly.identity}\n${anomaly.day}`
+    if (this.#anomalySeen.has(key)) return
     this.#anomalySeen.add(key)
     this.#anomalies.push(anomaly)
     if (this.#anomalies.length > MAX_ANOMALIES) this.#anomalies.splice(0, this.#anomalies.length - MAX_ANOMALIES)
-    const label = identity.length > 28 ? `${identity.slice(0, 28)}…` : identity
+    const label = anomaly.identity.length > 28 ? `${anomaly.identity.slice(0, 28)}…` : anomaly.identity
     this.#log(
       anomaly.reason === 'volume'
-        ? `traffic: ANOMALY ${label} carried ${formatMiB(anomaly.bytes)} on ${day}, over the ${formatMiB(this.#alertBytesPerDay)} ceiling`
-        : `traffic: ANOMALY ${label} carried ${formatMiB(anomaly.bytes)} on ${day}, over ${this.#alertGrowthFactor}× its ${formatMiB(anomaly.baseline)} average`,
+        ? `traffic: ANOMALY ${label} carried ${formatMiB(anomaly.bytes)} on ${anomaly.day}, over the ${formatMiB(anomaly.baseline)} ceiling`
+        : anomaly.reason === 'quota'
+          ? `traffic: ANOMALY ${label} spent its hard daily allowance on ${anomaly.day} (${formatMiB(anomaly.bytes)})`
+          : `traffic: ANOMALY ${label} carried ${formatMiB(anomaly.bytes)} on ${anomaly.day}, over ${this.#alertGrowthFactor}× its ${formatMiB(anomaly.baseline)} average`,
     )
+    try {
+      this.#onAnomaly?.(anomaly)
+    } catch {
+      // A listener that throws is a bug in the listener, not in the accounting.
+    }
   }
 
   /** The anomalies noticed so far, newest last. */
@@ -397,7 +474,9 @@ export class TrafficLedger {
         this.#log(`traffic: could not persist ${this.#filePath}: ${(error as Error).message}`)
       }
     }
-    if (this.#reportTo !== '' && this.#pending.size > 0) await this.#sendPending()
+    if ((this.#reportTo !== '' && this.#pending.size > 0) || this.#pendingExhausted.size > 0) {
+      await this.#sendPending()
+    }
     this.#prune()
   }
 
@@ -420,8 +499,9 @@ export class TrafficLedger {
       return
     }
     const entries = [...this.#pending.values()].slice(0, 500)
-    if (entries.length === 0) return
-    const body = JSON.stringify({ relayId: this.#relayId, role: this.#role, entries })
+    const exhausted = [...this.#pendingExhausted.values()].slice(0, 500)
+    if (entries.length === 0 && exhausted.length === 0) return
+    const body = JSON.stringify({ relayId: this.#relayId, role: this.#role, entries, exhausted })
     try {
       const response = await this.#fetch(`${this.#reportTo}/internal/v1/traffic`, {
         method: 'POST',
@@ -434,6 +514,7 @@ export class TrafficLedger {
       })
       if (!response.ok) throw new Error(`relay answered ${response.status}`)
       for (const entry of entries) this.#pending.delete(`${entry.identity}\n${entry.day}`)
+      for (const item of exhausted) this.#pendingExhausted.delete(`${item.identity}\n${item.day}`)
     } catch (error) {
       if (this.#now() - this.#lastReportFailure > 60_000) {
         this.#lastReportFailure = this.#now()

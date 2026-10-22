@@ -347,6 +347,8 @@ export class AdminApi {
       })),
       traffic,
       sessionCount: this.#options.store.sessionHashesForUser(user.id).length,
+      warnings: this.#options.store.warningsFor(user),
+      ban: user.ban,
     }
     writeHtml(response, 200, userPage(detail, csrf, url.searchParams.get('notice') ?? undefined))
     return true
@@ -511,6 +513,13 @@ export class AdminApi {
       const deviceId = decodeURIComponent(deviceMatch[2] ?? '')
       await this.#options.store.revokeDevice(id, deviceId)
       redirect(response, `/admin/users/${encodeURIComponent(id)}?notice=${encodeURIComponent('设备已吊销')}`)
+      return true
+    }
+    const warningResetMatch = /^\/admin\/users\/([^/]+)\/warnings\/reset$/.exec(path)
+    if (warningResetMatch !== null) {
+      const id = decodeURIComponent(warningResetMatch[1] ?? '')
+      await this.#options.store.resetWarnings(id)
+      redirect(response, `/admin/users/${encodeURIComponent(id)}?notice=${encodeURIComponent('流量警告已清零')}`)
       return true
     }
     if (path === '/admin/invites') {

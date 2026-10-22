@@ -245,6 +245,9 @@ export interface AdminUserDetail {
   }>
   readonly traffic: { readonly totalIn: number; readonly totalOut: number; readonly todayIn: number; readonly todayOut: number }
   readonly sessionCount: number
+  /** Warnings inside the trailing 30-day window, oldest first. */
+  readonly warnings: ReadonlyArray<{ readonly at: number; readonly day: string; readonly bytes: number; readonly reason: string }>
+  readonly ban: { readonly at: number; readonly reason: string; readonly bytes: number; readonly by: string } | null
 }
 
 /** The user detail page. */
@@ -271,6 +274,19 @@ export function userPage(user: AdminUserDetail, csrf: string, notice?: string): 
         <tr><th>最近校验</th><td>${h(formatTime(user.appStore.lastVerifiedAt))}</td></tr>
         <tr><th>原始交易</th><td class="mono">…${h(user.appStore.originalTransactionId.slice(-6))}</td></tr>
       </tbody></table>`
+  const warningRows = user.warnings
+    .map(
+      (warning) => `<tr>
+        <td class="muted">${h(formatTime(warning.at))}</td>
+        <td class="mono">${h(warning.day)}</td>
+        <td>${h(formatBytes(warning.bytes))}</td>
+        <td class="muted">${h(warning.reason)}</td>
+      </tr>`,
+    )
+    .join('')
+  const banNote = user.ban === null
+    ? ''
+    : `<p class="muted">封禁于 ${h(formatTime(user.ban.at))}，原因 ${h(user.ban.reason)}，当日 ${h(formatBytes(user.ban.bytes))}，由 ${h(user.ban.by)} 执行。</p>`
   return layout(
     '用户详情',
     `<p><a href="/admin/users">← 返回用户列表</a></p>
@@ -290,12 +306,19 @@ export function userPage(user: AdminUserDetail, csrf: string, notice?: string): 
      </tbody></table>
      <h2 style="margin-top:24px">App Store</h2>
      ${appStore}
+     <h2 style="margin-top:24px">流量警告 <span class="muted">(30 天内 ${user.warnings.length}/3)</span></h2>
+     ${banNote}
+     <table><thead><tr><th>时间</th><th>UTC 日</th><th>当日流量</th><th>原因</th></tr></thead><tbody>${warningRows || '<tr><td colspan="4" class="muted">没有警告</td></tr>'}</tbody></table>
      <h2 style="margin-top:24px">操作</h2>
      <div class="actions">
        <form method="post" action="/admin/users/${encodeURIComponent(user.row.id)}/plan" class="search">
          <input type="hidden" name="_csrf" value="${h(csrf)}">
          <input name="days" type="number" min="0" max="3650" placeholder="增加天数，0 = 清除" required>
          <button type="submit">调整人工权益</button>
+       </form>
+       <form method="post" action="/admin/users/${encodeURIComponent(user.row.id)}/warnings/reset">
+         <input type="hidden" name="_csrf" value="${h(csrf)}">
+         <button class="ghost" type="submit">重置流量警告</button>
        </form>
        <form method="post" action="/admin/users/${encodeURIComponent(user.row.id)}/disable">
          <input type="hidden" name="_csrf" value="${h(csrf)}">

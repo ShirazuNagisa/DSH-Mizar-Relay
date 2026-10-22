@@ -176,6 +176,9 @@ export class AccountApi {
         case 'POST /github/handoff':
           await this.#githubHandoffRoute(context)
           break
+        case 'POST /github/exchange':
+          await this.#githubExchangeRoute(context)
+          break
         case 'GET /me':
           await this.#me(context)
           break
@@ -567,6 +570,27 @@ export class AccountApi {
   }
 
   async #githubHandoffRoute(context: RequestContext): Promise<void> {
+    await this.#githubClaim(context, (body) => requireString(body, 'code'))
+  }
+
+  /**
+   * The same claim, under the name the phone's newer client uses.
+   *
+   * The done page has always called what it shows a handoff, while
+   * `/github/handoff` takes it as `code`. The Android client posts that code to
+   * `/github/exchange` as `handoff`, and a client that learned the field from
+   * the older route may still send `code`. Both spellings reach one claim here
+   * so a code is never lost to a field name.
+   */
+  async #githubExchangeRoute(context: RequestContext): Promise<void> {
+    await this.#githubClaim(context, (body) => stringField(body, 'handoff') ?? stringField(body, 'code') ?? '')
+  }
+
+  /** Spend one handoff code for a session, answering every failure in kind. */
+  async #githubClaim(
+    context: RequestContext,
+    readCode: (body: Record<string, unknown>) => string,
+  ): Promise<void> {
     const github = this.#githubOr404(context)
     if (github === null) return
     if (!this.#githubHandoffWindow.check(context.ip)) {
@@ -575,7 +599,7 @@ export class AccountApi {
     }
     const body = await this.#json(context)
     if (body === null) return
-    const code = requireString(body, 'code')
+    const code = readCode(body)
     const device = deviceOf(body)
     if (!GITHUB_HANDOFF_SHAPE.test(code)) {
       throw new AccountError('GITHUB_HANDOFF_INVALID', 'that sign-in code is not shaped right', 400)

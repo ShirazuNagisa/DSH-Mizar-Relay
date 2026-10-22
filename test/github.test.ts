@@ -161,6 +161,14 @@ async function handoff(base: string, code: string): Promise<{ status: number; bo
   return post(base, '/account/v1/github/handoff', { code, device: device('pixel-0001') })
 }
 
+async function exchange(
+  base: string,
+  code: string,
+  field: 'handoff' | 'code' = 'handoff',
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  return post(base, '/account/v1/github/exchange', { [field]: code, device: device('pixel-0001') })
+}
+
 async function seedUser(dir: string, overrides: Record<string, unknown> = {}): Promise<void> {
   const record = {
     id: '11111111-1111-4111-8111-111111111111',
@@ -329,6 +337,41 @@ describe('the GitHub sign-in routes', () => {
     expect(second.status).toBe(400)
     expect(second.body['error']).toBe('GITHUB_HANDOFF_INVALID')
     expect((await handoff(base, 'MZ-AAAA-BBBB')).status).toBe(400)
+  })
+
+  it('claims the same code through /github/exchange, as the phone posts it', async () => {
+    const base = await boot()
+    const started = await start(base)
+    const done = await callback(base, 'good-code', started.state)
+    const code = HANDOFF.exec(done.location)![1]!
+    const claim = await exchange(base, code)
+    expect(claim.status).toBe(200)
+    const token = String(claim.body['token'])
+    expect(token.startsWith('mza_')).toBe(true)
+    const user = claim.body['user'] as Record<string, unknown>
+    expect(user['githubLogin']).toBe('octocat')
+    const me = await fetch(`${base}/account/v1/me`, { headers: { authorization: `Bearer ${token}` } })
+    expect(me.status).toBe(200)
+    expect((await exchange(base, code)).status).toBe(400)
+  })
+
+  it('accepts the older `code` spelling on /github/exchange too', async () => {
+    const base = await boot()
+    const started = await start(base)
+    const done = await callback(base, 'good-code', started.state)
+    const claim = await exchange(base, HANDOFF.exec(done.location)![1]!, 'code')
+    expect(claim.status).toBe(200)
+    expect(String(claim.body['token']).startsWith('mza_')).toBe(true)
+  })
+
+  it('answers 400 for a malformed handoff on /github/exchange, never 404', async () => {
+    const base = await boot()
+    const malformed = await exchange(base, 'MZ-AAAA-AAAA')
+    expect(malformed.status).toBe(400)
+    expect(malformed.body['error']).toBe('GITHUB_HANDOFF_INVALID')
+    const missing = await post(base, '/account/v1/github/exchange', { device: device('pixel-0001') })
+    expect(missing.status).toBe(400)
+    expect(missing.body['error']).toBe('GITHUB_HANDOFF_INVALID')
   })
 
   it('expires the handoff with the clock', async () => {

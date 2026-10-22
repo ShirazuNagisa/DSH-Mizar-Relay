@@ -61,7 +61,7 @@ import {
 } from './protocol.js'
 
 /** The relay's own version, for the admin settings page. */
-const RELAY_VERSION = '0.3.1'
+const RELAY_VERSION = '0.3.2'
 
 /** Path prefix of the push API. */
 const PUSH_PREFIX = '/push/v1/'

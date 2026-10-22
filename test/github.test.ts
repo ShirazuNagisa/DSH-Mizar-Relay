@@ -234,6 +234,47 @@ describe('the GitHub sign-in routes', () => {
     expect(me.status).toBe(200)
   })
 
+  it('takes the avatar from the GitHub profile', async () => {
+    stub.user = { id: 1234501, login: 'octocat', email: null, avatar_url: 'https://avatars.githubusercontent.com/u/1234501?v=4' }
+    const base = await boot()
+    const started = await start(base)
+    const done = await callback(base, 'good-code', started.state)
+    const claim = await handoff(base, HANDOFF.exec(done.location)![1]!)
+    expect(claim.status).toBe(200)
+    const user = claim.body['user'] as Record<string, unknown>
+    const avatar = user['avatar'] as Record<string, unknown>
+    expect(avatar['kind']).toBe('github')
+    expect(avatar['url']).toBe('https://avatars.githubusercontent.com/u/1234501?v=4')
+    // The generated gradient travels with it: the image host is not always reachable.
+    expect(Array.isArray(avatar['colors'])).toBe(true)
+    expect(String(avatar['initials'])).not.toBe('')
+  })
+
+  it('keeps the generated avatar when GitHub serves no https picture', async () => {
+    stub.user = { id: 1234501, login: 'octocat', email: null, avatar_url: 'http://avatars.example.test/octo.png' }
+    const base = await boot()
+    const started = await start(base)
+    const done = await callback(base, 'good-code', started.state)
+    const claim = await handoff(base, HANDOFF.exec(done.location)![1]!)
+    const avatar = (claim.body['user'] as Record<string, unknown>)['avatar'] as Record<string, unknown>
+    expect(avatar['kind']).toBe('generated')
+    expect(avatar['url']).toBeUndefined()
+  })
+
+  it('offers the code to the clipboard on the landing page', async () => {
+    const base = await boot()
+    const started = await start(base)
+    const done = await callback(base, 'good-code', started.state)
+    expect(done.status).toBe(303)
+    // The landing page is an absolute public URL; the test relay listens elsewhere.
+    const landing = new URL(done.location)
+    const page = await fetch(`${base}${landing.pathname}${landing.search}`)
+    expect(page.status).toBe(200)
+    const html = await page.text()
+    expect(html).toContain('复制代码')
+    expect(html).toContain('navigator.clipboard')
+  })
+
   it('consumes a state once', async () => {
     const base = await boot()
     const started = await start(base)
@@ -274,6 +315,7 @@ describe('the GitHub sign-in routes', () => {
   })
 
   it('binds GitHub to the signed-in account', async () => {
+    stub.user = { id: 1234501, login: 'octocat', email: null, avatar_url: 'https://avatars.githubusercontent.com/u/1234501?v=4' }
     const base = await boot()
     const registered = await post(base, '/account/v1/register', {
       username: 'someone',
@@ -290,6 +332,8 @@ describe('the GitHub sign-in routes', () => {
     const body = (await me.json()) as { user: Record<string, unknown> }
     expect(body.user['github']).toBe(true)
     expect(body.user['githubLogin']).toBe('octocat')
+    // Linking replaces the generated avatar with the profile picture.
+    expect((body.user['avatar'] as Record<string, unknown>)['kind']).toBe('github')
   })
 
   it('refuses binding an identity that another account already wears', async () => {

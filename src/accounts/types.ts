@@ -24,6 +24,14 @@ export type AvatarSpec =
       readonly colors: readonly string[]
       readonly initials: string
     }
+  | {
+      /** The picture GitHub serves for the linked account. */
+      readonly kind: 'github'
+      readonly url: string
+      /** Always present, so an unreachable `avatars.githubusercontent.com` still draws something. */
+      readonly colors: readonly string[]
+      readonly initials: string
+    }
 
 /** One device seen for an account. */
 export interface DeviceRecord {
@@ -90,7 +98,8 @@ export interface UserRecord {
   appleSub: string | null
   githubId: string | null
   githubLogin: string | null
-  readonly avatar: AvatarSpec
+  /** Replaced when a GitHub sign-in brings a profile picture, so not `readonly`. */
+  avatar: AvatarSpec
   disabled: boolean
   /** Traffic warnings inside the trailing 30-day window, oldest first. */
   warnings: TrafficWarning[]
@@ -237,6 +246,8 @@ export interface GitHubIdentity {
   readonly email: string | null
   /** Always `true` when `email` is set. */
   readonly emailVerified: boolean
+  /** The profile picture, when GitHub serves one over https; `null` otherwise. */
+  readonly avatarUrl: string | null
 }
 
 /** A device descriptor sent by the app. */

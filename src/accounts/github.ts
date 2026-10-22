@@ -188,11 +188,15 @@ export class GitHubOAuth {
       throw exchangeFailed('GitHub answered a profile without a login')
     }
     const chosen = await this.#verifiedEmail(accessToken)
+    const avatar = profile['avatar_url']
     return {
       id: String(id),
       login,
       email: chosen?.email ?? null,
       emailVerified: chosen !== undefined,
+      // Only an https URL: this value is stored and later handed to an image
+      // loader, and GitHub's own field is always https anyway.
+      avatarUrl: typeof avatar === 'string' && avatar.startsWith('https://') ? avatar : null,
     }
   }
 
@@ -303,6 +307,9 @@ export function githubDonePage(code: string): string {
          background: #fff; border-radius: 14px; box-shadow: 0 1px 4px rgb(0 0 0 / 8%); }
   a { display: inline-block; padding: 12px 36px; border-radius: 999px; background: #0f62fe;
       color: #fff; text-decoration: none; font-size: 16px; font-weight: 600; }
+  button { display: inline-block; padding: 11px 28px; border-radius: 999px; border: 1px solid #d0d3d9;
+           background: #fff; color: #1c1e21; font-size: 16px; font-weight: 600; cursor: pointer; }
+  .actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
   small { display: block; margin-top: 24px; color: #8a8d91; font-size: 12px; }
 </style>
 </head>
@@ -311,8 +318,33 @@ export function githubDonePage(code: string): string {
   <h1>GitHub 登录成功</h1>
   <p>回到 Mizar 即自动完成登录；若没有跳转，在账户页输入此代码。</p>
   <code>${safe}</code>
-  <a href="mizar://github/login?code=${safe}">Open Mizar</a>
+  <div class="actions">
+    <a href="mizar://github/login?code=${safe}">Open Mizar</a>
+    <button id="copy" type="button">复制代码</button>
+  </div>
   <small>代码 10 分钟内有效，只能使用一次。</small>
+  <script>
+    (() => {
+      const button = document.getElementById('copy')
+      if (button === null) return
+      button.addEventListener('click', async () => {
+        const code = document.querySelector('code').textContent
+        try {
+          await navigator.clipboard.writeText(code)
+        } catch {
+          const area = document.createElement('textarea')
+          area.value = code
+          area.setAttribute('readonly', '')
+          document.body.appendChild(area)
+          area.select()
+          document.execCommand('copy')
+          area.remove()
+        }
+        button.textContent = '已复制'
+        setTimeout(() => { button.textContent = '复制代码' }, 1600)
+      })
+    })()
+  </script>
 </main>
 </body>
 </html>`

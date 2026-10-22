@@ -22,6 +22,7 @@ import type {
   AccountNotice,
   AccountsFile,
   AuthResult,
+  AvatarSpec,
   BanRecord,
   DeviceInput,
   DeviceRecord,
@@ -35,6 +36,25 @@ import type {
   TrafficWarning,
   UserRecord,
 } from './types.js'
+
+/**
+ * A GitHub account's avatar.
+ *
+ * The generated gradient is kept even when GitHub answers: `avatars.githubusercontent.com`
+ * is not always reachable from a phone, and the fallback has to be local to the
+ * record rather than a second lookup. An identity without an avatar keeps the
+ * gradient it already had.
+ */
+function githubAvatar(identity: GitHubIdentity): AvatarSpec {
+  const fallback = generatedAvatar(identity.id, identity.login)
+  if (identity.avatarUrl === null) return fallback
+  return {
+    kind: 'github',
+    url: identity.avatarUrl,
+    colors: fallback.colors,
+    initials: fallback.initials,
+  }
+}
 
 /**
  * How long a session token is valid.
@@ -528,6 +548,7 @@ export class AccountStore {
           } else if (existing.githubId === null && existing.emailVerified) {
             existing.githubId = identity.id
             existing.githubLogin = identity.login
+            if (identity.avatarUrl !== null) existing.avatar = githubAvatar(identity)
             existing.updatedAt = now
             user = existing
           } else {
@@ -546,12 +567,7 @@ export class AccountStore {
       if (user === undefined) {
         const email = identity.email
         const username = this.#uniqueUsername(deriveUsername(identity.login, email, identity.id))
-        const avatar = await avatarFor(email, identity.login, {
-          enabled: this.#gravatar.enabled,
-          baseURLs: this.#gravatar.baseURLs,
-          fetchImpl: this.#fetch,
-          seed: email ?? identity.id,
-        })
+        const avatar = githubAvatar(identity)
         user = {
           id: randomUUID(),
           username,
@@ -580,6 +596,7 @@ export class AccountStore {
       user.lastSeenAt = now
       user.updatedAt = now
       if (user.githubLogin !== identity.login) user.githubLogin = identity.login
+      if (identity.avatarUrl !== null) user.avatar = githubAvatar(identity)
       await this.#saveAccounts()
       await this.#audit('github-sign-in', { userId: user.id, login: identity.login })
       return { userId: user.id }
@@ -610,6 +627,7 @@ export class AccountStore {
       }
       user.githubId = input.identity.id
       user.githubLogin = input.identity.login
+      if (input.identity.avatarUrl !== null) user.avatar = githubAvatar(input.identity)
       if (
         input.identity.email !== null &&
         input.identity.emailVerified &&

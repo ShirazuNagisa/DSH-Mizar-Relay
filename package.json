@@ -1,6 +1,6 @@
 {
   "name": "dsh-mizar-relay",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "Reverse tunnel that lets the DSH-Mizar iOS app reach a computer from any network, with no inbound port.",
   "private": true,
   "license": "GPL-3.0-only",

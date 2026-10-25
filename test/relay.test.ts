@@ -331,6 +331,37 @@ describe('relay WebSocket bridging', () => {
     phone.close()
   })
 
+  it('bridges the direct path\'s signalling channel on a path of its own', async () => {
+    relay = await startRelay(config(), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
+    mac.echoStreams()
+
+    // The direct path negotiates its candidates over its own WebSocket, and it
+    // needs no route of its own: the room bridge forwards whatever path the
+    // phone asks for, so `/mizar-net/signal` reaches the host's endpoint the
+    // same way `/mizar/v1/ws` does. This test exists to hold that property --
+    // a future path allow-list would break the direct path silently.
+    const phone = new WebSocket(`ws://127.0.0.1:${relay.port}/r/${mac.room}/mizar-net/signal`)
+    await new Promise<void>((resolve, reject) => {
+      phone.once('open', () => resolve())
+      phone.once('error', reject)
+    })
+
+    const reply = new Promise<string>((resolve) => {
+      phone.once('message', (data: Buffer) => resolve(data.toString('utf8')))
+    })
+    const signal = JSON.stringify({ t: 'hello', candidates: [{ kind: 'host', address: '10.0.0.2', port: 5000 }] })
+    phone.send(signal)
+    expect(await reply).toBe(`echo:${signal}`)
+
+    // And the host was asked for that path, not for a rewritten one: the plugin
+    // routes on it.
+    expect(
+      mac.requests.some((frame) => frame['t'] === 'ws-open' && frame['path'] === '/mizar-net/signal'),
+    ).toBe(true)
+    phone.close()
+  })
+
   it('carries a 400 KiB attachment-sized frame in both directions', async () => {
     relay = await startRelay(config({ maxMessageBytes: 1024 * 1024 }), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)

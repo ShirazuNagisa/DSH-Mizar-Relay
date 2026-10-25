@@ -23,6 +23,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
+import { startStunServer } from './stun.js'
+import { UdpGuard } from './udp-guard.js'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
 import { AccountApi } from './accounts/api.js'
@@ -1328,6 +1330,17 @@ export async function startRelay(
   }
 
   const probe = startProbe(config, log)
+  // The direct path's address discovery. Same reply limits as the probe: both
+  // answer a source address nobody verified, so both are bounded the same way.
+  const stunLimits = resolveAbuse(config)
+  const stun = startStunServer({
+    port: config.stunPort,
+    limits: {
+      repliesPerSecond: stunLimits.probeRepliesPerSecond,
+      repliesPerSecondPerSource: stunLimits.probeRepliesPerSecondPerSource,
+    },
+    log,
+  })
 
   return {
     port: boundPort,
@@ -1342,6 +1355,7 @@ export async function startRelay(
       apns?.close()
       fcm?.close()
       probe?.close()
+      stun?.close()
       await new Promise<void>((resolve) => wss.close(() => resolve()))
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
@@ -1377,42 +1391,18 @@ function startProbe(config: RelayConfig, log: (message: string) => void): UdpSoc
   if (config.probePort <= 0) return null
   const abuse = resolveAbuse(config)
   const socket = createSocket('udp4')
-
-  // Two token buckets: one per source address and one for the socket. Both are
-  // refilled by wall-clock rather than counted in a window, so a steady trickle
-  // at the limit is allowed and a flood is shed instead of queued.
-  const perSource = new Map<string, number>()
-  let globalTokens = abuse.probeRepliesPerSecond
-  let lastRefill = Date.now()
-  const refill = (): void => {
-    const now = Date.now()
-    const elapsed = Math.max(0, now - lastRefill)
-    lastRefill = now
-    globalTokens = Math.min(
-      abuse.probeRepliesPerSecond,
-      globalTokens + (elapsed / 1000) * abuse.probeRepliesPerSecond,
-    )
-    if (perSource.size > 10_000) perSource.clear()
-    for (const [address, tokens] of perSource) {
-      const next = Math.min(
-        abuse.probeRepliesPerSecondPerSource,
-        tokens + (elapsed / 1000) * abuse.probeRepliesPerSecondPerSource,
-      )
-      if (next >= abuse.probeRepliesPerSecondPerSource) perSource.delete(address)
-      else perSource.set(address, next)
-    }
-  }
+  // The same guard the STUN responder uses: the two are the relay's only
+  // services that answer an unverified source address, so the protection
+  // against being used as a reflector lives in one place and is tested once.
+  const guard = new UdpGuard({
+    repliesPerSecond: abuse.probeRepliesPerSecond,
+    repliesPerSecondPerSource: abuse.probeRepliesPerSecondPerSource,
+  })
 
   socket.on('message', (data: Buffer, from) => {
-    refill()
     // Any payload earns an answer; the peer wants its own address back, not a
-    // handshake. Both buckets must have room, and the global one is checked
-    // first so a single spoofed source cannot exhaust it against one victim.
-    if (globalTokens < 1) return
-    const sourceTokens = perSource.get(from.address) ?? abuse.probeRepliesPerSecondPerSource
-    if (sourceTokens < 1) return
-    globalTokens -= 1
-    perSource.set(from.address, sourceTokens - 1)
+    // handshake.
+    if (!guard.allow(from.address)) return
 
     // The token is echoed so a peer can match an answer to its own probe. It is
     // capped and the reply is otherwise fixed-size, which is what keeps the

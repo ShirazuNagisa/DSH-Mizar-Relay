@@ -72,6 +72,14 @@ export interface RelayConfig {
   /** UDP port for the endpoint probe, or 0 to disable. */
   readonly probePort: number
   /**
+   * UDP port for the STUN responder, or `0` to disable it.
+   *
+   * Standard 3478 on purpose: it is the one port a restricted network is most
+   * likely to recognise as STUN and let out, and clients are configured with an
+   * explicit address anyway, so there is nothing to gain from being unusual.
+   */
+  readonly stunPort: number
+  /**
    * How to reach Apple, or `null` when this relay does not send notifications.
    *
    * `null` is the default and a perfectly good deployment: everything except
@@ -447,6 +455,7 @@ export function loadConfig(
     requestTimeoutMs: Number(pick(env['MIZAR_RELAY_REQUEST_TIMEOUT'], file.requestTimeoutMs, 30_000)),
     tunnelIdleMs: Number(pick(env['MIZAR_RELAY_TUNNEL_IDLE'], file.tunnelIdleMs, 90_000)),
     probePort: Number(pick(env['MIZAR_RELAY_PROBE_PORT'], file.probePort, 8788)),
+    stunPort: Number(pick(env['MIZAR_RELAY_STUN_PORT'], file.stunPort, 3478)),
     apns: readApns(env, file.apns ?? null),
     fcm: readFcm(env, (file.fcm ?? null) as FcmFileConfig | null),
     role,

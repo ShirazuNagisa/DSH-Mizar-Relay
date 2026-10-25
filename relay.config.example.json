@@ -11,6 +11,7 @@
   "requestTimeoutMs": 30000,
   "tunnelIdleMs": 90000,
   "probePort": 8788,
+  "stunPort": 3478,
   "_apns": {
     "_comment": "推送是可选的。要用就在 relay.config.json 里加一个 apns 块（keyId / teamId / topic / key），key 是 Apple 给你的 .p8 文件内容，必须是真的私钥 —— 占位的假 PEM 会让推送关闭（中继本身照常运行）。步骤见 docs/deployment.md 第 10 节。"
   },

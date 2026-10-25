@@ -58,6 +58,7 @@ Two deliberate behaviours are worth knowing before you debug anything:
 | `/tunnel` | the computer | WebSocket upgrade, authenticated with `Authorization: Bearer <token>`; an unknown token gets `401` and a closed socket |
 | `/r/<room>/…` | the phone | replayed over the tunnel; WebSocket upgrades are bridged; `404` when that room has no live tunnel |
 | `/healthz` | you | `{"ok":true,"rooms":1,"inFlight":0,"version":1}` — `rooms` counts the computers currently attached (section 7) |
+| `udp/<stunPort>` | peers | STUN responder (RFC 5389 binding requests): the address a peer appears from. Sized for hole punching; `0` disables |
 | `udp/<probePort>` | peers | endpoint probe: any datagram gets JSON back containing the sender's public address and port |
 
 ---
@@ -94,7 +95,7 @@ Two deliberate behaviours are worth knowing before you debug anything:
 4. 生成隧道令牌：`openssl rand -base64 32`。**一个电脑一个令牌**，等同于"成为那台电脑"的
    凭证，不要外传、不要提交进 git。
 5. 写配置：`cp relay.config.example.json relay.config.json`，把令牌填进 `tokens`，
-   `chmod 600 relay.config.json`。默认 `port: 8787`、`host: 127.0.0.1`、`probePort: 8788`。
+   `chmod 600 relay.config.json`。默认 `port: 8787`、`host: 127.0.0.1`、`probePort: 8788`、`stunPort: 3478`。
 6. 用 systemd 或宝塔的 **Node 项目** 跑起来，工作目录必须是该目录（配置文件是相对路径读的）。
 7. 宝塔建站 → 申请 Let's Encrypt 证书 → 开 **强制 HTTPS** → 反向代理到
    `http://127.0.0.1:8787`（发送域名 `$host`）。
@@ -242,7 +243,8 @@ file looks like this:
   "maxClientsPerRoom": 8,
   "requestTimeoutMs": 30000,
   "tunnelIdleMs": 90000,
-  "probePort": 8788
+  "probePort": 8788,
+    "stunPort": 3478
 }
 ```
 
@@ -262,7 +264,8 @@ Every key, its environment override and its default — the authoritative list, 
 | `tunnelIdleMs` | `MIZAR_RELAY_TUNNEL_IDLE` | `90000` | how long a tunnel may go without answering a ping before the relay drops it. The relay pings every `tunnelIdleMs / 3` (30 s at the default), never faster than 5 s |
 | `maxRooms` | `MIZAR_RELAY_MAX_ROOMS` | `10000` | rooms served at once, and push rooms remembered. The only bound on either map |
 | `maxTunnelsPerIp` | `MIZAR_RELAY_MAX_TUNNELS_PER_IP` | `4` | tunnels one source address may hold. A resource guard, not authentication. Behind the loopback reverse proxy the address is the client's, from `X-Real-IP` (see `trustProxy`); before 0.2.3 this counted the proxy and was effectively a global cap of four |
-| `probePort` | `MIZAR_RELAY_PROBE_PORT` | `8788` | UDP port for the endpoint probe; `0` disables it and opens no socket at all |
+| `probePort` | `MIZAR_RELAY_PROBE_PORT` | `8788` | UDP port for the endpoint probe; `0` disables it |
+| `stunPort` | `MIZAR_RELAY_STUN_PORT` | `3478` | UDP port for the STUN responder; `0` disables it and opens no socket at all |
 | `role` | `MIZAR_RELAY_ROLE` | `0` | `0` = free relay, `1` = paid/account relay. A label used by the account service and traffic reports; it never rejects a connection |
 | `accounts` | — | absent | Account service block. Only the account relay (主力1) enables it. Every field is optional; see section 11 |
 | `accounts.enabled` | `MIZAR_ACCOUNTS_ENABLED` | `false` | Serve `/account/v1/*`, `/admin`, and aggregate traffic |

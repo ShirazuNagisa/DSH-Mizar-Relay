@@ -665,6 +665,34 @@ describe('notifying a room', () => {
     ).toBe('update')
   })
 
+  it('creates the card when the one it was told about turns out to be gone', async () => {
+    const authority = await startFakeApple()
+    // The reported card has ended -- the app was killed with it up, or the user
+    // swiped it -- and only Apple knows: an update to its token answers 410.
+    answerFor = (request) =>
+      JSON.parse(request.body).aps?.event === 'update'
+        ? { status: 410, body: JSON.stringify({ reason: 'Unregistered' }) }
+        : { status: 200 }
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+      liveActivityStartToken: '9999',
+    })
+
+    const reply = await post(base, '/push/v1/activity', MAC_A, {
+      phase: 'start',
+      rows: [{ sessionId: 'session-1', title: 't', runningSince: Date.now() }],
+    })
+
+    // One update that was refused, then one start that was not: the event is not
+    // lost because the card it was aimed at had ended.
+    expect(received.map((entry) => entry.path)).toEqual(['/3/device/1111', '/3/device/9999'])
+    expect(reply.json).toMatchObject({ ok: true, sent: 1, dropped: 1, failed: 0 })
+  })
+
   it('does not start a card on the phone whose app is on screen', async () => {
     const authority = await startFakeApple()
     const base = await boot(authority)

@@ -608,6 +608,16 @@ export async function deliver(
  * differ only in which token is addressed and which event name the payload
  * carries -- and a card that changes from one to the other between two requests
  * is a race no two-endpoint design would remove.
+ *
+ * The phase is what the computer *believes*, not what happens: the relay looks
+ * at the tokens the app reported and decides. A phone with a reported card gets
+ * an update even when a start was asked for (the app starts its own card on the
+ * refresh after a prompt, and the plugin cannot see that moment), and a phone
+ * whose reported card turns out to be gone gets the start instead -- in the same
+ * call, because `410 Unregistered` is the answer to "does this card still
+ * exist". That test used to be a fifteen-minute window on the registration,
+ * which meant a session that ran longer than that looked like no card at all and
+ * the next request created a second one beside the first.
  */
 export interface ActivityRequest {
   /** Whether a card has to be created or only changed. */
@@ -630,18 +640,6 @@ export interface ActivityRequest {
 
 /** How many rows a card may carry. Mirrors the app's own cap. */
 const MAX_ACTIVITY_ROWS = 2
-
-/**
- * How long a reported activity token is trusted to mean "this phone has a card
- * up".
- *
- * A start is skipped while one is held, because the phone would then draw a
- * second card: the app starts its own card on its next refresh, and the plugin
- * cannot see that moment. The bound exists because a token outlives its card when
- * the app is killed rather than backgrounded, and a token trusted forever is a
- * phone that never gets a card again.
- */
-const ACTIVITY_TOKEN_TRUST_MS = 15 * 60 * 1000
 
 /**
  * Narrow an activity body.
@@ -735,66 +733,86 @@ export async function deliverActivity(
 
   const excluded = new Set(request.exceptDeviceIds)
   const tally = { sent: 0, failed: 0, dropped: 0 }
-  const now = Date.now()
-
-  /** Whether this phone already has a card that its app reported recently. */
-  const cardIsUp = (device: PushDevice): boolean =>
-    device.liveActivityToken !== null && now - device.registeredAt < ACTIVITY_TOKEN_TRUST_MS
 
   await Promise.all(
     devices.map(async (device): Promise<void> => {
       // Android has no Live Activity, and a phone whose app is looking at the
       // app is drawing a card from its own state.
       if (device.platform !== 'ios' || excluded.has(device.deviceId)) return
-      // Which of the two events this phone gets is decided by the token its app
-      // reported, not by what the plugin believes. A phone that reported a card
-      // gets an update even when a start was asked for: the app starts its own
-      // card on the refresh after a prompt, and the plugin cannot see that
-      // moment -- sending a start would put a second island beside the first.
-      // A phone without one gets a start, and a start is the only event that can
-      // bring a card into existence.
-      const mode = cardIsUp(device) ? 'update' : request.phase
-      const token = mode === 'start' ? device.liveActivityStartToken : device.liveActivityToken
-      if (token === null) return
+      const environment = device.environment ?? 'production'
 
-      const result =
-        mode === 'start'
-          ? await apns.sendLiveActivityStart({
-              token,
-              environment: device.environment ?? 'production',
-              rows: request.rows,
-              alert: {
-                title: 'DSH-Mizar',
-                body: request.rows[0]?.title ?? '',
-              },
-            })
-          : await apns.sendLiveActivityUpdate({
-              token,
-              environment: device.environment ?? 'production',
-              rows: request.rows,
-            })
+      // A reported card is where this event goes, whatever its age. "Is there a
+      // card" is Apple's answer -- `410 Unregistered` when it has ended -- and
+      // not a clock's: a session that runs for fifteen minutes used to make the
+      // relay decide the card was gone, and the next request then created a
+      // second one beside the first.
+      const reported = device.liveActivityToken
+      if (reported !== null) {
+        const result = await apns.sendLiveActivityUpdate({
+          token: reported,
+          environment,
+          rows: request.rows,
+        })
+        if (result.delivered) {
+          tally.sent += 1
+          return
+        }
+        if (!result.unregistered) {
+          tally.failed += 1
+          options.log(
+            `push: live-activity update for ${device.deviceId} in room ${room} failed (${result.status} ${result.reason ?? 'no reason'})`,
+          )
+          return
+        }
+        // The card this token addressed is gone, and only the token is retired:
+        // the device and its alert token stay, because an activity that ends
+        // mints a token that is then retired, routinely.
+        options.registry.clearLiveActivityToken(room, device.deviceId, reported)
+        tally.dropped += 1
+        options.log(
+          `push: retired live-activity token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
+        )
+        // An update had nothing else to try; the next publish asks for a start
+        // and this phone has no reported card any more, so it will get one.
+        if (request.phase !== 'start') return
+        // A start still has the push-to-start token, and the card it wanted to
+        // update is gone -- so create it rather than lose the event.
+      } else if (request.phase !== 'start') {
+        // Nothing to update and nothing to create: an update for a phone with no
+        // card is the next publish's start, not this one's.
+        return
+      }
 
+      const startToken = device.liveActivityStartToken
+      if (startToken === null) return
+      const result = await apns.sendLiveActivityStart({
+        token: startToken,
+        environment,
+        rows: request.rows,
+        alert: {
+          title: 'DSH-Mizar',
+          body: request.rows[0]?.title ?? '',
+        },
+      })
       if (result.delivered) {
         tally.sent += 1
         return
       }
       if (result.unregistered) {
         // Only the token that was refused: the registry matches on it, so a late
-        // answer about an older card cannot clear a newer one.
-        if (mode === 'start') {
-          options.registry.clearLiveActivityStartToken(room, device.deviceId, token)
-        } else {
-          options.registry.clearLiveActivityToken(room, device.deviceId, token)
-        }
+        // answer about an older token cannot clear a newer one. A start token is
+        // the opposite case from an activity one -- the install can obtain
+        // another on its next launch -- so it is dropped rather than retried.
+        options.registry.clearLiveActivityStartToken(room, device.deviceId, startToken)
         tally.dropped += 1
         options.log(
-          `push: retired live-activity ${mode === 'start' ? 'start ' : ''}token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
+          `push: retired live-activity start token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
         )
         return
       }
       tally.failed += 1
       options.log(
-        `push: live-activity ${mode} for ${device.deviceId} in room ${room} failed (${result.status} ${result.reason ?? 'no reason'})`,
+        `push: live-activity start for ${device.deviceId} in room ${room} failed (${result.status} ${result.reason ?? 'no reason'})`,
       )
     }),
   )

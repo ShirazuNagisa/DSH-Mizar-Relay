@@ -533,6 +533,61 @@ public address and port" to whoever asks, which is the whole of STUN for this pu
 `0.0.0.0` rather than loopback. If you do not want the endpoint discovery, set `probePort` to `0`:
 the relay then opens no UDP socket at all and the firewall rule is unnecessary.
 
+### 5.6 Rate limiting at the edge
+
+Optional, and not a substitute for 11.11 — but on a public free relay it is the cheap half
+of the defence, because it bounds a flood before it costs Node a connection. Two values matter:
+concurrent connections and request rate, both per client address.
+
+Declare the zones in the `http` context. BaoTa already defines a connection zone called `perip`
+(`limit_conn_zone $binary_remote_addr zone=perip:10m;` in `nginx.conf`), so only the request-rate
+zone is new. Put it in its own file that the `http` include picks up —
+`/www/server/panel/vhost/nginx/mizar-limits.conf`:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=mizar_req:10m rate=30r/s;
+```
+
+Then, inside the site's `server` block (server context covers every `location`, including the ACME
+challenge and `/healthz`):
+
+```nginx
+# ABUSE-GUARD-START
+limit_conn perip 100;
+limit_req zone=mizar_req burst=120 nodelay;
+limit_conn_status 429;
+limit_req_status 429;
+# ABUSE-GUARD-END
+```
+
+| Directive | Why this value |
+|---|---|
+| `limit_conn perip 100` | one address may hold 100 concurrent connections. One computer is one tunnel, one phone is one socket, so 100 is a household with room to spare — and it is the only thing stopping one address from pinning tens of thousands of sockets |
+| `limit_req ... rate=30r/s burst=120` | the relay's own address limit is 1200 requests/minute (20/s), so nginx must sit *above* it or it would become the practical ceiling for a NAT household. 30/s with a 120 burst absorbs a reconnect storm and still refuses a flood |
+| `limit_*_status 429` | nginx's default is 503, which reads as "the server is down". A rate refusal is a 429, and it matches what the relay itself returns |
+
+Verify it the honest way — from a second address, so the test does not spend the live relay's own
+budget:
+
+```sh
+seq 1 200 | xargs -P 40 -I{} curl -sk --interface 127.0.0.2 https://127.0.0.1/healthz \
+  -H 'Host: mizar.example.com' -o /dev/null -w '%{http_code}\n' | sort | uniq -c
+#  55 429
+# 145 200
+```
+
+Then watch it in production with `grep ' 429 ' /www/wwwlogs/mizar.example.com.log` and
+`limit_req` / `limiting connections` in the nginx error log.
+
+Two properties to know before deploying it:
+
+- **It is not a bandwidth limit.** A single WebSocket carrying a large transfer is one connection and
+  one request; the bytes are metered by the relay, not here (11.11). This bounds connection count
+  and request rate, which is what a flood costs.
+- **It lives in the vhost.** Regenerating the site's config from BaoTa (or reapplying a saved
+  template) drops the `ABUSE-GUARD` block, and it fails silently — the site keeps working, just
+  unprotected. The zone file survives, because BaoTa does not rewrite files it did not create.
+
 ---
 
 ## 6. Configuring the computer plugin

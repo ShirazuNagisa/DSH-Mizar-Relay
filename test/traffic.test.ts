@@ -143,6 +143,7 @@ describe('the ledger', () => {
 
 describe('traffic anomaly detection', () => {
   const ID = 'account:' + 'a'.repeat(64)
+  const MIB = 1024 * 1024
 
   it('raises a volume anomaly once an identity passes its daily ceiling', async () => {
     const now = Date.parse('2026-10-19T12:00:00Z')
@@ -190,11 +191,39 @@ describe('traffic anomaly detection', () => {
       now += 86_400_000
     }
     expect(ledger.anomalies()).toHaveLength(0)
-    // Today is far past 8x that baseline.
-    ledger.record(ID, 20 * 1024 * 1024, 20 * 1024 * 1024)
+    // Today is far past 8x that baseline and past the 100MiB floor.
+    ledger.record(ID, 60 * MIB, 60 * MIB)
     const anomalies = ledger.anomalies()
     expect(anomalies).toHaveLength(1)
-    expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'spike' })
+    expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'spike', bytes: 120 * MIB })
+    await ledger.close()
+  })
+
+  it('does not raise a spike until the day passes 100MiB', async () => {
+    let now = Date.parse('2026-10-12T12:00:00Z')
+    const ledger = await TrafficLedger.open({
+      dataDir: null,
+      relayId: 'primary-1',
+      role: 1,
+      reportTo: '',
+      internalSecret: '',
+      now: () => now,
+      alertBytesPerDay: 0,
+      alertGrowthFactor: 8,
+    })
+    // The same quiet 2MiB baseline; growth alone would fire long before 100MiB.
+    for (let day = 0; day < 7; day += 1) {
+      ledger.record(ID, 1024 * 1024, 1024 * 1024)
+      now += 86_400_000
+    }
+    // Exactly at the floor is still under it: the rule is "more than 100MiB".
+    ledger.record(ID, 50 * MIB, 50 * MIB)
+    expect(ledger.anomalies()).toHaveLength(0)
+    // One byte past the floor is enough, and the day still alerts only once.
+    ledger.record(ID, 1, 0)
+    const anomalies = ledger.anomalies()
+    expect(anomalies).toHaveLength(1)
+    expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'spike', bytes: 100 * MIB + 1 })
     await ledger.close()
   })
 

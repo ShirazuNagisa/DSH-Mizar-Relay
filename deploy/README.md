@@ -31,6 +31,21 @@
   Product ID 必须与 `accounts.appstore.productId`、iOS 常量一致。
 - 完整配置、nginx/证书、App Store Connect 清单见 `DEPLOYMENT-FULL.md` 第 11 节。
 
+## 带宽护栏
+
+免费中继不要求登录，所以「谁在用」只能按**来源地址**记，而不是按客户端自报的
+身份（那个头谁都能改）。`app/relay.config.json` 的 `abuse` 块控制这两层：
+
+- 每个身份（`x-mizar-client-id` / 账户）：默认 300 请求/分钟、500 MiB/天。
+- 每个来源地址：默认 1200 请求/分钟、2 GiB/天；**IPv6 按 /64 聚合**，
+  手机换临时地址不会换出新额度。
+
+超额时手机侧看到 `429`，响应头 `x-mizar-quota: rate` 或 `budget`。想让某个地址
+宽松一点就把 `bytesPerDayPerIp` 调大；`0` 表示关闭这一层。
+
+`curl http://127.0.0.1:8787/healthz` 里的 `quota.ip` 是地址层的计数，`anomalies`
+是流量账本记下的异常数。完整说明见 `DEPLOYMENT-FULL.md` 11.11。
+
 ## 推送（APNs）
 
 中继还负责把「审批/提问/跑完」的推送转给 Apple——手机不在前台时的通知走这条路，
@@ -180,6 +195,8 @@ relay: tunnel for room XXXXXXXXXXXX connected
 | 隧道每分钟重连一次 | `proxy_read_timeout` 还是默认 60s | 见上一行，改成 `3600s` |
 | 手机 `502` | 电脑没应答 | 电脑上的 DSH 在跑吗？看插件日志 |
 | **第 5 台电脑连不上，日志 429** | 0.2.2 及更早把 nginx 的 `127.0.0.1` 当成所有隧道来源，4 条之后全站拒绝 | 升级到 0.2.3+（`install.sh` 会保留 `relay.config.json`），并确认反代传了 `X-Real-IP` |
+| 手机请求回 `429`，`x-mizar-quota: budget` | 这个**来源地址**当天的 2 GiB 用完了（整个 NAT 共享这一份额度） | 正常护栏；看 `healthz` 的 `quota.ip.refusedBudget`。大户需要更多就把 `bytesPerDayPerIp` 调大 |
+| 手机请求回 `429`，`x-mizar-quota: rate` | 这个身份或地址的请求频率超了 | 正常护栏；`requestsPerMinute(PerIp)` 可调 |
 | 服务起不来 | 端口被占 | `journalctl -u dsh-mizar-relay -n 40` |
 | 探测口不通 | UDP 8788 被防火墙挡了 | 放行 UDP 8788（只有打洞阶段用得到） |
 

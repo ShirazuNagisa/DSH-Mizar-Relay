@@ -58,12 +58,14 @@
   "abuse": {
     "requestsPerMinute": 300,
     "bytesPerDay": 524288000,
+    "requestsPerMinutePerIp": 1200,
+    "bytesPerDayPerIp": 2097152000,
     "trafficAlertBytesPerDay": 524288000,
     "trafficAlertBytesPerDayPaid": 5368709120,
     "trafficAlertGrowthFactor": 8
   },
   "_abuse": {
-    "_comment": "bytesPerDay is the hard cap that refuses traffic (free relay 500MB, paid relay 5GB); the two alert thresholds are when a warning is raised, tier-aware on the account relay. The paid relay's config sets bytesPerDay=5368709120."
+    "_comment": "bytesPerDay is the hard cap that refuses traffic (free relay 500MB, paid relay 5GB); the two alert thresholds are when a warning is raised, tier-aware on the account relay. The paid relay's config sets bytesPerDay=5368709120. requestsPerMinutePerIp/bytesPerDayPerIp are the same limits keyed by source address (IPv6 aggregated to /64) instead of identity — on a free relay the identity is a self-reported header that rotates, and the per-address pair is the ceiling that survives the rotation. Set either to 0 to disable it; leave them well above the per-identity pair so one NAT household is never throttled for sharing an address."
   },
   "accounts": {
     "enabled": false,

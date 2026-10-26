@@ -96,7 +96,8 @@ export interface TrafficOptions {
   readonly alertBytesPerDay?: number
   /**
    * How many times larger than an identity's own trailing daily average today's
-   * total must be to raise a spike anomaly. Defaults to 8. `0` disables.
+   * total must be to raise a spike anomaly. Defaults to 8. `0` disables. The
+   * day must also pass {@link SPIKE_MIN_BYTES}, whatever the plan.
    */
   readonly alertGrowthFactor?: number
   /**
@@ -145,6 +146,18 @@ const MAX_ANOMALIES = 200
 
 /** How many trailing days the spike baseline averages. */
 const BASELINE_DAYS = 7
+
+/**
+ * A day must carry more than this before growth alone raises a spike.
+ *
+ * A small account's ordinary day can be many times its own quiet baseline
+ * without being news: 20 MiB against a 2 MiB average is 10x, but it is not a
+ * runaway. The floor keeps the self-relative detector from mailing people about
+ * small days; the volume ceiling still catches absolute heavy days, and a day
+ * that runs out of hard allowance still reports `quota`. Paid and free accounts
+ * share this floor -- it is about the size of the day, not the plan.
+ */
+const SPIKE_MIN_BYTES = 100 * 1024 * 1024
 
 /** One identity/day pending report. */
 interface PendingReport {
@@ -358,9 +371,9 @@ export class TrafficLedger {
    *     day. This is an absolute ceiling -- a person's heavy day -- so it fires
    *     on a runaway account regardless of what that account usually does.
    *   - **Spike.** Today is more than `alertGrowthFactor` times the identity's
-   *     own trailing daily average. This catches a sudden ramp from a small
-   *     baseline, which volume alone would miss because the total is still
-   *     modest.
+   *     own trailing daily average, and today has passed an absolute floor
+   *     ({@link SPIKE_MIN_BYTES}). The floor keeps a quiet account's small day
+   *     from looking like a ramp; the multiple catches the ramp itself.
    *
    * Each identity/day is reported at most once, so a burst is one alert rather
    * than one per frame. Both are heuristics meant to make an operator look, not
@@ -380,11 +393,11 @@ export class TrafficLedger {
     let anomaly: TrafficAnomaly | null = null
     if (ceiling > 0 && today > ceiling) {
       anomaly = { identity, day, bytes: today, reason: 'volume', baseline: ceiling, at }
-    } else if (this.#alertGrowthFactor > 0) {
+    } else if (this.#alertGrowthFactor > 0 && today > SPIKE_MIN_BYTES) {
       const baseline = trailingAverage(value.days, day, BASELINE_DAYS)
       // A tiny baseline makes any byte look like a spike, so growth only counts
-      // once an identity is actually moving a meaningful amount -- 1 MiB, the
-      // size of one frame, keeps a new account's first request from alerting.
+      // once the identity has both a meaningful history and a meaningful day --
+      // 1 MiB of history keeps a new account's first request from alerting.
       if (baseline > 1024 * 1024 && today > baseline * this.#alertGrowthFactor) {
         anomaly = { identity, day, bytes: today, reason: 'spike', baseline, at }
       }

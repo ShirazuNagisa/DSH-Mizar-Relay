@@ -280,6 +280,7 @@ Every key, its environment override and its default — the authoritative list, 
 | `accounts.paidGate.mode` | `MIZAR_PAID_GATE` | `enforce` on a `role: 1` relay with accounts enabled, else `off` | `off` / `observe` / `enforce`. See 11.7 |
 | `accounts.paidGate.allowUnaccounted` | `MIZAR_PAID_GATE_ALLOW_UNACCOUNTED` | `false` | let phones with no account at all through the paid relay |
 | `accounts.paidGate.cacheTtlMs` | `MIZAR_PAID_GATE_CACHE_TTL` | `60000` | how long a verified paid entitlement is reused |
+| `abuse` | — | absent (defaults apply) | data-plane meters per identity **and per source address**, plus the traffic-alert thresholds. All keys and their defaults are in 11.11 |
 
 Rules that are easy to trip over:
 
@@ -630,10 +631,17 @@ curl -sS https://mizar.example.com/healthz
 A healthy relay answers, with `content-type: application/json` and `cache-control: no-store`:
 
 ```json
-{"ok":true,"rooms":1,"inFlight":0,"version":1}
+{"ok":true,"rooms":1,"inFlight":0,"pushDevices":1,"push":true,"fcm":false,"version":1,
+ "role":0,"accounts":false,"paidGate":"off","paidGateAllowUnaccounted":false,
+ "gateEnforced":false,
+ "quota":{"entries":34,"refusedRate":10,"refusedBudget":0,
+          "ip":{"entries":31,"refusedRate":0,"refusedBudget":0}},
+ "anomalies":0,"mail":{"role":"client"}}
 ```
 
-Reading it:
+The first four are the tunnel itself; everything after them is diagnostics that a
+monitor can read without parsing the config. The body only ever grows — a field
+is never repurposed — so a check written against an older relay keeps working.
 
 | Field | Meaning |
 |---|---|
@@ -641,6 +649,12 @@ Reading it:
 | `rooms` | how many computers currently have a tunnel attached. `0` with the computer's plugin enabled means the tunnel never established — the token, or the nginx directives in 5.3 |
 | `inFlight` | phone requests and WebSocket streams waiting on a computer right now. A number that stays above zero while nothing is happening means a stuck computer or a stalled tunnel |
 | `version` | the tunnel protocol version, `1`. It must match what the computer logs as "this build speaks" |
+| `pushDevices`, `push`, `fcm` | registered push devices and whether this relay can reach APNs / FCM. See 10.4 |
+| `role`, `accounts` | the configured relay role and whether the account service is served |
+| `paidGate`, `paidGateAllowUnaccounted`, `gateEnforced` | the paywall's state. `gateEnforced` is the single boolean that is true only when the gate both enforces **and** lets no unaccounted caller through. See 11.7 |
+| `quota` | the data-plane meters: `entries` is how many identities are being metered, `refusedRate` / `refusedBudget` count refusals by reason since start-up. `quota.ip` is the same three numbers for the **address** meter, which is what catches a caller rotating a self-reported identity — see 11.11 |
+| `anomalies` | traffic anomalies the ledger has recorded (its last 200, all identities), so abuse can be alerted on without reading logs. On a free relay these are `guest:`/`anon:` callers, and this count plus `quota.ip` is the entire response — see 11.11 |
+| `mail` | `null` when this relay neither sends nor asks the other one to; `{"role":"client"}` on a free relay reporting through 主力1; otherwise the mail service's queue and last error |
 
 If the second command returns nginx's HTML error page instead of that JSON, nginx is not reaching
 the relay: check that the proxy covers `/` and that `systemctl status dsh-mizar-relay` is happy.
@@ -1245,6 +1259,11 @@ resolve the account, and a hash cannot be resolved. It is stripped before replay
 like the other two and never reaches the traffic ledger, which keeps bucketing by
 the hash.
 
+The accounting above records; it never refuses. The refusal lives in the
+`abuse` meters, which bucket by the same identity **and** by source address —
+on a free relay `guest:` and `anon:` are headers a caller chooses, so the
+identity alone is not a bound. See 11.11.
+
 ### 11.7 The paid gate
 
 A relay with `role: 1` is the one users are told is the high-bandwidth server.
@@ -1364,3 +1383,84 @@ admin UI are the answer to that, not this.
   promotions should use Apple Offer Codes to stay within App Store payment
   rules; the invitation entry in the app's About screen should be removed or
   gated if App Review objects.
+
+### 11.11 Abuse limits: per identity and per address
+
+The relay meters carried bytes in two dimensions. Both are configured in the
+`abuse` block, both default on, and `0` disables either one.
+
+```json
+"abuse": {
+  "requestsPerMinute": 300,
+  "bytesPerDay": 524288000,
+  "requestsPerMinutePerIp": 1200,
+  "bytesPerDayPerIp": 2097152000,
+  "trafficAlertBytesPerDay": 524288000,
+  "trafficAlertBytesPerDayPaid": 5368709120,
+  "trafficAlertGrowthFactor": 8
+}
+```
+
+| Key | Environment override | Default | What it does |
+|---|---|---|---|
+| `requestsPerMinute` | `MIZAR_ABUSE_REQUESTS_PER_MINUTE` | `300` | sustained data-plane requests per minute **per identity**; a token bucket, so a short burst is allowed and then paced |
+| `burst` | `MIZAR_ABUSE_BURST` | `0` (a small multiple of the rate) | burst allowance for both request buckets |
+| `bytesPerDay` | `MIZAR_ABUSE_BYTES_PER_DAY` | `500 MiB` (the paid relay sets 5 GiB) | carried bytes per identity per UTC day. Spent, the identity is refused until the day turns over |
+| `requestsPerMinutePerIp` | `MIZAR_ABUSE_REQUESTS_PER_MINUTE_PER_IP` | `1200` | the same request rate **per source address** |
+| `bytesPerDayPerIp` | `MIZAR_ABUSE_BYTES_PER_DAY_PER_IP` | `4 × 500 MiB` | the same byte budget per source address |
+| `trafficAlertBytesPerDay` | `MIZAR_ABUSE_TRAFFIC_ALERT_BYTES` | `500 MiB` | when the traffic ledger raises a `volume` anomaly (11.6) |
+| `trafficAlertBytesPerDayPaid` | `MIZAR_ABUSE_TRAFFIC_ALERT_BYTES_PAID` | `5 GiB` | the same ceiling for paid accounts, only consulted on a relay with an account store |
+| `trafficAlertGrowthFactor` | `MIZAR_ABUSE_TRAFFIC_ALERT_GROWTH` | `8` | today's total versus the identity's own trailing average raises a `spike` anomaly. Also needs a day above 100 MiB, so a quiet account's small day is not news |
+
+**Why two dimensions.** The per-identity meter is the accurate one when the
+identity is real: an account hash cannot be forged, and a phone moving between
+networks keeps its budget. But on a free relay the identity is `guest:<x-mizar-client-id>`,
+a header the phone chooses — a script that mints a new one per request used to
+mint a fresh 500 MiB per request, and the only remaining bound was four tunnels
+per IP. The address meter is keyed by the source address instead, which the
+caller cannot rotate, so it is the ceiling that survives the rotation.
+
+**IPv6 is counted by /64, not by /128.** A client is supposed to rotate through
+the privacy addresses inside its own delegation (SLAAC does it on a schedule), so
+counting each /128 separately would turn "four tunnels per address" into four per
+rotation and an address budget into no budget at all. The same key is used by the
+tunnel count and the byte budget, so one definition of "one peer" cannot drift
+between them. The address is taken from the same place the tunnel count takes it:
+`X-Real-IP` when the TCP peer is loopback (the nginx deployment) and
+`trustProxy` is on, otherwise the socket's address.
+
+**The address limits sit well above the identity ones on purpose.** One address
+carries several identities — a household of phones behind one NAT, a CGNAT pool —
+so an address budget equal to one identity's would throttle the innocent. Four
+identities' worth of headroom is enough for a household and still a hard ceiling
+that rotation cannot walk past.
+
+**Order of deduction.** The identity budget is spent first and the address budget
+second. The address budget is shared by everyone behind one NAT, so it must only
+be spent by traffic the caller's own budget also approved: with the reverse
+order, a caller whose identity budget is gone could still drain the shared
+address budget with requests doomed to be refused, locking the household out for
+the day at no cost to itself. The cost of this order is small — when the address
+meter refuses, that caller's own budget has already counted bytes that never
+moved.
+
+**Paid accounts are exempt from the address budget.** A caller the paid gate
+verified gets no address key at all. Its identity cannot be forged and the
+enforcement chain can ban it, so charging the shared address budget as well would
+let one heavy user spend a whole NAT's allowance. On a free relay nothing is
+gate-verified, so every caller is metered by address.
+
+**What refusal looks like.** An HTTP request gets `429` with
+`x-mizar-quota: rate|budget` and a `retry-after`; a bridged WebSocket frame is
+dropped rather than tearing down a session the phone already holds, and only a
+budget refusal closes the socket (`1008, "traffic allowance spent"`). A spent
+address budget is logged once per address/day.
+
+**What this is not.** Not authentication, not billing, and not an account ban. A
+free relay keeps its position — no login, no account, zero-config pairing — and
+answers abuse with an address-level ceiling plus visibility, not with a ban.
+There is also no persistent `ip:` traffic report: the ledger's keys are
+identities, and inventing `ip:` rows would corrupt the account relay's view. The
+address meter lives in memory, and `quota.ip` plus `anomalies` in `/healthz` plus
+the log are its whole surface. That is the honest surface: it answers "where is
+the bandwidth going", not "who is spending it".

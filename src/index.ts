@@ -33,11 +33,11 @@ import { Enforcement } from './accounts/enforcement.js'
 import { PaidGate, isGateExempt, type GateDecision } from './accounts/gate.js'
 import { identityFor, isPrivateHeader } from './accounts/identity.js'
 import { parseHash } from './accounts/passwords.js'
-import { DataQuota } from './accounts/quota.js'
+import { DataQuota, type QuotaDecision } from './accounts/quota.js'
 import { AccountStore } from './accounts/store.js'
 import { TrafficLedger, isValidDay, isValidIdentity } from './accounts/traffic.js'
 import { VerificationCodes } from './accounts/verification.js'
-import { clientAddress } from './client-address.js'
+import { addressGroup, clientAddress } from './client-address.js'
 import {
   gateStartupChecks,
   loadConfig,
@@ -354,6 +354,17 @@ export async function startRelay(
     internalSecret: accountsConfig?.internalSecret ?? '',
     alertBytesPerDay: abuse.trafficAlertBytesPerDay,
     alertGrowthFactor: abuse.trafficAlertGrowthFactor,
+    // The plan-aware ceiling needs the account store; a free relay keeps the
+    // flat threshold. `onAnomaly` is wired either way, so the callback does not
+    // silently vanish with the store: on the account relay enforcement turns it
+    // into a warning or a ban, and -- where it cannot act, because the identity
+    // is a `guest:`/`anon:` header rather than an account -- it now says so in
+    // the log instead of returning silently. On a free relay (no store, no
+    // enforcement) the ledger's own ANOMALY line and the healthz `anomalies`
+    // count are the surface.
+    onAnomaly: (anomaly) => {
+      enforcement?.observe(anomaly)
+    },
     ...(accountStore === null
       ? {}
       : {
@@ -366,9 +377,6 @@ export async function startRelay(
             return plan === 'paid'
               ? (abuse.trafficAlertBytesPerDayPaid ?? 5 * 1024 * 1024 * 1024)
               : abuse.trafficAlertBytesPerDay
-          },
-          onAnomaly: (anomaly) => {
-            enforcement?.observe(anomaly)
           },
         }),
     ...(deps.now === undefined ? {} : { now: deps.now }),
@@ -434,6 +442,89 @@ export async function startRelay(
     ...(deps.now === undefined ? {} : { now: deps.now }),
     log,
   })
+
+  // The address meter, the second half of the data-plane budget. The identity
+  // meter is only as strong as the identity, and on a free relay the identity
+  // is whatever `x-mizar-client-id` the phone chose to send -- a script can
+  // mint a new one per request and collect a fresh 500 MiB each time. This
+  // meter is keyed by the address group (an IPv6 peer is aggregated to its
+  // /64), which the caller cannot rotate its way out of, so the ceiling on
+  // "one household" becomes a ceiling again.
+  //
+  // It only bounds callers the paid gate did NOT vouch for. A verified account
+  // already has an identity that cannot be forged and an enforcement chain
+  // that can ban it; charging the shared address budget as well would let one
+  // heavy user spend a whole NAT's allowance.
+  const ipQuota = new DataQuota({
+    requestsPerMinute: abuse.requestsPerMinutePerIp,
+    // The burst is shared with the identity meter's tuning knob: one knob per
+    // concern, and an operator who sizes the address bucket is sizing the same
+    // kind of bucket.
+    ...(abuse.burst > 0 ? { burst: abuse.burst } : {}),
+    bytesPerDay: abuse.bytesPerDayPerIp,
+    onExhausted: (group: string, bytes: number, day: string) => {
+      // An address has no account to warn and no report row to write -- the
+      // ledger's keys are identities, and inventing `ip:` keys there would
+      // corrupt the account relay's view. The log and the healthz counters are
+      // the whole surface, which is the honest one: this limit answers "where
+      // is the bandwidth going", not "who is spending it".
+      log(
+        `relay: address ${group} spent its ${Math.round(abuse.bytesPerDayPerIp / (1024 * 1024))}MiB ` +
+          `daily budget on ${day} (${Math.round(bytes / (1024 * 1024))}MiB); refusing its requests until the day turns over`,
+      )
+    },
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+    log,
+  })
+
+  /**
+   * The address meter's key for one caller, or `null` when the caller is out
+   * of its scope.
+   *
+   * @param peer - the source address {@link clientAddress} resolved.
+   * @param verifiedHash - the token hash the paid gate verified, or `null`.
+   * @returns the key, or `null` for a gate-verified account.
+   */
+  function addressKey(peer: string, verifiedHash: string | null): string | null {
+    return verifiedHash === null ? `ip:${addressGroup(peer)}` : null
+  }
+
+  /**
+   * Spend against the meters one request owes: its identity budget, and --
+   * unless the gate vouched for the identity -- its address budget.
+   *
+   * The identity meter runs first on purpose. The address budget is shared by
+   * everyone behind one NAT, so it must only be spent by traffic the caller's
+   * own budget also approved: with the reverse order a caller whose identity
+   * budget is gone could still drain the shared address budget with requests
+   * doomed to be refused, locking their household out for the day at no cost.
+   * The cost of this order is the opposite and small -- when the address meter
+   * refuses, the caller's own budget has already counted bytes that never
+   * moved, which just makes their day end slightly early.
+   *
+   * @param ipKey - from {@link addressKey}, or `null` to skip the address meter.
+   * @param identityKey - the traffic ledger's identity key.
+   * @param bytes - payload bytes about to be carried, `0` for a bare request.
+   * @returns the first refusal, or an allowance.
+   */
+  function admitBytes(ipKey: string | null, identityKey: string, bytes: number): QuotaDecision {
+    const decision = quota.admit(identityKey, bytes)
+    if (!decision.allowed || ipKey === null) return decision
+    return ipQuota.admit(ipKey, bytes)
+  }
+
+  /**
+   * Record bytes already carried against both meters. Same order and same
+   * reason as {@link admitBytes}.
+   *
+   * @param ipKey - from {@link addressKey}, or `null` to skip the address meter.
+   * @param identityKey - the traffic ledger's identity key.
+   * @param bytes - payload bytes carried.
+   */
+  function chargeBytes(ipKey: string | null, identityKey: string, bytes: number): void {
+    quota.charge(identityKey, bytes)
+    if (ipKey !== null) ipQuota.charge(ipKey, bytes)
+  }
 
   /**
    * Answer a request the paid gate refused.
@@ -543,13 +634,26 @@ export async function startRelay(
         paidGateAllowUnaccounted: accountsConfig?.paidGate.allowUnaccounted ?? false,
         gateEnforced:
           paidGate?.mode === 'enforce' && (accountsConfig?.paidGate.allowUnaccounted ?? false) === false,
-        // The data-plane meter, so an operator can see refusals climbing without
-        // reading logs. `entries` is the number of identities being metered.
+        // The data-plane meters, so an operator can see refusals climbing
+        // without reading logs. `entries` is the number of identities being
+        // metered; the `ip` half is keyed by source address (IPv6 aggregated to
+        // its /64) and is what catches a caller rotating its claimed identity.
         quota: {
           entries: quota.stats.entries,
           refusedRate: quota.stats.refusedRate,
           refusedBudget: quota.stats.refusedBudget,
+          ip: {
+            entries: ipQuota.stats.entries,
+            refusedRate: ipQuota.stats.refusedRate,
+            refusedBudget: ipQuota.stats.refusedBudget,
+          },
         },
+        // Traffic anomalies the ledger has recorded (any identity, up to its
+        // 200-entry window), so a monitor can alert on abuse without reading
+        // logs. On a free relay these are guest/anon callers -- there is no
+        // account to warn, so this count and the address budget's refusals are
+        // the whole response.
+        anomalies: traffic.anomalies().length,
         // Whether this relay can mail, and what is waiting. `null` on a relay
         // that neither sends nor asks the other one to.
         mail: mailService?.status ?? (mailClient === null ? null : { role: 'client' }),
@@ -644,6 +748,7 @@ export async function startRelay(
             userAgent: request.headers['user-agent'] ?? '',
           })
         : { kind: 'account' as const, hash: verifiedHash, key: `account:${verifiedHash}` }
+    const ipKey = addressKey(peer, verifiedHash)
     const body = await readBody(request, config.maxBodyBytes)
     if (body === null) {
       writeJson(response, 413, { error: 'request body too large' })
@@ -654,7 +759,7 @@ export async function startRelay(
     // a map lookup and refuses an over-quota caller here rather than after the
     // megabyte has crossed the uplink; the byte count is the request body plus
     // the answer the relay already knows it will carry.
-    const decision = quota.admit(identity.key, body.length)
+    const decision = admitBytes(ipKey, identity.key, body.length)
     if (!decision.allowed) {
       const status = 429
       response.setHeader('retry-after', String(decision.retryAfterSeconds ?? 60))
@@ -696,7 +801,7 @@ export async function startRelay(
       // The answer's bytes were not known at admission time, so they are charged
       // after the fact. The budget still refuses the *next* request once it is
       // spent; nothing already delivered is recalled.
-      quota.charge(identity.key, carried)
+      chargeBytes(ipKey, identity.key, carried)
       response.writeHead(result.status, {
         ...result.headers,
         'content-length': String(payload.length),
@@ -956,6 +1061,7 @@ export async function startRelay(
             userAgent: request.headers['user-agent'] ?? '',
           })
         : { kind: 'account' as const, hash: verifiedHash, key: `account:${verifiedHash}` }
+    const ipKey = addressKey(peer, verifiedHash)
 
     // `maxClientsPerRoom` is the only bound on how many sockets one room holds,
     // and it counts the ones still waiting for the computer as well as the bridged
@@ -976,7 +1082,7 @@ export async function startRelay(
     // frames are then charged individually in `bridgePhone`, which is where the
     // real bytes are. Checking here means a caller that has spent its request
     // budget cannot even take a phone slot.
-    const quotaDecision = quota.admit(identity.key, 0)
+    const quotaDecision = admitBytes(ipKey, identity.key, 0)
     if (!quotaDecision.allowed) {
       socket.write(
         'HTTP/1.1 429 Too Many Requests\r\n' +
@@ -1050,7 +1156,7 @@ export async function startRelay(
         socket.removeListener('error', onSocketGone)
         wss.handleUpgrade(request, socket, head, (phone: WebSocket) => {
           opened.phone = phone
-          bridgePhone(phone, stream, identity)
+          bridgePhone(phone, stream, identity, ipKey)
         })
       },
       onError: (message) => {
@@ -1091,7 +1197,7 @@ export async function startRelay(
         // dropping the frame rather than the connection: the caller is over its
         // allowance, but the session the phone already holds should survive
         // until the day turns over.
-        if (!quota.admit(identity.key, data.length).allowed) return
+        if (!admitBytes(ipKey, identity.key, data.length).allowed) return
         opened.phone?.send(data, { binary })
       },
       onClose: (code, reason) => {
@@ -1116,6 +1222,7 @@ export async function startRelay(
     phone: WebSocket,
     stream: TunnelStream,
     identity: ReturnType<typeof identityFor>,
+    ipKey: string | null,
   ): void {
     // The phone joins the keepalive round here. Its silence is measured from
     // now rather than from the epoch, so a socket that never answers is dropped
@@ -1134,7 +1241,7 @@ export async function startRelay(
       // their traffic, and closing with "traffic allowance spent" made the app
       // tell people their quota was gone when it was not. The frame is dropped
       // and the socket stays, exactly like the computer -> phone direction.
-      const decision = quota.admit(identity.key, data.length)
+      const decision = admitBytes(ipKey, identity.key, data.length)
       if (!decision.allowed) {
         if (decision.reason === 'budget') {
           phone.close(1008, 'traffic allowance spent')
@@ -1190,12 +1297,17 @@ export async function startRelay(
     // global one: four computers online and the fifth refused. The headers are
     // read only when the peer is loopback, so a relay exposed directly keeps
     // counting the real peer. See client-address.ts.
+    //
+    // The count is per address *group* (an IPv6 peer is aggregated to its /64),
+    // so privacy-address rotation inside one subscriber's delegation cannot
+    // mint fresh allowances. See `addressGroup`.
     const peer = clientAddress(
       request.socket.remoteAddress,
       request.headers,
       config.trustProxy !== false,
     )
-    if (tunnelsPerIp.get(peer) !== undefined && (tunnelsPerIp.get(peer) ?? 0) >= config.maxTunnelsPerIp) {
+    const peerKey = addressGroup(peer)
+    if (tunnelsPerIp.get(peerKey) !== undefined && (tunnelsPerIp.get(peerKey) ?? 0) >= config.maxTunnelsPerIp) {
       log(`relay: tunnel refused — ${peer} already has ${config.maxTunnelsPerIp} tunnels`)
       socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n')
       socket.destroy()
@@ -1211,7 +1323,7 @@ export async function startRelay(
     }
 
     wss.handleUpgrade(request, socket, head, (host: WebSocket) => {
-      tunnelsPerIp.set(peer, (tunnelsPerIp.get(peer) ?? 0) + 1)
+      tunnelsPerIp.set(peerKey, (tunnelsPerIp.get(peerKey) ?? 0) + 1)
       const tunnel = new Tunnel(
         {
           send: (text) => host.send(text),
@@ -1232,9 +1344,9 @@ export async function startRelay(
       host.on('close', () => {
         if (!released) {
           released = true
-          const remaining = (tunnelsPerIp.get(peer) ?? 1) - 1
-          if (remaining <= 0) tunnelsPerIp.delete(peer)
-          else tunnelsPerIp.set(peer, remaining)
+          const remaining = (tunnelsPerIp.get(peerKey) ?? 1) - 1
+          if (remaining <= 0) tunnelsPerIp.delete(peerKey)
+          else tunnelsPerIp.set(peerKey, remaining)
         }
         const wasCurrent = rooms.remove(room, tunnel)
         if (wasCurrent) log(`relay: tunnel for room ${room} disconnected`)

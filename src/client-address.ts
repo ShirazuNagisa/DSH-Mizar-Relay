@@ -122,3 +122,76 @@ function isLoopback(address: string): boolean {
   if (parts.length !== 4 || parts[0] !== '127') return false
   return parts.every((part) => /^\d{1,3}$/.test(part))
 }
+
+/**
+ * The key per-address limits count against: an IPv6 peer is grouped to its /64.
+ *
+ * A per-address limit is only as good as the identity of "one address". For
+ * IPv4 that is the address itself; for IPv6 it is not. A client is *supposed*
+ * to rotate through the privacy addresses inside its own /64 (SLAAC does it on
+ * schedule), so counting each /128 separately turns "four tunnels per address"
+ * into four per rotation, and an address budget into no budget at all. Grouping
+ * to the /64 is the standard compromise: it is one subscriber's delegation on
+ * any sane ISP, so a rotation buys nothing while a second subscriber is
+ * unaffected. Two /64s behind one NAT66 are counted together, which is the
+ * same imprecision an IPv4 NAT already has.
+ *
+ * The same key is used by the tunnel count and the data-plane address budget,
+ * so one definition of "one peer" cannot drift between them.
+ *
+ * @param address - the address as {@link clientAddress} resolved it, or any
+ *   textual IP; anything unparseable is its own group.
+ * @returns the counting key: an IPv4 address as-is, or an IPv6 /64 written in
+ *   RFC 5952 style with the all-zero suffix (`2001:db8:1234:5678::`, or
+ *   `2001:db8::` when the prefix itself ends in zeros).
+ */
+export function addressGroup(address: string): string {
+  // A zone id (`fe80::1%eth0`) is interface-local noise for counting purposes.
+  const bare = address.split('%')[0] ?? address
+  const normalized = normalize(bare)
+  if (isIP(normalized) !== 6) return normalized
+  const hextets = expandHextets(normalized)
+  if (hextets === null) return normalized
+  const prefix = hextets
+    .slice(0, 4)
+    .map((hextet) => (parseInt(hextet, 16) & 0xffff).toString(16))
+  // Trailing zero hextets of the prefix merge into the `::` the /64 suffix
+  // already makes, so one /64 has one spelling no matter how it was written.
+  while (prefix.length > 0 && prefix[prefix.length - 1] === '0') prefix.pop()
+  return prefix.length === 0 ? '::' : `${prefix.join(':')}::`
+}
+
+/**
+ * Expand an IPv6 address to its eight hextets.
+ *
+ * Handles `::` compression, so every spelling of one address (`2001:db8::1`,
+ * `2001:0db8:0000:0000:0000:0000:0000:0001`) expands to the same list and
+ * therefore groups to the same /64.
+ *
+ * @param address - a textual IPv6 address without a zone id.
+ * @returns the eight hextets as written (1–4 hex digits each), or `null` when
+ *   the text is not a plain hextet address.
+ */
+function expandHextets(address: string): string[] | null {
+  const halves = address.split('::')
+  if (halves.length > 2) return null
+  const parse = (part: string): string[] | null => {
+    if (part === '') return []
+    const out: string[] = []
+    for (const piece of part.split(':')) {
+      // A dotted-quad tail is not a plain hextet; the IPv4-mapped spellings
+      // were already folded into IPv4 by `normalize`.
+      if (!/^[0-9a-fA-F]{1,4}$/.test(piece)) return null
+      out.push(piece)
+    }
+    return out
+  }
+  const head = parse(halves[0] ?? '')
+  if (head === null) return null
+  if (halves.length === 1) return head.length === 8 ? head : null
+  const tail = parse(halves[1] ?? '')
+  if (tail === null) return null
+  const fill = 8 - head.length - tail.length
+  if (fill < 1) return null
+  return [...head, ...new Array<string>(fill).fill('0'), ...tail]
+}

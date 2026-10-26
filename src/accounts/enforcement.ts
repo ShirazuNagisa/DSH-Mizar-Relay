@@ -91,7 +91,19 @@ export class Enforcement {
 
   /** The decision itself. */
   async #decide(anomaly: EnforcementAnomaly): Promise<void> {
-    if (!anomaly.identity.startsWith('account:')) return
+    if (!anomaly.identity.startsWith('account:')) {
+      // A `guest:` or `anon:` identity is a header the phone chose; there is no
+      // account to warn and none to ban, and on a free relay every caller is
+      // one. That used to return silently, which made anonymous abuse invisible
+      // to the operator reading the account relay's log -- the one place the
+      // free relay's reports land. The address budget is what actually stops
+      // such a caller; this line is what makes it noticeable.
+      this.#log(
+        `enforcement: ${anomaly.identity.slice(0, 28)}… carries no account (${anomaly.reason}, ` +
+          `${formatBytes(anomaly.bytes)} on ${anomaly.day}); nothing to warn — address budget is the only limit`,
+      )
+      return
+    }
     const hash = anomaly.identity.slice('account:'.length)
     const user = this.#store.findUserBySessionHash(hash)
     if (user === undefined) {

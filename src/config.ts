@@ -243,6 +243,17 @@ export interface AbuseLimits {
   readonly burst: number
   /** Carried bytes per identity per UTC day. `0` disables. */
   readonly bytesPerDay: number
+  /**
+   * Sustained data-plane requests per minute per source address. `0` disables.
+   *
+   * The identity limits above are per *identity*, and on a free relay the
+   * identity is whatever the phone claims -- a `guest:` id is a header, free to
+   * invent and rotate. This limit is the answer: keyed by the address group
+   * (IPv6 aggregated to its /64), it does not move when the header does.
+   */
+  readonly requestsPerMinutePerIp: number
+  /** Carried bytes per source address per UTC day. `0` disables. */
+  readonly bytesPerDayPerIp: number
   /** Global UDP probe replies per second. Bounds a spoofed-source reflector. */
   readonly probeRepliesPerSecond: number
   /** UDP probe replies per source address per second. */
@@ -260,6 +271,8 @@ export interface AbuseFileConfig {
   readonly requestsPerMinute?: number
   readonly burst?: number
   readonly bytesPerDay?: number
+  readonly requestsPerMinutePerIp?: number
+  readonly bytesPerDayPerIp?: number
   readonly probeRepliesPerSecond?: number
   readonly probeRepliesPerSecondPerSource?: number
   readonly trafficAlertBytesPerDay?: number
@@ -275,11 +288,21 @@ export interface AbuseFileConfig {
  * relay raises `bytesPerDay` to 5 GiB in its own config; its warning threshold
  * for paid accounts is `trafficAlertBytesPerDayPaid`, while free accounts it
  * aggregates from the free relay stay on the 500 MiB default.
+ *
+ * The per-address limits sit well above the per-identity ones on purpose. One
+ * address legitimately carries several identities -- a household of phones
+ * behind one NAT, a CGNAT pool -- so an address budget that equals one
+ * identity's budget would throttle the innocent. What they exist to stop is
+ * *rotation*: a script that mints a fresh `guest:` id per request and would
+ * otherwise be unbounded. Four identities' worth is enough for a household and
+ * still a hard ceiling a rotating abuser cannot walk past.
  */
 export const DEFAULT_ABUSE: AbuseLimits = {
   requestsPerMinute: 300,
   burst: 0,
   bytesPerDay: 500 * 1024 * 1024,
+  requestsPerMinutePerIp: 1200,
+  bytesPerDayPerIp: 4 * 500 * 1024 * 1024,
   probeRepliesPerSecond: 200,
   probeRepliesPerSecondPerSource: 5,
   trafficAlertBytesPerDay: 500 * 1024 * 1024,
@@ -606,6 +629,16 @@ function readAbuse(env: NodeJS.ProcessEnv, file: AbuseFileConfig | null): AbuseL
     ),
     burst: num(env['MIZAR_ABUSE_BURST'], file?.burst, DEFAULT_ABUSE.burst),
     bytesPerDay: num(env['MIZAR_ABUSE_BYTES_PER_DAY'], file?.bytesPerDay, DEFAULT_ABUSE.bytesPerDay),
+    requestsPerMinutePerIp: num(
+      env['MIZAR_ABUSE_REQUESTS_PER_MINUTE_PER_IP'],
+      file?.requestsPerMinutePerIp,
+      DEFAULT_ABUSE.requestsPerMinutePerIp,
+    ),
+    bytesPerDayPerIp: num(
+      env['MIZAR_ABUSE_BYTES_PER_DAY_PER_IP'],
+      file?.bytesPerDayPerIp,
+      DEFAULT_ABUSE.bytesPerDayPerIp,
+    ),
     probeRepliesPerSecond: num(
       env['MIZAR_ABUSE_PROBE_REPLIES_PER_SECOND'],
       file?.probeRepliesPerSecond,

@@ -40,6 +40,21 @@
 主力1 的完整配置、nginx/证书、App Store Connect 清单和备份说明见
 [docs/deployment.md](docs/deployment.md) 第 11 节。
 
+## 带宽护栏
+
+免费中继不要求登录，配额的身份就是客户端自报的 `x-mizar-client-id` —— 轮换它
+就等于换一个新配额桶。所以带宽按**两个维度**记：
+
+- **按身份**：300 请求/分钟、500 MiB/天（付费中继 5 GiB/天）。
+- **按来源地址**：1200 请求/分钟、2 GiB/天，IPv6 按 **/64** 聚合 —— 地址不能靠
+  改请求头换掉，这是轮换身份绕不过去的那道天花板。付费门禁验证过的账户不占地址额度，
+  免得一个人吃光整个 NAT 的份额。
+
+超额回 `429`（`x-mizar-quota: rate|budget`）；`/healthz` 的 `quota.ip` 与
+`anomalies` 让运维不读日志也能看到异常。全部键、默认值、扣减顺序与取舍见
+[docs/deployment.md](docs/deployment.md) 11.11，起因见工作区
+`docs/relay-free-tier-abuse-risk-2026-10-26.md`。
+
 ## 部署
 
 打包成一个自包含的 bundle，然后在服务器上装：

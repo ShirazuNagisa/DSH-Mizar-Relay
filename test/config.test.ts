@@ -330,6 +330,30 @@ describe('the data-plane abuse limits', () => {
     })
   })
 
+  it('meter an address as well as an identity, each with its own limits', async () => {
+    // The per-address pair is what survives an identity the caller invented.
+    // It must default on, and it must be independently tunable: the address
+    // budget stays well above the identity budget so one NAT household sharing
+    // an address is never throttled for the sharing.
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(
+      path,
+      JSON.stringify({ abuse: { requestsPerMinutePerIp: 60, bytesPerDayPerIp: 4096 } }),
+      'utf8',
+    )
+    expect(loadConfig(path, {}).abuse).toMatchObject({
+      requestsPerMinutePerIp: 60,
+      bytesPerDayPerIp: 4096,
+    })
+    expect(loadConfig(path, { MIZAR_ABUSE_BYTES_PER_DAY_PER_IP: '0' }).abuse).toMatchObject({
+      bytesPerDayPerIp: 0,
+    })
+    // Defaults: on, and looser than the per-identity pair.
+    expect(DEFAULT_ABUSE.requestsPerMinutePerIp).toBeGreaterThan(DEFAULT_ABUSE.requestsPerMinute)
+    expect(DEFAULT_ABUSE.bytesPerDayPerIp).toBeGreaterThan(DEFAULT_ABUSE.bytesPerDay)
+  })
+
   it('fall back to the defaults for a config built by hand', () => {
     // Tests and embedders construct RelayConfig literals without the block;
     // the meter asks through resolveAbuse and still gets enforcing limits.

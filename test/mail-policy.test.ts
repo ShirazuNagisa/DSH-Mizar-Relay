@@ -155,6 +155,28 @@ describe('traffic policy', () => {
     await policy.settle()
     expect(store.allUsers().every((user) => user.warnings.length === 0)).toBe(true)
   })
+
+  it('says so in the log for an identity with no account, instead of dropping it silently', async () => {
+    // A free relay's callers are `guest:`/`anon:` headers, and its reports land
+    // here with those identities attached. There is nothing to warn and nothing
+    // to ban, but the operator still needs to see the abuse -- silence turned
+    // anonymous runaway traffic into a non-event.
+    const lines: string[] = []
+    const policy = new Enforcement({
+      store,
+      mail: null,
+      contact: 'help@example.com',
+      now: () => now,
+      log: (message) => lines.push(message),
+    })
+    policy.observe({ identity: 'guest:rotating-header', day: '2026-10-01', bytes: 600 * 1024 * 1024, reason: 'quota' })
+    policy.observe({ identity: 'anon:' + 'a'.repeat(16), day: '2026-10-01', bytes: 600 * 1024 * 1024, reason: 'volume' })
+    await policy.settle()
+    expect(lines.filter((line) => line.includes('carries no account'))).toHaveLength(2)
+    // And the silence of the policy itself: no warnings, no bans, no mail.
+    expect(store.allUsers().every((user) => user.warnings.length === 0)).toBe(true)
+    expect(store.allUsers().every((user) => !user.disabled)).toBe(true)
+  })
 })
 
 describe('device roster', () => {

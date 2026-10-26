@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
 import { startRelay, type Relay } from '../src/index.js'
-import type { RelayConfig } from '../src/config.js'
+import { DEFAULT_ABUSE, type RelayConfig } from '../src/config.js'
 import { deriveRoom } from '../src/room.js'
 
 const TOKEN = 'test-tunnel-token'
@@ -574,6 +574,72 @@ describe('abuse limits', () => {
     await new Promise((resolve) => setTimeout(resolve, 120))
     const second = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`, 'i'.repeat(43))
     expect(second.room).toMatch(/^[0-9A-HJKMNP-TV-Z]{12}$/)
+  })
+
+  it('counts an IPv6 computer by its /64, not by each privacy address', async () => {
+    // A client is supposed to rotate through the addresses inside its own
+    // delegation; counting each /128 turns a per-address limit into a per-
+    // rotation one. The same /64 must share a bucket, and a neighbouring /64
+    // must not.
+    relay = await startRelay(
+      { ...config(), tokens: [], maxTunnelsPerIp: 1 },
+      () => undefined,
+    )
+    const url = `ws://127.0.0.1:${relay.port}`
+    await FakeMac.connect(url, 'a'.repeat(43), { 'x-real-ip': '2001:db8:1:2::10' })
+    await expect(
+      FakeMac.connect(url, 'b'.repeat(43), { 'x-real-ip': '2001:db8:1:2:9abc:def0:1234:5678' }),
+    ).rejects.toThrow(/429/)
+    const other = await FakeMac.connect(url, 'c'.repeat(43), { 'x-real-ip': '2001:db8:1:3::10' })
+    expect(other.room).toMatch(/^[0-9A-HJKMNP-TV-Z]{12}$/)
+  })
+
+  it('bounds one address however often the phone rotates its claimed identity', async () => {
+    // The abuse this exists for: on a free relay the identity is
+    // `x-mizar-client-id`, a header the phone chooses. Minting a new one per
+    // request used to mint a fresh allowance per request. The address budget
+    // is keyed by the source address and cannot be rotated away -- while a
+    // *different* address keeps its own allowance, and the per-identity meter
+    // is out of the picture here (disabled) so this test cannot pass by it.
+    relay = await startRelay(
+      {
+        ...config(),
+        tokens: [],
+        maxTunnelsPerIp: 8,
+        abuse: {
+          ...DEFAULT_ABUSE,
+          requestsPerMinute: 0,
+          bytesPerDay: 0,
+          requestsPerMinutePerIp: 0,
+          bytesPerDayPerIp: 1000,
+          trafficAlertBytesPerDay: 0,
+          trafficAlertGrowthFactor: 0,
+        },
+      },
+      () => undefined,
+    )
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`, 'd'.repeat(43))
+    // Each round trip carries a 600-byte answer: two fit in the 1000-byte
+    // address budget, the third is over it.
+    mac.respondWith(200, 'x'.repeat(600))
+    const url = `http://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/hello`
+    const from = (clientId: string, ip: string): Promise<Response> =>
+      fetch(url, { headers: { 'x-mizar-client-id': clientId, 'x-real-ip': ip } })
+
+    expect((await from('device-0001', '203.0.113.7')).status).toBe(200)
+    expect((await from('device-0002', '203.0.113.7')).status).toBe(200)
+    // The identity is now brand new; the address has spent its day.
+    const refused = await from('device-0003', '203.0.113.7')
+    expect(refused.status).toBe(429)
+    expect(refused.headers.get('x-mizar-quota')).toBe('budget')
+    // And a different address is unaffected by its neighbour's spending.
+    expect((await from('device-0004', '203.0.113.8')).status).toBe(200)
+
+    // The meter is visible to a monitor without reading logs.
+    const body = (await (await fetch(`http://127.0.0.1:${relay.port}/healthz`)).json()) as {
+      quota: { ip: { refusedBudget: number } }
+    }
+    expect(body.quota.ip.refusedBudget).toBeGreaterThan(0)
   })
 })
 

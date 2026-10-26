@@ -52,7 +52,7 @@ import { MailClient } from './mail/client.js'
 import { MailService } from './mail/service.js'
 import { SmtpMailTransport } from './mail/smtp.js'
 import { TencentMailTransport } from './mail/tencent.js'
-import { deliver, PushRegistry, readDevice, readNotification } from './push.js'
+import { deliver, deliverActivity, PushRegistry, readActivity, readDevice, readNotification } from './push.js'
 import { deriveRoom, secretsEqual } from './room.js'
 import { RoomRegistry, Tunnel, saneCloseCode, type TunnelStream } from './tunnel.js'
 import {
@@ -989,6 +989,22 @@ export async function startRelay(
           return
         }
         const outcome = await deliver({ registry: pushRegistry, apns, fcm, log }, room, notification)
+        writeJson(response, 200, { ok: true, ...outcome })
+        return
+      }
+
+      case 'activity': {
+        // A Live Activity started from the computer rather than from the phone.
+        // The plugin names the rows and the phase; the relay decides which token
+        // each one is addressed to, because only it holds the tokens.
+        const activity = readActivity(parsed)
+        if (activity === null) {
+          writeJson(response, 400, {
+            error: 'phase must be "start" or "update", with one or two rows carrying a sessionId and runningSince',
+          })
+          return
+        }
+        const outcome = await deliverActivity({ registry: pushRegistry, apns, log }, room, activity)
         writeJson(response, 200, { ok: true, ...outcome })
         return
       }

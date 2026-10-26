@@ -54,6 +54,14 @@ export interface PushDevice {
    * is retired with the activity rather than with the install.
    */
   readonly liveActivityToken: string | null
+  /**
+   * The token that can *start* a Live Activity, for an iOS device.
+   *
+   * Not an activity token and not the phone's alert token: this one belongs to
+   * the install, survives every card, and addresses the card that does not exist
+   * yet. `null` until the app has reported one, and on Android always.
+   */
+  readonly liveActivityStartToken: string | null
   readonly locale: string
   readonly registeredAt: number
 }
@@ -169,6 +177,7 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
       // field anyway must not lose its alerts over it, so it is dropped rather
       // than validated or refused.
       liveActivityToken: null,
+      liveActivityStartToken: null,
       locale: typeof record['locale'] === 'string' ? record['locale'].slice(0, 32) : 'en',
     }
   }
@@ -176,6 +185,8 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
   if (token.length > MAX_IOS_TOKEN_LENGTH || !IOS_TOKEN.test(token)) return null
   const liveActivityToken = readLiveActivityToken(record['liveActivityToken'])
   if (liveActivityToken === undefined) return null
+  const liveActivityStartToken = readLiveActivityToken(record['liveActivityStartToken'])
+  if (liveActivityStartToken === undefined) return null
   return {
     deviceId,
     token,
@@ -185,6 +196,7 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
     // real device sent.
     environment: record['environment'] === 'sandbox' ? 'sandbox' : 'production',
     liveActivityToken,
+    liveActivityStartToken,
     locale: typeof record['locale'] === 'string' ? record['locale'].slice(0, 32) : 'en',
   }
 }
@@ -346,6 +358,28 @@ export class PushRegistry {
     if (devices === undefined || device === undefined) return false
     if (device.liveActivityToken !== token) return false
     devices.set(deviceId, { ...device, liveActivityToken: null })
+    return true
+  }
+
+  /**
+   * Forget one device's push-to-start token, and nothing else.
+   *
+   * The same shape as {@link clearLiveActivityToken} and for the same reason: a
+   * late `410` about a token the app has already replaced must not clear the
+   * newer one, or the first slow answer would make the relay unable to start the
+   * next card.
+   *
+   * @param room - the room.
+   * @param deviceId - the device the start was sent to.
+   * @param token - the start token Apple retired.
+   * @returns whether it was still that device's current token.
+   */
+  clearLiveActivityStartToken(room: string, deviceId: string, token: string): boolean {
+    const devices = this.#rooms.get(room)
+    const device = devices?.get(deviceId)
+    if (devices === undefined || device === undefined) return false
+    if (device.liveActivityStartToken !== token) return false
+    devices.set(deviceId, { ...device, liveActivityStartToken: null })
     return true
   }
 
@@ -561,6 +595,209 @@ export async function deliver(
       `push: ${count} ${platform} device(s) in room ${room} and no ${platform === 'android' ? 'FCM service account' : 'APNs key'} configured — nothing was sent to them`,
     )
   }
+
+  return { ...tally, enabled }
+}
+
+/**
+ * One Live Activity to start or bring up to date, as the plugin described it.
+ *
+ * The plugin's vocabulary, not the widget's: it names sessions and when the work
+ * began, and this module turns that into the payload Apple expects. A start and
+ * an update are one request type with a phase rather than two, because they
+ * differ only in which token is addressed and which event name the payload
+ * carries -- and a card that changes from one to the other between two requests
+ * is a race no two-endpoint design would remove.
+ */
+export interface ActivityRequest {
+  /** Whether a card has to be created or only changed. */
+  readonly phase: 'start' | 'update'
+  /** The rows, oldest first: the order the island draws them in. */
+  readonly rows: readonly {
+    readonly sessionId: string
+    readonly title: string
+    readonly runningSince: number
+  }[]
+  /**
+   * Devices whose app is on screen, and which started a card of their own.
+   *
+   * Unlike the alert fan-out this is not a courtesy: a start sent to a phone that
+   * already has one is a second card on that phone's Lock Screen, and only the
+   * plugin knows which phone that is.
+   */
+  readonly exceptDeviceIds: readonly string[]
+}
+
+/** How many rows a card may carry. Mirrors the app's own cap. */
+const MAX_ACTIVITY_ROWS = 2
+
+/**
+ * How long a reported activity token is trusted to mean "this phone has a card
+ * up".
+ *
+ * A start is skipped while one is held, because the phone would then draw a
+ * second card: the app starts its own card on its next refresh, and the plugin
+ * cannot see that moment. The bound exists because a token outlives its card when
+ * the app is killed rather than backgrounded, and a token trusted forever is a
+ * phone that never gets a card again.
+ */
+const ACTIVITY_TOKEN_TRUST_MS = 15 * 60 * 1000
+
+/**
+ * Narrow an activity body.
+ *
+ * Rows rather than a payload: the fields are the plugin's, and the encoded shape
+ * is {@link buildLiveActivityStartPayload}'s business. A malformed row drops the
+ * whole request rather than being repaired, because a card is drawn from all of
+ * its rows and half a payload is a card about the wrong sessions.
+ *
+ * @param value - the decoded JSON body.
+ * @returns the request, or `null` when it is unusable.
+ */
+export function readActivity(value: unknown): ActivityRequest | null {
+  if (typeof value !== 'object' || value === null) return null
+  const record = value as Record<string, unknown>
+  const phase = record['phase']
+  if (phase !== 'start' && phase !== 'update') return null
+  const raw = record['rows']
+  if (!Array.isArray(raw) || raw.length === 0) return null
+  const rows: {
+    sessionId: string
+    title: string
+    runningSince: number
+  }[] = []
+  for (const entry of raw) {
+    if (rows.length >= MAX_ACTIVITY_ROWS) break
+    if (typeof entry !== 'object' || entry === null) return null
+    const row = entry as Record<string, unknown>
+    const sessionId = row['sessionId']
+    const runningSince = row['runningSince']
+    if (typeof sessionId !== 'string' || sessionId === '') return null
+    if (typeof runningSince !== 'number' || !Number.isFinite(runningSince) || runningSince <= 0) {
+      return null
+    }
+    rows.push({
+      sessionId: sessionId.slice(0, 200),
+      title: typeof row['title'] === 'string' ? row['title'].slice(0, 140) : '',
+      runningSince,
+    })
+  }
+  return {
+    phase,
+    rows,
+    exceptDeviceIds: readExceptDeviceIds(record['exceptDeviceIds']),
+  }
+}
+
+/**
+ * Start a Live Activity on every iPhone in a room that has none, or update the
+ * ones that have one.
+ *
+ * Fan-out is bounded by the room's device limit and runs together, for the reason
+ * {@link deliver} does: one phone Apple cannot reach costs a full request
+ * timeout, and a card for a session that began a minute ago is worth more than a
+ * perfect tally.
+ *
+ * An `Unregistered` answer clears only the token that produced it. For a start
+ * that is the push-to-start token, and clearing it is the opposite of the
+ * activity token's case: the install can obtain another one on its next launch,
+ * and the relay must stop addressing a token Apple has retired rather than pay a
+ * round trip every session.
+ *
+ * **A card started here cannot be ended here.** Ending an activity addresses its
+ * own token, and that token is only ever learned by the app -- which is not
+ * running when the card is created. So the end half of the contract still covers
+ * only cards the app started itself; a card this function created comes down
+ * when the app next runs (its own refresh ends it) or when the system's lifetime
+ * limit is reached. That is a property of ActivityKit's model, not a missing
+ * branch: there is no token the relay could have held instead.
+ *
+ * @param options - the registry and the APNs client.
+ * @param room - the room the credential derives.
+ * @param request - which rows, and whether they are a start or an update.
+ * @returns the same tallies a notification reports.
+ */
+export async function deliverActivity(
+  options: {
+    readonly registry: PushRegistry
+    readonly apns: ApnsClient | null
+    readonly log: (message: string) => void
+  },
+  room: string,
+  request: ActivityRequest,
+): Promise<PushOutcome> {
+  const enabled = options.apns !== null
+  const apns = options.apns
+  const devices = options.registry.devices(room)
+  if (apns === null || devices.length === 0) {
+    return { sent: 0, failed: 0, dropped: 0, enabled }
+  }
+
+  const excluded = new Set(request.exceptDeviceIds)
+  const tally = { sent: 0, failed: 0, dropped: 0 }
+  const now = Date.now()
+
+  /** Whether this phone already has a card that its app reported recently. */
+  const cardIsUp = (device: PushDevice): boolean =>
+    device.liveActivityToken !== null && now - device.registeredAt < ACTIVITY_TOKEN_TRUST_MS
+
+  await Promise.all(
+    devices.map(async (device): Promise<void> => {
+      // Android has no Live Activity, and a phone whose app is looking at the
+      // app is drawing a card from its own state.
+      if (device.platform !== 'ios' || excluded.has(device.deviceId)) return
+      // Which of the two events this phone gets is decided by the token its app
+      // reported, not by what the plugin believes. A phone that reported a card
+      // gets an update even when a start was asked for: the app starts its own
+      // card on the refresh after a prompt, and the plugin cannot see that
+      // moment -- sending a start would put a second island beside the first.
+      // A phone without one gets a start, and a start is the only event that can
+      // bring a card into existence.
+      const mode = cardIsUp(device) ? 'update' : request.phase
+      const token = mode === 'start' ? device.liveActivityStartToken : device.liveActivityToken
+      if (token === null) return
+
+      const result =
+        mode === 'start'
+          ? await apns.sendLiveActivityStart({
+              token,
+              environment: device.environment ?? 'production',
+              rows: request.rows,
+              alert: {
+                title: 'DSH-Mizar',
+                body: request.rows[0]?.title ?? '',
+              },
+            })
+          : await apns.sendLiveActivityUpdate({
+              token,
+              environment: device.environment ?? 'production',
+              rows: request.rows,
+            })
+
+      if (result.delivered) {
+        tally.sent += 1
+        return
+      }
+      if (result.unregistered) {
+        // Only the token that was refused: the registry matches on it, so a late
+        // answer about an older card cannot clear a newer one.
+        if (mode === 'start') {
+          options.registry.clearLiveActivityStartToken(room, device.deviceId, token)
+        } else {
+          options.registry.clearLiveActivityToken(room, device.deviceId, token)
+        }
+        tally.dropped += 1
+        options.log(
+          `push: retired live-activity ${mode === 'start' ? 'start ' : ''}token for ${device.deviceId} in room ${room} (${result.status} ${result.reason ?? ''})`.trim(),
+        )
+        return
+      }
+      tally.failed += 1
+      options.log(
+        `push: live-activity ${mode} for ${device.deviceId} in room ${room} failed (${result.status} ${result.reason ?? 'no reason'})`,
+      )
+    }),
+  )
 
   return { ...tally, enabled }
 }

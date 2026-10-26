@@ -137,6 +137,46 @@ export interface ApnsLiveActivityEnd {
   readonly environment: ApnsEnvironment
 }
 
+/**
+ * One row of a Live Activity, as the plugin described it.
+ *
+ * The plugin's own vocabulary rather than the widget's: it knows a session and
+ * when the work began, and the wire shape -- ids, elapsed times, the Swift
+ * reference epoch -- is this file's business.
+ */
+export interface ApnsActivityRow {
+  /** The session this row is about. */
+  readonly sessionId: string
+  /** What the row says. Empty when the host has no name for the session. */
+  readonly title: string
+  /** When the work this row counts began, in epoch milliseconds. */
+  readonly runningSince: number
+}
+
+/** A Live Activity to start on a phone that has none. */
+export interface ApnsLiveActivityStart {
+  /**
+   * The *push-to-start* token, which is not the activity token and does not
+   * belong to any activity: iOS issues it per install so a card can be asked
+   * for before one exists.
+   */
+  readonly token: string
+  /** Which APNs minted that token. */
+  readonly environment: ApnsEnvironment
+  /** The rows to draw, oldest first. */
+  readonly rows: readonly ApnsActivityRow[]
+  /** The banner that accompanies the start. */
+  readonly alert: { readonly title: string; readonly body: string }
+}
+
+/** A Live Activity that is up and has something new to say. */
+export interface ApnsLiveActivityUpdate {
+  /** The *activity* token of the card that is up. */
+  readonly token: string
+  readonly environment: ApnsEnvironment
+  readonly rows: readonly ApnsActivityRow[]
+}
+
 /** How long a signed JWT is reused before it is minted again. */
 const TOKEN_LIFETIME_MS = 50 * 60 * 1000
 
@@ -252,7 +292,7 @@ export function buildPayload(
  * test suites, and by the `builds the Live Activity end payload` test here).
  * There are no dates in it, so no encoding strategy can disagree about it.
  */
-const FINISHED_CONTENT_STATE = { finished: {} } as const
+const FINISHED_CONTENT_STATE = { rows: [] as const } as const
 
 /**
  * Build the payload that ends one Live Activity.
@@ -263,6 +303,13 @@ const FINISHED_CONTENT_STATE = { finished: {} } as const
  * defines, and milliseconds would put the date tens of thousands of years out
  * while the event itself silently did nothing -- leaving the activity counting,
  * which is the bug this exists to fix.
+ *
+ * The content state is `{"rows":[]}`, and that is a shape rather than a
+ * decoration: it used to be `{"finished":{}}`, mirroring an enum the app no
+ * longer uses. Measured 2026-10-26: three end pushes were delivered to the same
+ * card over twelve minutes (APNs answered 200 each time, so every required key
+ * was present and well formed), the card kept counting, and the token was never
+ * retired -- a state the phone cannot decode is accepted and dropped.
  *
  * The dismissal date is one second after the timestamp rather than equal to it:
  * a state on the card has to render for the system to end it, and a date in the
@@ -280,6 +327,108 @@ export function buildLiveActivityEndPayload(now: number): Record<string, unknown
       event: 'end',
       'dismissal-date': timestamp + 1,
       'content-state': FINISHED_CONTENT_STATE,
+    },
+  }
+}
+
+/**
+ * The instant Swift's `Date` counts from, in Unix seconds.
+ *
+ * `JSONEncoder`'s default for a `Date` is seconds since 2001-01-01, and the
+ * system decodes a Live Activity's `content-state` with that default. A payload
+ * that sent Unix seconds instead would put every clock 31 years into the future,
+ * which the widget would draw as a count-up from a date that has not happened.
+ */
+const SWIFT_REFERENCE_EPOCH = 978_307_200
+
+/**
+ * Encode rows as the app's `LiveActivityState` reads them.
+ *
+ * `rows` is a property of that type, which is what Apple's contract for a Live
+ * Activity `content-state` asks for: the keys are the state's properties. This
+ * used to nest them under a case name (`{"running":{"rows":[…]}}`), which the
+ * device accepted and then could not place -- see ``buildLiveActivityEndPayload``
+ * for the measurement. `elapsed` is filled in as well as `countingSince` even
+ * though the widget ticks from the latter: it is a required field of the row
+ * type, and a payload missing it is a card that fails to decode and draws
+ * nothing.
+ *
+ * @param rows - the rows, oldest first.
+ * @param now - the current time, in epoch milliseconds.
+ * @returns the decoded shape of the app's content state.
+ */
+export function buildLiveActivityContentState(
+  rows: readonly ApnsActivityRow[],
+  now: number,
+): Record<string, unknown> {
+  return {
+    rows: rows.map((row) => ({
+      id: row.sessionId,
+      // The title is what the card says; the instruction is deliberately not
+      // carried, because it lives in the conversation log and a second copy of
+      // it on a push payload is a copy Apple and the operator's network see.
+      prompt: '',
+      title: row.title,
+      elapsed: Math.max(0, (now - row.runningSince) / 1000),
+      countingSince: row.runningSince / 1000 - SWIFT_REFERENCE_EPOCH,
+    })),
+  }
+}
+
+/**
+ * Build the payload that starts one Live Activity.
+ *
+ * `event: "start"` is what makes the system create the activity rather than look
+ * for one, so the payload carries the whole of what the widget draws: this is
+ * the one push this app sends with no code of the app running to fill anything
+ * in afterwards. `attributes-type` has to name the app's attributes type
+ * exactly, and `attributes` is `{}` because that type has no properties.
+ *
+ * The name is the unqualified Swift type, which is how
+ * `ActivityConfiguration(for:)` names it in the widget. The type lives in the
+ * `MizarKit` module, so if a device ever answers `BadAttributesType` the thing to
+ * try is `MizarKit.DSHMizarActivityAttributes` -- one string, in this function,
+ * and nothing else in the payload changes.
+ *
+ * @param start - the token, its Apple, the rows and the banner.
+ * @param now - the current time, in epoch milliseconds.
+ * @returns the payload object, ready to serialize.
+ */
+export function buildLiveActivityStartPayload(
+  start: ApnsLiveActivityStart,
+  now: number,
+): Record<string, unknown> {
+  return {
+    aps: {
+      timestamp: Math.floor(now / 1000),
+      event: 'start',
+      'attributes-type': 'DSHMizarActivityAttributes',
+      attributes: {},
+      'content-state': buildLiveActivityContentState(start.rows, now),
+      alert: { title: start.alert.title, body: start.alert.body },
+    },
+  }
+}
+
+/**
+ * Build the payload that brings an existing activity up to date.
+ *
+ * No `attributes-type` and no `alert`: the activity is up, and an update is a
+ * change of the card rather than a new thing to announce.
+ *
+ * @param update - the activity token, its Apple and the rows.
+ * @param now - the current time, in epoch milliseconds.
+ * @returns the payload object, ready to serialize.
+ */
+export function buildLiveActivityUpdatePayload(
+  update: ApnsLiveActivityUpdate,
+  now: number,
+): Record<string, unknown> {
+  return {
+    aps: {
+      timestamp: Math.floor(now / 1000),
+      event: 'update',
+      'content-state': buildLiveActivityContentState(update.rows, now),
     },
   }
 }
@@ -405,26 +554,86 @@ export class ApnsClient {
     return await this.#deliver(
       { deviceToken: end.token, environment: end.environment },
       payload,
-      (freshToken) => ({
-        [constants.HTTP2_HEADER_METHOD]: 'POST',
-        [constants.HTTP2_HEADER_PATH]: `/3/device/${end.token}`,
-        [constants.HTTP2_HEADER_AUTHORIZATION]: `bearer ${this.#currentToken(freshToken)}`,
-        // An activity push is addressed to the app's Live Activity topic: the
-        // bundle id plus this suffix. Sent to the plain app topic, Apple
-        // answers `DeviceTokenNotForTopic` -- not a retired token, so a relay
-        // that read that as one would be wrong, and one that retried it would
-        // retry forever.
-        'apns-topic': `${this.#config.topic}.push-type.liveactivity`,
-        'apns-push-type': 'liveactivity',
-        // Apple accepts an activity push at priority 10 only. A deferred end
-        // would arrive after the phone had stopped showing the activity.
-        'apns-priority': 10,
-        // The activity has already ended; there is nothing to keep for later.
-        'apns-expiration': 0,
-        'content-type': 'application/json',
-        [constants.HTTP2_HEADER_CONTENT_LENGTH]: Buffer.byteLength(payload),
-      }),
+      (freshToken) => this.#liveActivityHeaders(end.token, payload, freshToken),
     )
+  }
+
+  /**
+   * Start one Live Activity on a phone that has none.
+   *
+   * Addressed to the push-to-start token, which is the one credit this design
+   * spends to make a card appear with no app running. A failure is a session
+   * that reaches the island next time the app is opened, which is the old
+   * behaviour rather than a broken state -- so it is reported, not retried.
+   *
+   * @param start - the token, its Apple, the rows and the banner.
+   * @returns what Apple said.
+   */
+  async sendLiveActivityStart(start: ApnsLiveActivityStart): Promise<ApnsResult> {
+    const payload = JSON.stringify(buildLiveActivityStartPayload(start, Date.now()))
+    return await this.#deliver(
+      { deviceToken: start.token, environment: start.environment },
+      payload,
+      (freshToken) => this.#liveActivityHeaders(start.token, payload, freshToken),
+    )
+  }
+
+  /**
+   * Bring one Live Activity that is already up up to date.
+   *
+   * Addressed to the activity's own token, which travels with the update because
+   * only the app ever sees it.
+   *
+   * @param update - the activity token, its Apple and the rows.
+   * @returns what Apple said.
+   */
+  async sendLiveActivityUpdate(update: ApnsLiveActivityUpdate): Promise<ApnsResult> {
+    const payload = JSON.stringify(buildLiveActivityUpdatePayload(update, Date.now()))
+    return await this.#deliver(
+      { deviceToken: update.token, environment: update.environment },
+      payload,
+      (freshToken) => this.#liveActivityHeaders(update.token, payload, freshToken),
+    )
+  }
+
+  /**
+   * The framing and headers every Live Activity push shares.
+   *
+   * One function rather than three copies because the parts that differ are the
+   * payload and the token, and the parts that must not differ are exactly the
+   * ones that fail silently: the topic suffix, the push type and the priority.
+   *
+   * @param token - the activity or push-to-start token.
+   * @param payload - the already-encoded body.
+   * @param freshToken - whether to mint a new provider token for this attempt.
+   * @returns the HTTP/2 headers.
+   */
+  #liveActivityHeaders(
+    token: string,
+    payload: string,
+    freshToken: boolean,
+  ): Record<string, string | number> {
+    return {
+      [constants.HTTP2_HEADER_METHOD]: 'POST',
+      [constants.HTTP2_HEADER_PATH]: `/3/device/${token}`,
+      [constants.HTTP2_HEADER_AUTHORIZATION]: `bearer ${this.#currentToken(freshToken)}`,
+      // An activity push is addressed to the app's Live Activity topic: the
+      // bundle id plus this suffix. Sent to the plain app topic, Apple answers
+      // `DeviceTokenNotForTopic` -- not a retired token, so a relay that read
+      // that as one would be wrong, and one that retried it would retry forever.
+      'apns-topic': `${this.#config.topic}.push-type.liveactivity`,
+      'apns-push-type': 'liveactivity',
+      // Apple accepts an activity push at priority 10 only. A deferred one would
+      // arrive after the phone had stopped showing the activity.
+      'apns-priority': 10,
+      // Every event describes work that is happening now: an end kept for later
+      // counts down something that already stopped, a start kept for later
+      // announces a session that is finished, an update kept for later is a card
+      // that is wrong in both directions.
+      'apns-expiration': 0,
+      'content-type': 'application/json',
+      [constants.HTTP2_HEADER_CONTENT_LENGTH]: Buffer.byteLength(payload),
+    }
   }
 
   /**

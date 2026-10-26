@@ -26,6 +26,8 @@ import {
   ApnsClient,
   apnsOrigin,
   buildLiveActivityEndPayload,
+  buildLiveActivityStartPayload,
+  buildLiveActivityUpdatePayload,
   buildPayload,
   providerToken,
   MAX_PAYLOAD_BYTES,
@@ -261,9 +263,95 @@ describe('payloads', () => {
         // One second, not zero: the state has to render for the system to end
         // the activity, and a future date has no equal-date edge.
         'dismissal-date': 1_700_000_001,
-        'content-state': { finished: {} },
+        'content-state': { rows: [] },
       },
     })
+  })
+})
+
+describe('starting a Live Activity from the computer', () => {
+  // The app's `LiveActivityPhase` is an enum, and Swift's synthesised encoding
+  // is one key naming the case. The end event uses the same shape and was
+  // measured working on 2026-10-18, so a start reuses the encoding rather than
+  // inventing a second one -- a payload the app cannot decode is a card that
+  // never appears, with a 200 from Apple and nothing in any log.
+  const rows = [
+    { sessionId: 'session-1', title: 'Refactor the parser', runningSince: 1_700_000_000_000 },
+  ]
+
+  it('carries attributes, content state, and the alert a start needs', () => {
+    const payload = buildLiveActivityStartPayload(
+      { token: 'start1', environment: 'sandbox', rows, alert: { title: 'DSH-Mizar', body: 'Refactor' } },
+      1_700_000_060_000,
+    )
+    expect(payload).toEqual({
+      aps: {
+        timestamp: 1_700_000_060,
+        event: 'start',
+        // The type name has to match the app's attributes type exactly: this is
+        // how the system finds the right widget for an activity nobody asked
+        // for locally.
+        'attributes-type': 'DSHMizarActivityAttributes',
+        attributes: {},
+        'content-state': {
+          rows: [
+            {
+              id: 'session-1',
+              prompt: '',
+              title: 'Refactor the parser',
+              elapsed: 60,
+              // Seconds since Swift's 2001 reference date, not since 1970: the
+              // widget counts from this, and a Unix stamp would be a clock
+              // that started 31 years ago.
+              countingSince: 1_700_000_000 - 978_307_200,
+            },
+          ],
+        },
+        alert: { title: 'DSH-Mizar', body: 'Refactor' },
+      },
+    })
+  })
+
+  it('brings an existing activity up to date without attributes or an alert', () => {
+    const payload = buildLiveActivityUpdatePayload(
+      { token: 'activity1', environment: 'sandbox', rows },
+      1_700_000_060_000,
+    )
+    expect(payload).toEqual({
+      aps: {
+        timestamp: 1_700_000_060,
+        event: 'update',
+        'content-state': {
+          rows: [
+            {
+              id: 'session-1',
+              prompt: '',
+              title: 'Refactor the parser',
+              elapsed: 60,
+              countingSince: 1_700_000_000 - 978_307_200,
+            },
+          ],
+        },
+      },
+    })
+  })
+
+  it('never lets a clock count down from the future', () => {
+    // A start whose row was already stale when it was built: the elapsed time is
+    // floored rather than allowed to be negative, because a negative timer is a
+    // card that says "-0:03".
+    const payload = buildLiveActivityStartPayload(
+      {
+        token: 'start1',
+        environment: 'sandbox',
+        rows: [{ sessionId: 's', title: 't', runningSince: 1_700_000_100_000 }],
+        alert: { title: 'DSH-Mizar', body: 't' },
+      },
+      1_700_000_060_000,
+    )
+    const state = payload['aps'] as Record<string, unknown>
+    const content = state['content-state'] as { rows: Array<{ elapsed: number }> }
+    expect(content.rows[0]?.elapsed).toBe(0)
   })
 })
 
@@ -696,7 +784,7 @@ describe('ending a Live Activity', () => {
         timestamp: 1_700_000_000,
         event: 'end',
         'dismissal-date': 1_700_000_001,
-        'content-state': { finished: {} },
+        'content-state': { rows: [] },
       },
     })
 

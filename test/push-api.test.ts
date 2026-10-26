@@ -577,8 +577,135 @@ describe('notifying a room', () => {
       // end the activity, and an equal date is an undocumented edge.
       expect(payload.aps['dismissal-date']).toBe(Number(payload.aps['timestamp']) + 1)
       // The final state is required for the system to decode and end it.
-      expect(payload.aps['content-state']).toEqual({ finished: {} })
+      expect(payload.aps['content-state']).toEqual({ rows: [] })
     }
+  })
+
+  it('starts a card on the push-to-start token and updates it on the activity token', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    // No activity token yet: a phone with no card is the only one a start is
+    // for, and registering one would have meant "a card is up".
+    const registered = await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityStartToken: '9999',
+    })
+    expect(registered.status).toBe(200)
+
+    const rows = [{ sessionId: 'session-1', title: 'Refactor the parser', runningSince: Date.now() - 60_000 }]
+    const started = await post(base, '/push/v1/activity', MAC_A, { phase: 'start', rows })
+    expect(started.json).toMatchObject({ ok: true, sent: 1, failed: 0 })
+
+    // A start is addressed to the token that can create an activity, which is
+    // not the card's token and not the phone's alert token.
+    const start = received.find((entry) => entry.path === '/3/device/9999')
+    expect(start).toBeDefined()
+    expect(start?.headers['apns-topic']).toBe('me.shirazu.dshmizar.push-type.liveactivity')
+    expect(start?.headers['apns-push-type']).toBe('liveactivity')
+    expect(String(start?.headers['apns-priority'])).toBe('10')
+    const startBody = JSON.parse(start?.body ?? '{}') as { aps: Record<string, unknown> }
+    expect(startBody.aps['event']).toBe('start')
+    expect(startBody.aps['attributes-type']).toBe('DSHMizarActivityAttributes')
+    expect(startBody.aps['attributes']).toEqual({})
+    const content = startBody.aps['content-state'] as {
+      rows: Array<{ id: string; title: string }>
+    }
+    expect(content.rows[0]).toMatchObject({ id: 'session-1', title: 'Refactor the parser' })
+
+    // The app has now started counting and reported the card's own token.
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+      liveActivityStartToken: '9999',
+    })
+
+    received = []
+    const updated = await post(base, '/push/v1/activity', MAC_A, { phase: 'update', rows })
+    expect(updated.json).toMatchObject({ ok: true, sent: 1 })
+    // An update goes to the card that is up, and carries no attributes: the
+    // activity already exists.
+    const update = received.find((entry) => entry.path === '/3/device/1111')
+    expect(update).toBeDefined()
+    const updateBody = JSON.parse(update?.body ?? '{}') as { aps: Record<string, unknown> }
+    expect(updateBody.aps['event']).toBe('update')
+    expect(updateBody.aps['attributes-type']).toBeUndefined()
+    expect(updateBody.aps['alert']).toBeUndefined()
+  })
+
+  it('does not start a second card on a phone that already has one', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    // The app started its own card a moment ago -- the operator sent a prompt and
+    // pocketed the phone -- and reported that activity's token. A start would
+    // draw a second island beside it, so the token the app reported decides
+    // rather than the plugin's second-hand belief.
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityToken: '1111',
+      liveActivityStartToken: '9999',
+    })
+
+    // A start asked for a phone that already has a card is delivered as an
+    // update, to the card: the alternative is a second island beside it.
+    const started = await post(base, '/push/v1/activity', MAC_A, {
+      phase: 'start',
+      rows: [{ sessionId: 'session-1', title: 't', runningSince: Date.now() }],
+    })
+    expect(started.json).toMatchObject({ ok: true, sent: 1 })
+    expect(received.map((entry) => entry.path)).toEqual(['/3/device/1111'])
+    expect(received[0]?.headers['apns-push-type']).toBe('liveactivity')
+    expect(
+      (JSON.parse(received[0]?.body ?? '{}') as { aps: Record<string, unknown> }).aps['event'],
+    ).toBe('update')
+  })
+
+  it('does not start a card on the phone whose app is on screen', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    for (const [deviceId, startToken] of [
+      ['phone-1', '9999'],
+      ['phone-2', '8888'],
+    ] as const) {
+      await post(base, '/push/v1/register', MAC_A, {
+        deviceId,
+        token: deviceId === 'phone-1' ? 'aaaa' : 'bbbb',
+        environment: 'sandbox',
+        liveActivityStartToken: startToken,
+      })
+    }
+
+    const reply = await post(base, '/push/v1/activity', MAC_A, {
+      phase: 'start',
+      rows: [{ sessionId: 'session-1', title: 't', runningSince: Date.now() }],
+      exceptDeviceIds: ['phone-1'],
+    })
+    expect(reply.json).toMatchObject({ sent: 1 })
+    // The phone in the hand started its own card; a push would be a second one.
+    expect(received.map((entry) => entry.path)).toEqual(['/3/device/8888'])
+  })
+
+  it('refuses an activity request with no rows or an unknown phase', async () => {
+    const base = await boot(null)
+    expect((await post(base, '/push/v1/activity', MAC_A, { phase: 'start', rows: [] })).status).toBe(400)
+    expect(
+      (await post(base, '/push/v1/activity', MAC_A, {
+        phase: 'restart',
+        rows: [{ sessionId: 's', title: 't', runningSince: 1 }],
+      })).status,
+    ).toBe(400)
+    // A row with no id is a card about nobody.
+    expect(
+      (await post(base, '/push/v1/activity', MAC_A, {
+        phase: 'start',
+        rows: [{ title: 't', runningSince: 1 }],
+      })).status,
+    ).toBe(400)
   })
 
   it('sends no end push when endLiveActivity is false or absent', async () => {

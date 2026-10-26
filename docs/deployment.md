@@ -577,7 +577,13 @@ seq 1 200 | xargs -P 40 -I{} curl -sk --interface 127.0.0.2 https://127.0.0.1/he
 ```
 
 Then watch it in production with `grep ' 429 ' /www/wwwlogs/mizar.example.com.log` and
-`limit_req` / `limiting connections` in the nginx error log.
+`limiting requests` in **that site's** error log, `/www/wwwlogs/mizar.example.com.error.log`.
+Not the global `nginx_error.log`: BaoTa writes that one at `crit`, and nginx logs a limit hit at
+`error`, so the lines never appear there. The site log is where they land:
+
+```text
+2026/10/26 13:41:30 [error] … limiting requests, excess: 120.610 by zone "mizar_req", client: 127.0.0.2, …
+```
 
 Two properties to know before deploying it:
 

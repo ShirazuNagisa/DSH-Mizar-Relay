@@ -80,6 +80,31 @@ export interface TunnelPong {
   readonly id: string
 }
 
+/**
+ * Ask the computer to mint a Mizar token for one phone of the same account.
+ *
+ * The relay verifies the account session on both ends; the computer owns the
+ * roster the token must satisfy. Only the computer can answer this.
+ */
+export interface TunnelProvision {
+  readonly t: 'provision'
+  readonly id: string
+  /** The account both ends are signed in to. */
+  readonly accountId: string
+  /** The phone's own device id, so one phone keeps one token. */
+  readonly phoneDeviceId: string
+  /** What the computer's device list should call the phone. */
+  readonly phoneName: string
+}
+
+/** The computer's answer to {@link TunnelProvision}. */
+export interface TunnelProvisionResult {
+  readonly t: 'provision-result'
+  readonly id: string
+  /** The Mizar token the phone should present. */
+  readonly token: string
+}
+
 /** The first frame the relay sends after a tunnel authenticates. */
 export interface TunnelWelcome {
   readonly t: 'welcome'
@@ -103,6 +128,7 @@ export type RelayToHost =
   | TunnelStreamMessage
   | TunnelStreamClose
   | TunnelPing
+  | TunnelProvision
 
 /** Everything a computer may send to the relay. */
 export type HostToRelay =
@@ -111,6 +137,7 @@ export type HostToRelay =
   | TunnelStreamMessage
   | TunnelStreamClose
   | TunnelPong
+  | TunnelProvisionResult
   | { readonly t: 'error'; readonly id: string; readonly message: string }
 
 /** The tunnel protocol version. */

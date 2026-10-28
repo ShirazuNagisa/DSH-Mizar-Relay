@@ -157,6 +157,128 @@ describe('registration and login', () => {
     expect(body.user['username']).toBe('shirazu')
   })
 
+
+  it('brokers a token from a connected desktop of the same account', async () => {
+    const base = await boot()
+    const { token } = await register(base) // the phone: device-0001, ios
+
+    // The desktop signs in as a second device of the same account.
+    const mac = await json(base, '/account/v1/login', {
+      identifier: 'shirazu',
+      password: 'correct horse battery',
+      device: { id: 'device-0002', name: 'Mac mini', model: 'Mac', platform: 'macos', appVersion: '0.1.0' },
+    })
+    expect(mac.status).toBe(200)
+    const macToken = String(mac.body['token'])
+
+    const socket = new WebSocket(`${base.replace('http', 'ws')}/tunnel`, {
+      headers: {
+        authorization: 'Bearer account-test-token',
+        'x-mizar-session': macToken,
+        'x-mizar-client-id': 'device-0002',
+      },
+    })
+    const welcome = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      socket.once('message', (data: Buffer) => resolve(JSON.parse(data.toString('utf8'))))
+      socket.once('error', reject)
+    })
+    const room = String(welcome['room'])
+    socket.on('message', (data: Buffer) => {
+      const frame = JSON.parse(data.toString('utf8')) as { t?: string; id?: string }
+      if (frame.t === 'provision' && typeof frame.id === 'string') {
+        socket.send(JSON.stringify({ t: 'provision-result', id: frame.id, token: 'mz_issued_for_phone' }))
+      }
+    })
+
+    // Presence arrives asynchronously, after the account session is checked.
+    const desktops = async (): Promise<Record<string, unknown>[]> => {
+      const response = await fetch(`${base}/account/v1/desktops`, {
+        headers: { authorization: `Bearer ${token}` },
+      })
+      expect(response.status).toBe(200)
+      return ((await response.json()) as { desktops: Record<string, unknown>[] }).desktops
+    }
+    let listed: Record<string, unknown>[] = []
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      listed = await desktops()
+      if (listed.some((entry) => entry['online'] === true)) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(listed).toHaveLength(1)
+    expect(listed[0]?.['deviceId']).toBe('device-0002')
+    expect(listed[0]?.['online']).toBe(true)
+    expect(listed[0]?.['room']).toBe(room)
+
+    const connect = await json(base, '/account/v1/connect', { deviceId: 'device-0002' }, token)
+    expect(connect.status).toBe(200)
+    expect(connect.body['token']).toBe('mz_issued_for_phone')
+    expect(connect.body['room']).toBe(room)
+
+    // A device that is not on this account is refused.
+    const stranger = await json(base, '/account/v1/connect', { deviceId: 'device-9' }, token)
+    expect(stranger.status).toBe(404)
+
+    socket.close()
+  })
+
+
+  it('carries no anonymous traffic when requireSession is on', async () => {
+    const base = await boot({
+      accounts: {
+        ...config().accounts!,
+        requireSession: true,
+      },
+    })
+    // The tunnel itself refuses a desktop with no session.
+    const bare = new WebSocket(`${base.replace('http', 'ws')}/tunnel`, {
+      headers: { authorization: 'Bearer account-test-token' },
+    })
+    const refused = await new Promise<number>((resolve) => {
+      bare.once('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0))
+      bare.once('open', () => resolve(0))
+      bare.once('error', () => resolve(-1))
+    })
+    expect(refused).toBe(401)
+
+    const { token } = await register(base)
+    const socket = new WebSocket(`${base.replace('http', 'ws')}/tunnel`, {
+      headers: {
+        authorization: 'Bearer account-test-token',
+        'x-mizar-session': token,
+        'x-mizar-client-id': 'device-0001',
+      },
+    })
+    const welcome = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      socket.once('message', (data: Buffer) => resolve(JSON.parse(data.toString('utf8'))))
+      socket.once('error', reject)
+    })
+    socket.on('message', (data: Buffer) => {
+      const frame = JSON.parse(data.toString('utf8')) as { t?: string; id?: string; path?: string }
+      if (frame.t === 'req' && typeof frame.id === 'string') {
+        socket.send(
+          JSON.stringify({
+            t: 'res',
+            id: frame.id,
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+            body: Buffer.from(JSON.stringify({ path: frame.path })).toString('base64'),
+          }),
+        )
+      }
+    })
+
+    const anonymous = await fetch(`${base}/r/${String(welcome['room'])}/mizar/v1/hello`)
+    expect(anonymous.status).toBe(401)
+
+    const signedIn = await fetch(`${base}/r/${String(welcome['room'])}/mizar/v1/hello`, {
+      headers: { 'x-mizar-session': token, 'x-mizar-client-id': 'device-0001' },
+    })
+    expect(signedIn.status).toBe(200)
+    expect(((await signedIn.json()) as { path: string }).path).toBe('/mizar/v1/hello')
+
+    socket.close()
+  })
+
   it('refuses a duplicate username or email', async () => {
     const base = await boot()
     await register(base)

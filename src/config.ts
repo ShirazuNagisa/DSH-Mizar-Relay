@@ -326,6 +326,15 @@ export interface AccountsConfig {
   readonly reportId: string
   /** How the paid relay treats a phone that is not paying for it. */
   readonly paidGate: PaidGateConfig
+  /**
+   * Whether every remote caller must be signed in.
+   *
+   * A relay with this on carries no anonymous traffic at all: the tunnel and the
+   * room both require a session, which is what "the free relay needs an account
+   * too" means on the wire. Off by default so an existing free relay keeps
+   * working until it is deliberately flipped.
+   */
+  readonly requireSession: boolean
   /** Gravatar lookup policy. */
   readonly gravatar: GravatarConfig
   /** Apple identity-token audiences (the bundle id). */
@@ -370,6 +379,7 @@ export interface AccountsFileConfig {
   }
   readonly appleAudiences?: readonly string[]
   readonly appleKeysURL?: string
+  readonly requireSession?: boolean
   readonly paidGate?: {
     /** `true`/`false` are accepted as shorthand for `enforce`/`off`. */
     readonly mode?: PaidGateMode | boolean
@@ -695,7 +705,14 @@ export function resolveAbuse(config: RelayConfig): AbuseLimits {
  */
 export function gateStartupChecks(config: RelayConfig): string[] {
   const accounts = config.accounts
-  if (accounts === null || !accounts.enabled) return []
+  if (accounts === null) return []
+  if (!accounts.enabled) {
+    // requireSession without an account service cannot verify anybody, so it
+    // would either refuse every caller or check nothing. Both are wrong.
+    return accounts.requireSession
+      ? ['accounts.requireSession needs accounts.enabled: there is no service to check a session against.']
+      : []
+  }
   // A free relay (role 0) is not supposed to gate -- it has no paid users to
   // gate for -- so its gate state is not a problem, whatever it is.
   if (config.role !== 1) return []
@@ -813,6 +830,10 @@ function readAccounts(
     reportTo: pick(env['MIZAR_ACCOUNT_REPORT_TO'], file.reportTo, ''),
     reportId: pick(env['MIZAR_ACCOUNT_REPORT_ID'], file.reportId, ''),
     paidGate: readPaidGate(env, file.paidGate ?? {}, role, enabled),
+    requireSession: flagOr(
+      pick(env['MIZAR_ACCOUNTS_REQUIRE_SESSION'], file.requireSession, false),
+      false,
+    ),
     gravatar: {
       enabled: flagOr(pick(env['MIZAR_ACCOUNTS_GRAVATAR'], gravatar.enabled, true), true),
       baseURLs: commaList(

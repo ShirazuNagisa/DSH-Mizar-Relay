@@ -45,6 +45,13 @@ export interface TunnelStream {
   close(code?: number, reason?: string): void
 }
 
+/** A token the computer minted for one phone. */
+interface PendingProvision {
+  readonly resolve: (token: string) => void
+  readonly reject: (error: Error) => void
+  readonly timer: NodeJS.Timeout
+}
+
 /** One in-flight request. */
 interface PendingRequest {
   readonly resolve: (result: ReplayResult) => void
@@ -180,6 +187,7 @@ export class Tunnel {
   readonly #maxBufferedBytes: number
   readonly #pendingRequests = new Map<string, PendingRequest>()
   readonly #pendingStreams = new Map<string, PendingStream>()
+  readonly #pendingProvisions = new Map<string, PendingProvision>()
   #nextId = 0
   #closed = false
   #lastPong = Date.now()
@@ -208,6 +216,40 @@ export class Tunnel {
   /** How many phone requests are waiting on the computer right now. */
   get inFlight(): number {
     return this.#pendingRequests.size + this.#pendingStreams.size
+  }
+
+  /**
+   * Ask the computer to mint a Mizar token for one phone of its account.
+   *
+   * The relay cannot mint one itself: the token is checked by the computer, and
+   * only the computer holds the roster. This is the handshake that makes an
+   * account-scoped connection possible without a pairing code.
+   *
+   * @param accountId - the account both ends are signed in to.
+   * @param phoneDeviceId - the phone's own device id, so the computer can keep
+   *   one token per phone instead of one per connection.
+   * @param phoneName - what to call the phone in the computer's device list.
+   * @returns the token the phone should present.
+   */
+  async provision(accountId: string, phoneDeviceId: string, phoneName: string): Promise<string> {
+    if (this.#closed) throw new TunnelGoneError()
+
+    const id = this.#allocate()
+    return await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pendingProvisions.delete(id)
+        reject(new TunnelTimeoutError())
+      }, this.#requestTimeoutMs)
+      timer.unref?.()
+
+      this.#pendingProvisions.set(id, { resolve, reject, timer })
+
+      if (!this.#write({ t: 'provision', id, accountId, phoneDeviceId, phoneName })) {
+        clearTimeout(timer)
+        this.#pendingProvisions.delete(id)
+        reject(new TunnelGoneError('the tunnel is congested'))
+      }
+    })
   }
 
   /**
@@ -352,6 +394,19 @@ export class Tunnel {
     if (typeof id !== 'string') return
 
     switch (frame.t) {
+      case 'provision-result': {
+        const pending = this.#pendingProvisions.get(id)
+        if (pending === undefined) return
+        this.#pendingProvisions.delete(id)
+        clearTimeout(pending.timer)
+        const token = (frame as { token?: unknown }).token
+        if (typeof token !== 'string' || token === '') {
+          pending.reject(new Error('the computer did not return a token'))
+          return
+        }
+        pending.resolve(token)
+        return
+      }
       case 'res': {
         const pending = this.#pendingRequests.get(id)
         if (pending === undefined) return // a late answer to a timed-out request
@@ -395,6 +450,13 @@ export class Tunnel {
           clearTimeout(request.timer)
           this.#pendingRequests.delete(id)
           request.reject(new Error(message))
+          return
+        }
+        const provision = this.#pendingProvisions.get(id)
+        if (provision !== undefined) {
+          clearTimeout(provision.timer)
+          this.#pendingProvisions.delete(id)
+          provision.reject(new Error(message))
           return
         }
         const stream = this.#pendingStreams.get(id)
@@ -446,6 +508,12 @@ export class Tunnel {
       this.#pendingStreams.delete(id)
       stream.onError(reason)
     }
+
+    for (const [, pending] of this.#pendingProvisions) {
+      clearTimeout(pending.timer)
+      pending.reject(new TunnelGoneError(reason))
+    }
+    this.#pendingProvisions.clear()
   }
 }
 

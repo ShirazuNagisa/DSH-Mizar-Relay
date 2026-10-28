@@ -562,12 +562,51 @@ export async function startRelay(
     socket.destroy()
   }
 
+  /**
+   * Which account and device each connected tunnel belongs to.
+   *
+   * A tunnel authenticates with the static credential that derives its room; the
+   * account session that rides alongside is what lets a phone of the same
+   * account find it. An unauthenticated tunnel simply has no entry here.
+   */
+  const hostPresence = new Map<
+    string,
+    { userId: string; deviceId: string; tunnel: import('./tunnel.js').Tunnel }
+  >()
+
   const accountApi =
     accountStore === null
       ? null
       : new AccountApi({
           store: accountStore,
           trustProxy: config.trustProxy,
+          hosts: {
+            onlineRooms(userId) {
+              const rooms = new Map<string, string>()
+              for (const [room, host] of hostPresence) {
+                if (host.userId === userId) rooms.set(host.deviceId, room)
+              }
+              return rooms
+            },
+            async provision(userId, hostDeviceId, phone) {
+              for (const [room, host] of hostPresence) {
+                if (host.userId !== userId || host.deviceId !== hostDeviceId) continue
+                if (!host.tunnel.alive) continue
+                try {
+                  const token = await host.tunnel.provision(userId, phone.id, phone.name)
+                  return { room, token }
+                } catch (error) {
+                  log(
+                    `relay: ${hostDeviceId} did not mint a token — ${
+                      error instanceof Error ? error.message : String(error)
+                    }`,
+                  )
+                  return null
+                }
+              }
+              return null
+            },
+          },
           notificationsEnabled: accountsConfig?.appstore.notificationsEnabled ?? true,
           ...(accountsConfig?.github === undefined || accountsConfig.github === null
             ? {}
@@ -719,6 +758,29 @@ export async function startRelay(
     if (tunnel === undefined || !tunnel.alive) {
       writeJson(response, 404, { error: 'not found' })
       return
+    }
+
+    // A relay that carries no anonymous traffic refuses the request before it
+    // reads anything. This is separate from the paid gate: it is about having an
+    // account at all, not about what that account pays.
+    if (accountsConfig?.requireSession === true) {
+      const session = request.headers['x-mizar-session']
+      const deviceId = request.headers['x-mizar-client-id']
+      const valid =
+        typeof session === 'string' &&
+        session !== '' &&
+        accountStore !== null &&
+        (await accountStore
+          .me(session, typeof deviceId === 'string' ? deviceId : null)
+          .then(() => true)
+          .catch(() => false))
+      if (!valid) {
+        writeJson(response, 401, {
+          error: 'SIGN_IN_REQUIRED',
+          message: 'this relay carries no anonymous traffic; sign in first',
+        })
+        return
+      }
     }
 
     // The paywall, before a single byte is read from the body: an unpaid caller
@@ -1301,6 +1363,17 @@ export async function startRelay(
       return
     }
 
+    if (accountsConfig?.requireSession === true) {
+      const session = request.headers['x-mizar-session']
+      const deviceId = request.headers['x-mizar-client-id']
+      if (typeof session !== 'string' || session === '' || typeof deviceId !== 'string' || deviceId === '') {
+        log('relay: tunnel refused — this relay requires a signed-in desktop')
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+        socket.destroy()
+        return
+      }
+    }
+
     if (config.tokens.length > 0 && !config.tokens.some((token) => secretsEqual(token, presented))) {
       log('relay: tunnel refused — this relay only accepts its configured credentials')
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
@@ -1354,6 +1427,29 @@ export async function startRelay(
 
       const displaced = rooms.register(room, tunnel)
       displaced?.close(4000, 'replaced by a newer tunnel')
+
+      // The account half of this tunnel: optional today, required by the relay
+      // that has no anonymous traffic. A rejected session closes the socket so a
+      // signed-out desktop cannot linger as an online-but-unreachable device.
+      const session = request.headers['x-mizar-session']
+      const accountDevice = request.headers['x-mizar-client-id']
+      if (
+        accountStore !== null &&
+        typeof session === 'string' &&
+        session !== '' &&
+        typeof accountDevice === 'string' &&
+        accountDevice !== ''
+      ) {
+        void accountStore
+          .me(session, accountDevice)
+          .then((user) => {
+            hostPresence.set(room, { userId: user.id, deviceId: accountDevice, tunnel })
+          })
+          .catch(() => {
+            log('relay: tunnel presented an account session the account service refused')
+            host.close(4401, 'account session rejected')
+          })
+      }
       log(`relay: tunnel for room ${room} connected${displaced ? ' (replaced a stale one)' : ''}`)
 
       let released = false
@@ -1365,6 +1461,7 @@ export async function startRelay(
           else tunnelsPerIp.set(peerKey, remaining)
         }
         const wasCurrent = rooms.remove(room, tunnel)
+        if (hostPresence.get(room)?.tunnel === tunnel) hostPresence.delete(room)
         if (wasCurrent) log(`relay: tunnel for room ${room} disconnected`)
       })
 

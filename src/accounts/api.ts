@@ -58,6 +58,22 @@ export interface AccountApiOptions {
   readonly mail?: MailClient | null
   /** Appeal address printed on `ACCOUNT_DISABLED`. */
   readonly contact?: string
+  /**
+   * Which of an account's devices currently have a tunnel, by device id → room.
+   *
+   * The tunnel registry lives in the relay process, not in the account store;
+   * this is the seam that lets the account API answer "what can I connect to"
+   * without importing the relay.
+   */
+  readonly hosts?: {
+    readonly onlineRooms: (userId: string) => ReadonlyMap<string, string>
+    /** Ask a connected computer to mint a token for one phone. */
+    readonly provision: (
+      userId: string,
+      hostDeviceId: string,
+      phone: { readonly id: string; readonly name: string },
+    ) => Promise<{ readonly room: string; readonly token: string } | null>
+  }
 }
 
 /** Per-request facts. */
@@ -88,6 +104,8 @@ export class AccountApi {
    * a person mistypes a code and far less than a scanner reads them.
    */
   readonly #redeemWindow = new RateWindow(5, 60 * 60_000)
+  /** Token minting for account-scoped connections: one per phone per minute. */
+  readonly #connectWindow = new RateWindow(10, 60_000)
   readonly #github: GitHubOAuth | null
   /**
    * The browser round-trip's memory: the state GitHub echoes back, and the
@@ -106,6 +124,7 @@ export class AccountApi {
   readonly #verification: VerificationCodes | null
   readonly #mail: MailClient | null
   readonly #contact: string
+  readonly #hosts: AccountApiOptions['hosts']
   /** Password-reset starts, per address; a reset is a mail-bombing surface too. */
   readonly #resetWindow = new RateWindow(5, 60 * 60_000)
 
@@ -118,6 +137,7 @@ export class AccountApi {
     this.#verification = options.verification ?? null
     this.#mail = options.mail ?? null
     this.#contact = options.contact ?? 'shirazunagisa@icloud.com'
+    this.#hosts = options.hosts
     this.#github =
       options.github === undefined
         ? null
@@ -181,6 +201,12 @@ export class AccountApi {
           break
         case 'GET /me':
           await this.#me(context)
+          break
+        case 'GET /desktops':
+          await this.#desktops(context)
+          break
+        case 'POST /connect':
+          await this.#connect(context)
           break
         case 'POST /logout':
           await this.#logout(context)
@@ -367,6 +393,63 @@ export class AccountApi {
       device,
     })
     writeJson(context.response, 200, result)
+  }
+
+  /**
+   * The account's computers, and which of them a phone can reach right now.
+   *
+   * A desktop is online when its tunnel presented this account's session; the
+   * room is the address the relay uses for it. Phones still authenticate to the
+   * computer itself, so this is discovery, not authorization.
+   */
+  async #desktops(context: RequestContext): Promise<void> {
+    const token = bearer(context.request)
+    const user = await this.#store.me(token, deviceIdOf(context.request))
+    const online = this.#hosts?.onlineRooms(user.id) ?? new Map<string, string>()
+    const desktops = user.devices
+      .filter((device) => device.platform !== 'ios')
+      .map((device) => ({
+        deviceId: device.id,
+        name: device.name,
+        model: device.model,
+        platform: device.platform,
+        online: online.has(device.id),
+        room: online.get(device.id) ?? null,
+      }))
+    writeJson(context.response, 200, { desktops })
+  }
+
+  /**
+   * Ask for a token that lets this phone reach one of its account's computers.
+   *
+   * The computer mints it: the relay verifies that both ends are in the same
+   * account and that the computer is connected, then brokers the token without
+   * ever having seen the roster it lives in.
+   */
+  async #connect(context: RequestContext): Promise<void> {
+    const body = await this.#json(context)
+    if (body === null) return
+    const deviceId = requireString(body, 'deviceId')
+    const token = bearer(context.request)
+    const user = await this.#store.me(token, deviceIdOf(context.request))
+    if (!this.#connectWindow.check(user.id)) {
+      this.#tooMany(context, 'too many connection attempts')
+      return
+    }
+    const desktop = user.devices.find((device) => device.id === deviceId)
+    if (desktop === undefined || desktop.platform === 'ios') {
+      throw new AccountError('NO_SUCH_DESKTOP', 'that computer is not on this account', 404)
+    }
+    const phoneId = deviceIdOf(context.request) ?? 'phone'
+    const phone = user.devices.find((device) => device.id === phoneId)
+    const issued = await this.#hosts?.provision(user.id, deviceId, {
+      id: phoneId,
+      name: phone?.name ?? 'Phone',
+    })
+    if (issued === null || issued === undefined) {
+      throw new AccountError('DESKTOP_OFFLINE', 'that computer is not connected', 409)
+    }
+    writeJson(context.response, 200, { room: issued.room, token: issued.token })
   }
 
   async #me(context: RequestContext): Promise<void> {

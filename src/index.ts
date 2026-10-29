@@ -611,6 +611,12 @@ export async function startRelay(
           ...(accountsConfig?.github === undefined || accountsConfig.github === null
             ? {}
             : { github: accountsConfig.github }),
+          ...(accountsConfig?.appleWeb === undefined || accountsConfig.appleWeb === null
+            ? {}
+            : { appleWeb: accountsConfig.appleWeb }),
+          ...(accountsConfig?.publicBaseURL === undefined
+            ? {}
+            : { publicBaseURL: accountsConfig.publicBaseURL }),
           // Verification is on only when this relay can actually send: a
           // deployment without a mail client keeps the pre-verification
           // behaviour rather than refusing every registration.

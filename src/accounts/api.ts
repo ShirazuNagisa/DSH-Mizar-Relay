@@ -8,7 +8,7 @@
  *
  * @module dsh-mizar-relay/accounts/api
  */
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { clientAddress } from '../client-address.js'
 import { normalizeEmail } from './avatar.js'
@@ -18,7 +18,7 @@ import { hashToken, validateDevice, validateEmail, validatePassword, validateUse
 import { AccountError, type DeviceInput, type GitHubIdentity } from './types.js'
 import type { VerificationCodes } from './verification.js'
 import { RateWindow } from './rate.js'
-import { GitHubOAuth, githubBoundPage, githubDonePage, githubErrorPage } from './github.js'
+import { GitHubOAuth, escape, githubBoundPage, githubDonePage, githubErrorPage } from './github.js'
 import { readBody, writeJson, writeHtml, redirect, parseJsonObject, stringField } from '../http.js'
 
 /** The largest account request body. */
@@ -47,6 +47,13 @@ export interface AccountApiOptions {
    * `GITHUB_NOT_CONFIGURED` on every `/github/*` route.
    */
   readonly github?: { readonly clientId: string; readonly clientSecret: string; readonly callbackURL: string }
+  /**
+   * Sign in with Apple for the website. The Services ID is the `client_id`
+   * Apple's authorize page expects; the callback lands on this relay.
+   */
+  readonly appleWeb?: { readonly servicesId: string }
+  /** Public origin used to build the Apple callback URL. */
+  readonly publicBaseURL?: string
   /** Clock, injectable for the pending/handoff TTLs. */
   readonly now?: () => number
   /** Fetch implementation for GitHub's OAuth endpoints; injectable for tests. */
@@ -107,6 +114,13 @@ export class AccountApi {
   /** Token minting for account-scoped connections: one per phone per minute. */
   readonly #connectWindow = new RateWindow(10, 60_000)
   readonly #github: GitHubOAuth | null
+  readonly #appleWeb: { servicesId: string } | null
+  readonly #appleCallbackURL: string
+  readonly #applePending = new Map<
+    string,
+    { device: ReturnType<typeof deviceOf>; nonce: string; expiresAt: number }
+  >()
+  readonly #appleStartWindow = new RateWindow(10, 60_000)
   /**
    * The browser round-trip's memory: the state GitHub echoes back, and the
    * handoff codes waiting for a phone. Both live in memory only and die with
@@ -138,6 +152,11 @@ export class AccountApi {
     this.#mail = options.mail ?? null
     this.#contact = options.contact ?? 'shirazunagisa@icloud.com'
     this.#hosts = options.hosts
+    this.#appleWeb = options.appleWeb ?? null
+    this.#appleCallbackURL =
+      options.publicBaseURL === undefined
+        ? ''
+        : `${options.publicBaseURL.replace(/\/+$/, '')}/account/v1/apple/callback`
     this.#github =
       options.github === undefined
         ? null
@@ -183,6 +202,15 @@ export class AccountApi {
           break
         case 'POST /apple':
           await this.#apple(context)
+          break
+        case 'POST /apple/start':
+          await this.#appleStart(context)
+          break
+        case 'POST /apple/callback':
+          await this.#appleCallback(context)
+          break
+        case 'POST /apple/exchange':
+          await this.#appleExchange(context)
           break
         case 'POST /github/start':
           await this.#githubStart(context)
@@ -402,6 +430,143 @@ export class AccountApi {
    * room is the address the relay uses for it. Phones still authenticate to the
    * computer itself, so this is discovery, not authorization.
    */
+  /** Guard shared by every /apple/* route. */
+  #appleOr404(context: RequestContext): { servicesId: string } | null {
+    if (this.#appleWeb === null || this.#appleCallbackURL === '') {
+      writeJson(context.response, 404, {
+        error: 'APPLE_NOT_CONFIGURED',
+        message: 'Apple sign-in is not configured on this relay',
+      })
+      return null
+    }
+    return this.#appleWeb
+  }
+
+  /**
+   * Start a web sign-in.
+   *
+   * The state ties the callback to this device; the nonce is stored raw and
+   * sent hashed, which is what Apple copies into the identity token and what
+   * the verifier hashes again before comparing.
+   */
+  async #appleStart(context: RequestContext): Promise<void> {
+    const apple = this.#appleOr404(context)
+    if (apple === null) return
+    if (!this.#appleStartWindow.check(context.ip)) {
+      this.#tooMany(context, 'too many Apple sign-in attempts')
+      return
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const device = deviceOf(body)
+    const state = randomBytes(16).toString('hex')
+    const nonce = randomBytes(16).toString('hex')
+    const now = this.#now()
+    this.#applePending.set(state, { device, nonce, expiresAt: now + 10 * 60_000 })
+    const url = new URL('https://appleid.apple.com/auth/authorize')
+    url.searchParams.set('client_id', apple.servicesId)
+    url.searchParams.set('redirect_uri', this.#appleCallbackURL)
+    url.searchParams.set('response_type', 'code id_token')
+    url.searchParams.set('response_mode', 'form_post')
+    url.searchParams.set('scope', 'name email')
+    url.searchParams.set('state', state)
+    url.searchParams.set('nonce', createHash('sha256').update(nonce, 'utf8').digest('hex'))
+    writeJson(context.response, 200, {
+      authorizeUrl: url.toString(),
+      state,
+      expiresAt: now + 10 * 60_000,
+    })
+  }
+
+  /** Apple posts the identity token here; the browser is shown a code. */
+  async #appleCallback(context: RequestContext): Promise<void> {
+    const apple = this.#appleOr404(context)
+    if (apple === null) return
+    const raw = await readBody(context.request, 64 * 1024)
+    const form = new URLSearchParams(raw?.toString('utf8') ?? '')
+    const fail = (code: string, message: string): void => {
+      writeHtml(
+        context.response,
+        400,
+        `<!doctype html><meta charset="utf-8"><title>Mizar · Apple 登录失败</title><p>${escape(message)}</p><small>${escape(code)}</small>`,
+      )
+    }
+    const identityToken = form.get('id_token')
+    const state = form.get('state')
+    if (identityToken === null || state === null) {
+      fail('APPLE_INVALID_STATE', 'Apple did not return an identity token; start the sign-in again')
+      return
+    }
+    const now = this.#now()
+    const pending = this.#applePending.get(state)
+    if (pending === undefined || pending.expiresAt <= now) {
+      this.#applePending.delete(state)
+      fail('APPLE_INVALID_STATE', 'this sign-in round-trip is unknown or has expired; start again')
+      return
+    }
+    this.#applePending.delete(state)
+    let fullName: string | undefined
+    const user = form.get('user')
+    if (user !== null) {
+      try {
+        const parsed = JSON.parse(user) as { name?: { firstName?: string; lastName?: string } }
+        const joined = [parsed.name?.firstName, parsed.name?.lastName]
+          .filter((part): part is string => typeof part === 'string' && part !== '')
+          .join(' ')
+        if (joined !== '') fullName = joined
+      } catch {
+        // A malformed `user` field only costs the display name.
+      }
+    }
+    try {
+      const result = await this.#store.signInWithApple({
+        identityToken,
+        nonce: pending.nonce,
+        ...(fullName === undefined ? {} : { fullName }),
+        device: pending.device,
+      })
+      const handoff = this.#newHandoff(result.user.id, now)
+      writeHtml(context.response, 200, githubDonePage(handoff.code))
+    } catch (error) {
+      fail(
+        'APPLE_SIGN_IN_FAILED',
+        error instanceof Error ? error.message : 'Apple sign-in failed',
+      )
+    }
+  }
+
+  /** Spend the code the callback page showed for a session. */
+  async #appleExchange(context: RequestContext): Promise<void> {
+    const apple = this.#appleOr404(context)
+    if (apple === null) return
+    if (!this.#githubHandoffWindow.check(context.ip)) {
+      this.#tooMany(context, 'too many handoff attempts')
+      return
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const code = stringField(body, 'handoff') ?? stringField(body, 'code') ?? ''
+    const device = deviceOf(body)
+    if (!GITHUB_HANDOFF_SHAPE.test(code)) {
+      throw new AccountError('GITHUB_HANDOFF_INVALID', 'that sign-in code is not shaped right', 400)
+    }
+    const now = this.#now()
+    this.#pruneGithub(now)
+    const key = hashToken(code)
+    const entry = this.#githubHandoff.get(key)
+    if (entry === undefined || entry.expiresAt <= now) {
+      this.#githubHandoff.delete(key)
+      throw new AccountError(
+        'GITHUB_HANDOFF_INVALID',
+        'that sign-in code is unknown or has expired; start again',
+        400,
+      )
+    }
+    this.#githubHandoff.delete(key)
+    const result = await this.#store.createSession({ userId: entry.userId, device })
+    writeJson(context.response, 200, result)
+  }
+
   async #desktops(context: RequestContext): Promise<void> {
     const token = bearer(context.request)
     const user = await this.#store.me(token, deviceIdOf(context.request))

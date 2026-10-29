@@ -419,7 +419,7 @@ export function githubErrorPage(code: string, message: string): string {
 }
 
 /** Escape text for HTML interpolation. */
-function escape(value: string): string {
+export function escape(value: string): string {
   return value
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')

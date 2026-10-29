@@ -347,6 +347,8 @@ export interface AccountsConfig {
   readonly publicBaseURL: string
   /** GitHub sign-in, or `null` when it is off. */
   readonly github: GitHubConfig | null
+  /** Sign in with Apple for the website, or `null` when it is off. */
+  readonly appleWeb: AppleWebConfig | null
 }
 
 /** The file-shaped `github` object, where every field is optional. */
@@ -358,6 +360,11 @@ export interface GitHubFileConfig {
 }
 
 /** The GitHub sign-in policy, resolved. */
+export interface AppleWebConfig {
+  /** The Services ID Apple issues for web sign-in; also an accepted audience. */
+  readonly servicesId: string
+}
+
 export interface GitHubConfig {
   readonly enabled: boolean
   readonly clientId: string
@@ -378,6 +385,7 @@ export interface AccountsFileConfig {
     readonly baseURLs?: readonly string[]
   }
   readonly appleAudiences?: readonly string[]
+  readonly appleWeb?: { readonly servicesId?: string }
   readonly appleKeysURL?: string
   readonly requireSession?: boolean
   readonly paidGate?: {
@@ -815,6 +823,7 @@ function readAccounts(
       )
     }
   }
+  const appleWebServicesId = pick(env['MIZAR_APPLE_SERVICES_ID'], file.appleWeb?.servicesId, '')
   if (githubFile.clientSecret !== undefined && githubFile.clientSecret !== '') {
     // The manual's rule: the secret lives in the environment file with mode 600,
     // not in a config file that is easier to copy or commit by accident.
@@ -841,10 +850,16 @@ function readAccounts(
         gravatar.baseURLs ?? ['https://www.gravatar.com'],
       ),
     },
-    appleAudiences: commaList(
-      String(pick(env['MIZAR_APPLE_AUDIENCES'], undefined as string | undefined, '')),
-      file.appleAudiences ?? ['me.shirazu.dshmizar'],
-    ),
+    appleAudiences: (() => {
+      const audiences = commaList(
+        String(pick(env['MIZAR_APPLE_AUDIENCES'], undefined as string | undefined, '')),
+        file.appleAudiences ?? ['me.shirazu.dshmizar'],
+      )
+      return appleWebServicesId !== '' && !audiences.includes(appleWebServicesId)
+        ? [...audiences, appleWebServicesId]
+        : audiences
+    })(),
+    appleWeb: appleWebServicesId === '' ? null : { servicesId: appleWebServicesId },
     appleKeysURL: pick(
       env['MIZAR_APPLE_KEYS_URL'],
       file.appleKeysURL,

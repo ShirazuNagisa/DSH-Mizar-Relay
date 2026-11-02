@@ -302,7 +302,7 @@ export function githubDonePage(code: string): string {
   main { text-align: center; padding: 48px 28px; }
   h1 { font-size: 20px; margin: 0 0 6px; }
   p { margin: 0 0 28px; color: #65676b; font-size: 14px; }
-  code { display: block; font-size: 34px; letter-spacing: 2px; font-weight: 700;
+  code { user-select: all; cursor: pointer; display: block; font-size: 34px; letter-spacing: 2px; font-weight: 700;
          font-family: ui-monospace, Menlo, monospace; padding: 18px 24px; margin: 0 0 28px;
          background: #fff; border-radius: 14px; box-shadow: 0 1px 4px rgb(0 0 0 / 8%); }
   a { display: inline-block; padding: 12px 36px; border-radius: 999px; background: #0f62fe;
@@ -326,23 +326,34 @@ export function githubDonePage(code: string): string {
   <script>
     (() => {
       const button = document.getElementById('copy')
-      if (button === null) return
-      button.addEventListener('click', async () => {
-        const code = document.querySelector('code').textContent
-        try {
-          await navigator.clipboard.writeText(code)
-        } catch {
-          const area = document.createElement('textarea')
-          area.value = code
-          area.setAttribute('readonly', '')
-          document.body.appendChild(area)
-          area.select()
-          document.execCommand('copy')
-          area.remove()
+      const codeNode = document.querySelector('code')
+      if (button === null || codeNode === null) return
+      const copy = () => {
+        // The selection fallback runs first: a clipboard permission prompt
+        // that never resolves leaves a button that looks dead.
+        const code = codeNode.textContent
+        const area = document.createElement('textarea')
+        area.value = code
+        area.setAttribute('readonly', '')
+        area.style.position = 'fixed'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        let ok = false
+        try { ok = document.execCommand('copy') } catch { ok = false }
+        area.remove()
+        if (!ok && navigator.clipboard !== undefined) {
+          navigator.clipboard.writeText(code).then(() => {
+            button.textContent = '已复制'
+            setTimeout(() => { button.textContent = '复制代码' }, 1600)
+          }).catch(() => {})
+          return
         }
-        button.textContent = '已复制'
+        button.textContent = ok ? '已复制' : '请选中代码手动复制'
         setTimeout(() => { button.textContent = '复制代码' }, 1600)
-      })
+      }
+      button.addEventListener('click', copy)
+      codeNode.addEventListener('click', copy)
     })()
   </script>
 </main>

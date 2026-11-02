@@ -153,6 +153,23 @@ export interface ApnsActivityRow {
   readonly runningSince: number
 }
 
+/**
+ * One approval the card draws beside its rows.
+ *
+ * The ids and the two sentences are the computer's, not this file's: the relay
+ * moves them, and the widget decides how they read. `requestId` is what an
+ * answer on the island has to name, so it travels unchanged -- an id this layer
+ * rewrote would be an answer nobody could match.
+ */
+export interface ApnsActivityApproval {
+  readonly requestId: string
+  readonly sessionId: string
+  /** The tool asking, e.g. `Bash`. */
+  readonly tool: string
+  /** The sentence the agent wrote about it. */
+  readonly detail: string
+}
+
 /** A Live Activity to start on a phone that has none. */
 export interface ApnsLiveActivityStart {
   /**
@@ -165,6 +182,8 @@ export interface ApnsLiveActivityStart {
   readonly environment: ApnsEnvironment
   /** The rows to draw, oldest first. */
   readonly rows: readonly ApnsActivityRow[]
+  /** The approvals waiting on the operator. */
+  readonly approvals?: readonly ApnsActivityApproval[]
   /** The banner that accompanies the start. */
   readonly alert: { readonly title: string; readonly body: string }
 }
@@ -175,6 +194,8 @@ export interface ApnsLiveActivityUpdate {
   readonly token: string
   readonly environment: ApnsEnvironment
   readonly rows: readonly ApnsActivityRow[]
+  /** The approvals waiting on the operator. */
+  readonly approvals?: readonly ApnsActivityApproval[]
 }
 
 /** How long a signed JWT is reused before it is minted again. */
@@ -355,11 +376,13 @@ const SWIFT_REFERENCE_EPOCH = 978_307_200
  *
  * @param rows - the rows, oldest first.
  * @param now - the current time, in epoch milliseconds.
+ * @param approvals - the approvals waiting on the operator, oldest first.
  * @returns the decoded shape of the app's content state.
  */
 export function buildLiveActivityContentState(
   rows: readonly ApnsActivityRow[],
   now: number,
+  approvals: readonly ApnsActivityApproval[] = [],
 ): Record<string, unknown> {
   return {
     rows: rows.map((row) => ({
@@ -371,6 +394,15 @@ export function buildLiveActivityContentState(
       title: row.title,
       elapsed: Math.max(0, (now - row.runningSince) / 1000),
       countingSince: row.runningSince / 1000 - SWIFT_REFERENCE_EPOCH,
+    })),
+    // Always present, even when empty: a card whose state has no approvals is a
+    // card with nothing to answer, and a missing key would be a decode failure in
+    // a Swift type that declares the array.
+    approvals: approvals.map((approval) => ({
+      requestId: approval.requestId,
+      sessionId: approval.sessionId,
+      tool: approval.tool,
+      detail: approval.detail,
     })),
   }
 }
@@ -404,7 +436,7 @@ export function buildLiveActivityStartPayload(
       event: 'start',
       'attributes-type': 'DSHMizarActivityAttributes',
       attributes: {},
-      'content-state': buildLiveActivityContentState(start.rows, now),
+      'content-state': buildLiveActivityContentState(start.rows, now, start.approvals ?? []),
       alert: { title: start.alert.title, body: start.alert.body },
     },
   }
@@ -428,7 +460,7 @@ export function buildLiveActivityUpdatePayload(
     aps: {
       timestamp: Math.floor(now / 1000),
       event: 'update',
-      'content-state': buildLiveActivityContentState(update.rows, now),
+      'content-state': buildLiveActivityContentState(update.rows, now, update.approvals ?? []),
     },
   }
 }

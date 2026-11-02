@@ -306,6 +306,7 @@ describe('starting a Live Activity from the computer', () => {
               countingSince: 1_700_000_000 - 978_307_200,
             },
           ],
+          approvals: [],
         },
         alert: { title: 'DSH-Mizar', body: 'Refactor' },
       },
@@ -331,6 +332,7 @@ describe('starting a Live Activity from the computer', () => {
               countingSince: 1_700_000_000 - 978_307_200,
             },
           ],
+          approvals: [],
         },
       },
     })

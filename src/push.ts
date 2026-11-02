@@ -629,6 +629,20 @@ export interface ActivityRequest {
     readonly runningSince: number
   }[]
   /**
+   * The approvals waiting on the operator, oldest first.
+   *
+   * Additive: a computer that predates this sends none, and the card simply has
+   * nothing to answer. `requestId` is passed through untouched — it is what an
+   * answer on the island names, so an id this layer invented would be an answer
+   * nobody could match.
+   */
+  readonly approvals: readonly {
+    readonly requestId: string
+    readonly sessionId: string
+    readonly tool: string
+    readonly detail: string
+  }[]
+  /**
    * Devices whose app is on screen, and which started a card of their own.
    *
    * Unlike the alert fan-out this is not a courtesy: a start sent to a phone that
@@ -640,6 +654,9 @@ export interface ActivityRequest {
 
 /** How many rows a card may carry. Mirrors the app's own cap. */
 const MAX_ACTIVITY_ROWS = 2
+
+/** How many approvals a card may carry. One is ordinary; two is a batch. */
+const MAX_ACTIVITY_APPROVALS = 2
 
 /**
  * Narrow an activity body.
@@ -658,7 +675,7 @@ export function readActivity(value: unknown): ActivityRequest | null {
   const phase = record['phase']
   if (phase !== 'start' && phase !== 'update') return null
   const raw = record['rows']
-  if (!Array.isArray(raw) || raw.length === 0) return null
+  if (!Array.isArray(raw)) return null
   const rows: {
     sessionId: string
     title: string
@@ -680,11 +697,54 @@ export function readActivity(value: unknown): ActivityRequest | null {
       runningSince,
     })
   }
+  const approvals = readApprovals(record['approvals'])
+  // A card with nothing on it is not an update, it is an end -- and that has its
+  // own request. Rows alone are the ordinary case; approvals alone happen when a
+  // turn is blocked but its engine does not call that "running".
+  if (rows.length === 0 && approvals.length === 0) return null
   return {
     phase,
     rows,
+    approvals,
     exceptDeviceIds: readExceptDeviceIds(record['exceptDeviceIds']),
   }
+}
+
+/**
+ * Narrow the optional approvals on an activity body.
+ *
+ * Absent is the ordinary case for a computer that predates them, and is an empty
+ * list rather than a parse failure. A present but malformed approval drops the
+ * whole request, for the same reason a malformed row does: the card draws all of
+ * them, and an answer button whose id is a truncated string would answer the
+ * wrong request — or none.
+ *
+ * @param value - the `approvals` field, or anything else.
+ * @returns the approvals, at most {@link MAX_ACTIVITY_APPROVALS}.
+ */
+function readApprovals(value: unknown): ActivityRequest['approvals'] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) return []
+  const approvals: {
+    requestId: string
+    sessionId: string
+    tool: string
+    detail: string
+  }[] = []
+  for (const entry of value) {
+    if (approvals.length >= MAX_ACTIVITY_APPROVALS) break
+    if (typeof entry !== 'object' || entry === null) continue
+    const approval = entry as Record<string, unknown>
+    const requestId = approval['requestId']
+    if (typeof requestId !== 'string' || requestId === '') continue
+    approvals.push({
+      requestId: requestId.slice(0, 200),
+      sessionId: typeof approval['sessionId'] === 'string' ? approval['sessionId'].slice(0, 200) : '',
+      tool: typeof approval['tool'] === 'string' ? approval['tool'].slice(0, 120) : '',
+      detail: typeof approval['detail'] === 'string' ? approval['detail'].slice(0, 400) : '',
+    })
+  }
+  return approvals
 }
 
 /**
@@ -752,6 +812,7 @@ export async function deliverActivity(
           token: reported,
           environment,
           rows: request.rows,
+          approvals: request.approvals,
         })
         if (result.delivered) {
           tally.sent += 1
@@ -789,6 +850,7 @@ export async function deliverActivity(
         token: startToken,
         environment,
         rows: request.rows,
+        approvals: request.approvals,
         alert: {
           title: 'DSH-Mizar',
           body: request.rows[0]?.title ?? '',

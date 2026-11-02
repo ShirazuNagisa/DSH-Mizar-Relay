@@ -327,6 +327,15 @@ export interface AccountsConfig {
   /** How the paid relay treats a phone that is not paying for it. */
   readonly paidGate: PaidGateConfig
   /**
+   * An account service this relay defers to instead of keeping its own store.
+   *
+   * The second relay in a deployment (`requireSession` on, `enabled` off) holds
+   * no accounts: it asks the origin relay's `/account/v1/me` whether a session
+   * is real. Two processes must never open the same `accounts.json`, so sharing
+   * an account database is done over HTTP, not over a file.
+   */
+  readonly upstreamURL: string | null
+  /**
    * Whether every remote caller must be signed in.
    *
    * A relay with this on carries no anonymous traffic at all: the tunnel and the
@@ -388,6 +397,7 @@ export interface AccountsFileConfig {
   readonly appleWeb?: { readonly servicesId?: string }
   readonly appleKeysURL?: string
   readonly requireSession?: boolean
+  readonly upstreamURL?: string
   readonly paidGate?: {
     /** `true`/`false` are accepted as shorthand for `enforce`/`off`. */
     readonly mode?: PaidGateMode | boolean
@@ -715,10 +725,13 @@ export function gateStartupChecks(config: RelayConfig): string[] {
   const accounts = config.accounts
   if (accounts === null) return []
   if (!accounts.enabled) {
-    // requireSession without an account service cannot verify anybody, so it
-    // would either refuse every caller or check nothing. Both are wrong.
-    return accounts.requireSession
-      ? ['accounts.requireSession needs accounts.enabled: there is no service to check a session against.']
+    // requireSession without any account service cannot verify anybody, so it
+    // would either refuse every caller or check nothing. Both are wrong. An
+    // upstream service (a second relay deferring to the first) is a real answer,
+    // and then a local store is exactly what this relay must not have.
+    if (!accounts.requireSession) return []
+    return accounts.upstreamURL === null
+      ? ['accounts.requireSession needs accounts.enabled or accounts.upstreamURL: there is no service to check a session against.']
       : []
   }
   // A free relay (role 0) is not supposed to gate -- it has no paid users to
@@ -833,6 +846,10 @@ function readAccounts(
   }
   return {
     enabled,
+    upstreamURL: (() => {
+      const raw = pick(env['MIZAR_ACCOUNTS_UPSTREAM'], file.upstreamURL, '')
+      return raw === '' ? null : raw.replace(/\/+$/, '')
+    })(),
     dataDir: pick(env['MIZAR_ACCOUNTS_DATA_DIR'], file.dataDir, './data'),
     adminPasswordHash: pick(env['MIZAR_ADMIN_PASSWORD_HASH'], file.adminPasswordHash, ''),
     internalSecret: pick(env['MIZAR_ACCOUNT_INTERNAL_SECRET'], file.internalSecret, ''),

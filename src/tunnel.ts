@@ -231,7 +231,12 @@ export class Tunnel {
    * @param phoneName - what to call the phone in the computer's device list.
    * @returns the token the phone should present.
    */
-  async provision(accountId: string, phoneDeviceId: string, phoneName: string): Promise<string> {
+  async provision(
+    accountId: string,
+    phoneDeviceId: string,
+    phoneName: string,
+    engine?: string,
+  ): Promise<string> {
     if (this.#closed) throw new TunnelGoneError()
 
     const id = this.#allocate()
@@ -244,7 +249,16 @@ export class Tunnel {
 
       this.#pendingProvisions.set(id, { resolve, reject, timer })
 
-      if (!this.#write({ t: 'provision', id, accountId, phoneDeviceId, phoneName })) {
+      if (
+        !this.#write({
+          t: 'provision',
+          id,
+          accountId,
+          phoneDeviceId,
+          phoneName,
+          ...(engine === undefined || engine === '' ? {} : { engine }),
+        })
+      ) {
         clearTimeout(timer)
         this.#pendingProvisions.delete(id)
         reject(new TunnelGoneError('the tunnel is congested'))

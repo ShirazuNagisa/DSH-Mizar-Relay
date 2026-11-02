@@ -78,7 +78,7 @@ export interface AccountApiOptions {
     readonly provision: (
       userId: string,
       hostDeviceId: string,
-      phone: { readonly id: string; readonly name: string },
+      phone: { readonly id: string; readonly name: string; readonly engine?: string },
     ) => Promise<{ readonly room: string; readonly token: string } | null>
   }
 }
@@ -121,6 +121,9 @@ export class AccountApi {
     { device: ReturnType<typeof deviceOf>; nonce: string; expiresAt: number }
   >()
   readonly #appleStartWindow = new RateWindow(10, 60_000)
+  /** Completed browser sign-ins, by the state the desktop is polling. */
+  readonly #loginResults = new Map<string, { code: string; expiresAt: number }>()
+  readonly #loginPollWindow = new RateWindow(120, 60_000)
   /**
    * The browser round-trip's memory: the state GitHub echoes back, and the
    * handoff codes waiting for a phone. Both live in memory only and die with
@@ -208,6 +211,12 @@ export class AccountApi {
           break
         case 'POST /apple/callback':
           await this.#appleCallback(context)
+          break
+        case 'POST /apple/poll':
+          await this.#loginPoll(context)
+          break
+        case 'POST /github/poll':
+          await this.#loginPoll(context)
           break
         case 'POST /apple/exchange':
           await this.#appleExchange(context)
@@ -526,6 +535,7 @@ export class AccountApi {
         device: pending.device,
       })
       const handoff = this.#newHandoff(result.user.id, now)
+      this.#loginResults.set(state, { code: handoff.code, expiresAt: handoff.expiresAt })
       writeHtml(context.response, 200, githubDonePage(handoff.code))
     } catch (error) {
       fail(
@@ -533,6 +543,36 @@ export class AccountApi {
         error instanceof Error ? error.message : 'Apple sign-in failed',
       )
     }
+  }
+
+  /**
+   * The desktop asking whether its browser round-trip has finished.
+   *
+   * The state is the only thing needed: it was minted for this attempt, lives
+   * ten minutes, and the code it hands back is single-use.
+   */
+  async #loginPoll(context: RequestContext): Promise<void> {
+    if (!this.#loginPollWindow.check(context.ip)) {
+      this.#tooMany(context, 'too many sign-in polls')
+      return
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const state = stringField(body, 'state')
+    if (state === undefined || state === '') {
+      throw new AccountError('MALFORMED_FRAME', 'the poll needs the state from the start call', 400)
+    }
+    const now = this.#now()
+    for (const [key, value] of this.#loginResults) {
+      if (value.expiresAt <= now) this.#loginResults.delete(key)
+    }
+    const result = this.#loginResults.get(state)
+    if (result === undefined) {
+      writeJson(context.response, 200, { pending: true })
+      return
+    }
+    this.#loginResults.delete(state)
+    writeJson(context.response, 200, { pending: false, code: result.code })
   }
 
   /** Spend the code the callback page showed for a session. */
@@ -607,9 +647,11 @@ export class AccountApi {
     }
     const phoneId = deviceIdOf(context.request) ?? 'phone'
     const phone = user.devices.find((device) => device.id === phoneId)
+    const engine = typeof body.engine === 'string' ? body.engine : ''
     const issued = await this.#hosts?.provision(user.id, deviceId, {
       id: phoneId,
       name: phone?.name ?? 'Phone',
+      engine,
     })
     if (issued === null || issued === undefined) {
       throw new AccountError('DESKTOP_OFFLINE', 'that computer is not connected', 409)
@@ -789,6 +831,7 @@ export class AccountApi {
       }
       const { userId } = await this.#store.resolveGitHubIdentity(identity)
       const handoff = this.#newHandoff(userId, now)
+      this.#loginResults.set(state, { code: handoff.code, expiresAt: handoff.expiresAt })
       redirect(context.response, this.#doneURL(`handoff=${encodeURIComponent(handoff.code)}`))
     } catch (error) {
       if (error instanceof AccountError) {

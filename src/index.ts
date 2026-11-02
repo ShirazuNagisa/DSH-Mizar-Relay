@@ -27,6 +27,7 @@ import { startStunServer } from './stun.js'
 import { UdpGuard } from './udp-guard.js'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { ApnsClient } from './apns.js'
+import type { PublicUser } from './accounts/types.js'
 import { AccountApi } from './accounts/api.js'
 import { AdminApi } from './accounts/admin.js'
 import { Enforcement } from './accounts/enforcement.js'
@@ -116,6 +117,32 @@ function forwardableHeaders(request: IncomingMessage): Record<string, string> {
 }
 
 /** Extract the bearer token from an upgrade request. */
+
+/** The `x-mizar-client-id` header, when it is a non-empty string. */
+function clientIdOf(request: IncomingMessage): string | null {
+  const value = request.headers['x-mizar-client-id']
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/** A request body, or null when it is over the shared limit. */
+async function bodyBytes(request: IncomingMessage): Promise<Buffer | null> {
+  return readBody(request, 1 << 20)
+}
+
+/** A JSON request body, or null when it is absent or unparsable. */
+async function bodyJson(request: IncomingMessage): Promise<Record<string, unknown> | null> {
+  const bytes = await bodyBytes(request)
+  if (bytes === null || bytes.length === 0) return null
+  try {
+    const parsed: unknown = JSON.parse(bytes.toString('utf8'))
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
 function bearerToken(request: IncomingMessage): string | null {
   const header = request.headers.authorization
   if (typeof header !== 'string') return null
@@ -574,6 +601,159 @@ export async function startRelay(
     { userId: string; deviceId: string; tunnel: import('./tunnel.js').Tunnel }
   >()
 
+  /**
+   * The account service this relay defers to, when it keeps no store of its own.
+   *
+   * A relay with `requireSession` but `enabled: false` is the second half of a
+   * deployment: it carries the tunnels, the origin relay carries the accounts.
+   * Sessions are verified by asking that origin, never by reading its files.
+   */
+  const upstreamAccountURL = accountsConfig?.upstreamURL ?? null
+
+  /** Verify a session against the origin relay. */
+  const verifyUpstream = async (
+    token: string,
+    deviceId: string | null,
+  ): Promise<PublicUser | null> => {
+    if (upstreamAccountURL === null) return null
+    try {
+      const response = await fetch(`${upstreamAccountURL}/me`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(deviceId === null ? {} : { 'x-mizar-client-id': deviceId }),
+        },
+      })
+      if (!response.ok) return null
+      const body = (await response.json()) as { user?: PublicUser }
+      return body.user ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** Verify a session: locally when this relay owns accounts, upstream when it does not. */
+  const verifySession = async (token: string, deviceId: string | null): Promise<PublicUser | null> => {
+    if (accountStore !== null) {
+      try {
+        return (await accountStore.me(token, deviceId)) as unknown as PublicUser
+      } catch {
+        return null
+      }
+    }
+    return verifyUpstream(token, deviceId)
+  }
+
+  /** The signed-in user, or null after writing a 401. */
+  const requireUser = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<PublicUser | null> => {
+    const token = bearerToken(request)
+    const deviceId = clientIdOf(request)
+    const user = token === null ? null : await verifySession(token, deviceId)
+    if (user === null) {
+      writeJson(response, 401, {
+        error: 'SIGN_IN_REQUIRED',
+        message: 'sign in with an account this relay knows',
+      })
+      return null
+    }
+    return user
+  }
+
+  /** `GET /account/v1/desktops` — the user's computers, by whether they are here. */
+  const serveLocalDesktops = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> => {
+    const user = await requireUser(request, response)
+    if (user === null) return
+    const online = new Map<string, string>()
+    for (const [room, host] of hostPresence) {
+      if (host.userId === user.id) online.set(host.deviceId, room)
+    }
+    const desktops = (user.devices ?? [])
+      .filter((device) => device.platform !== 'ios')
+      .map((device) => ({
+        deviceId: device.id,
+        name: device.name,
+        model: device.model,
+        platform: device.platform,
+        online: online.has(device.id),
+        room: online.get(device.id) ?? null,
+      }))
+    writeJson(response, 200, { desktops })
+  }
+
+  /** `POST /account/v1/connect` — ask a computer for a token for this phone. */
+  const serveLocalConnect = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    parsedUrl: URL,
+  ): Promise<void> => {
+    const user = await requireUser(request, response)
+    if (user === null) return
+    const body = await bodyJson(request)
+    const deviceId = typeof body?.deviceId === 'string' ? body.deviceId : null
+    if (deviceId === null) {
+      writeJson(response, 400, { error: 'BAD_REQUEST', message: 'deviceId is required' })
+      return
+    }
+    const host = [...hostPresence.values()].find(
+      (entry) => entry.userId === user.id && entry.deviceId === deviceId && entry.tunnel.alive,
+    )
+    if (host === undefined) {
+      writeJson(response, 409, { error: 'DESKTOP_OFFLINE', message: 'that computer is not connected' })
+      return
+    }
+    const phoneId = clientIdOf(request) ?? 'phone'
+    const phone = (user.devices ?? []).find((device) => device.id === phoneId)
+    const engine = typeof body?.engine === 'string' ? body.engine : undefined
+    const room = [...hostPresence.entries()].find(([, entry]) => entry === host)?.[0] ?? ''
+    try {
+      const token = await host.tunnel.provision(user.id, phoneId, phone?.name ?? 'Phone', engine)
+      writeJson(response, 200, { room, token })
+    } catch (error) {
+      log(`relay: connect failed — ${error instanceof Error ? error.message : String(error)}`)
+      writeJson(response, 503, { error: 'PROVISION_FAILED', message: 'the computer did not answer' })
+    }
+    void parsedUrl
+  }
+
+  /** Forward an account request this relay does not own to the origin service. */
+  const proxyToUpstream = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    parsedUrl: URL,
+  ): Promise<void> => {
+    const suffix = parsedUrl.pathname.slice('/account/v1'.length)
+    const target = new URL(`${upstreamAccountURL}${suffix}${parsedUrl.search}`)
+    const headers: Record<string, string> = {}
+    for (const name of ['authorization', 'content-type', 'accept', 'x-mizar-client-id', 'user-agent']) {
+      const value = request.headers[name]
+      if (typeof value === 'string') headers[name] = value
+    }
+    const body = await bodyBytes(request)
+    try {
+      const upstream = await fetch(target, {
+        method: request.method,
+        headers,
+        ...(body === null || request.method === 'GET' ? {} : { body }),
+      })
+      const bytes = Buffer.from(await upstream.arrayBuffer())
+      const contentType = upstream.headers.get('content-type') ?? 'application/json'
+      response.writeHead(upstream.status, {
+        'content-type': contentType,
+        'content-length': String(bytes.length),
+        'cache-control': 'no-store',
+      })
+      response.end(bytes)
+    } catch (error) {
+      log(`relay: account upstream unreachable — ${error instanceof Error ? error.message : String(error)}`)
+      writeJson(response, 502, { error: 'UPSTREAM_UNAVAILABLE', message: 'the account service did not answer' })
+    }
+  }
+
   const accountApi =
     accountStore === null
       ? null
@@ -593,7 +773,12 @@ export async function startRelay(
                 if (host.userId !== userId || host.deviceId !== hostDeviceId) continue
                 if (!host.tunnel.alive) continue
                 try {
-                  const token = await host.tunnel.provision(userId, phone.id, phone.name)
+                  const token = await host.tunnel.provision(
+                    userId,
+                    phone.id,
+                    phone.name,
+                    phone.engine,
+                  )
                   return { room, token }
                 } catch (error) {
                   log(
@@ -719,11 +904,26 @@ export async function startRelay(
     // a free relay answers 404 instead of leaking the request into a room.
     const parsedUrl = new URL(url, 'http://relay.invalid')
     if (parsedUrl.pathname.startsWith('/account/v1/')) {
-      if (accountApi === null) {
-        writeJson(response, 404, { error: 'not found' })
-      } else {
+      if (accountApi !== null) {
         await accountApi.handle(request, response, parsedUrl)
+        return
       }
+      if (upstreamAccountURL === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      // A relay that keeps no accounts owns exactly two answers: which of the
+      // signed-in user's computers are connected *here*, and how to reach one.
+      // Everything else (sign-in, /me, invites) belongs to the origin service.
+      if (parsedUrl.pathname === '/account/v1/desktops' && request.method === 'GET') {
+        await serveLocalDesktops(request, response)
+        return
+      }
+      if (parsedUrl.pathname === '/account/v1/connect' && request.method === 'POST') {
+        await serveLocalConnect(request, response, parsedUrl)
+        return
+      }
+      await proxyToUpstream(request, response, parsedUrl)
       return
     }
     if (parsedUrl.pathname === '/internal/v1/traffic') {
@@ -775,11 +975,10 @@ export async function startRelay(
       const valid =
         typeof session === 'string' &&
         session !== '' &&
-        accountStore !== null &&
-        (await accountStore
-          .me(session, typeof deviceId === 'string' ? deviceId : null)
-          .then(() => true)
-          .catch(() => false))
+        (await verifySession(
+          session,
+          typeof deviceId === 'string' ? deviceId : null,
+        )) !== null
       if (!valid) {
         writeJson(response, 401, {
           error: 'SIGN_IN_REQUIRED',
@@ -1440,21 +1639,26 @@ export async function startRelay(
       const session = request.headers['x-mizar-session']
       const accountDevice = request.headers['x-mizar-client-id']
       if (
-        accountStore !== null &&
+        (accountStore !== null || upstreamAccountURL !== null) &&
         typeof session === 'string' &&
         session !== '' &&
         typeof accountDevice === 'string' &&
         accountDevice !== ''
       ) {
-        void accountStore
-          .me(session, accountDevice)
+        void verifySession(session, accountDevice)
           .then((user) => {
+            if (user === null) throw new Error('session refused')
             hostPresence.set(room, { userId: user.id, deviceId: accountDevice, tunnel })
+            log(`relay: ${accountDevice} is online for ${user.id}`)
           })
           .catch(() => {
             log('relay: tunnel presented an account session the account service refused')
             host.close(4401, 'account session rejected')
           })
+      } else if (accountStore !== null || upstreamAccountURL !== null) {
+        // A tunnel with no account headers costs the operator a mystery: the
+        // computer is connected and still not in the phone's list.
+        log('relay: tunnel connected without an account session — it will not appear in /desktops')
       }
       log(`relay: tunnel for room ${room} connected${displaced ? ' (replaced a stale one)' : ''}`)
 

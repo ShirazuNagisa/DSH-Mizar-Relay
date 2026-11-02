@@ -636,6 +636,34 @@ describe('notifying a room', () => {
     expect(updateBody.aps['alert']).toBeUndefined()
   })
 
+  it('carries the approvals waiting on the operator onto the card', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityStartToken: '9999',
+    })
+
+    const rows = [{ sessionId: 'session-1', title: 'Refactor', runningSince: Date.now() - 60_000 }]
+    const approvals = [
+      { requestId: 'r1', sessionId: 'session-1', tool: 'Bash', detail: 'rm -rf build' },
+    ]
+    const started = await post(base, '/push/v1/activity', MAC_A, { phase: 'start', rows, approvals })
+    expect(started.json).toMatchObject({ ok: true, sent: 1 })
+
+    const start = received.find((entry) => entry.path === '/3/device/9999')
+    const body = JSON.parse(start?.body ?? '{}') as { aps: Record<string, unknown> }
+    const content = body.aps['content-state'] as {
+      approvals: Array<{ requestId: string; sessionId: string; tool: string; detail: string }>
+    }
+    // The id travels unchanged: it is what a press on the island answers with.
+    expect(content.approvals).toEqual([
+      { requestId: 'r1', sessionId: 'session-1', tool: 'Bash', detail: 'rm -rf build' },
+    ])
+  })
+
   it('does not start a second card on a phone that already has one', async () => {
     const authority = await startFakeApple()
     const base = await boot(authority)

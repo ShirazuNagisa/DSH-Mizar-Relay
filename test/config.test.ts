@@ -361,3 +361,37 @@ describe('the data-plane abuse limits', () => {
     expect(resolveAbuse(bare)).toEqual(DEFAULT_ABUSE)
   })
 })
+
+describe('the dataset configuration', () => {
+  it('is null when the block is absent, so an upgrade enables nothing', async () => {
+    const home = await scratch()
+    const config = loadConfig(join(home, 'relay.config.json'), {})
+    expect(config.dataset).toBeNull()
+  })
+
+  it('reads the block and lets the environment override the secret', async () => {
+    const home = await scratch()
+    const path = join(home, 'relay.config.json')
+    await writeFile(
+      path,
+      JSON.stringify({
+        dataset: {
+          enabled: true,
+          dataDir: '/var/lib/mizar',
+          receiveURL: 'https://free.example/dataset/v1/receive',
+          secret: 'from-file',
+          maxBatchBytes: 2048,
+        },
+      }),
+    )
+    const config = loadConfig(path, { MIZAR_DATASET_SECRET: 'from-env' })
+    expect(config.dataset).toMatchObject({
+      enabled: true,
+      dataDir: '/var/lib/mizar',
+      receiveURL: 'https://free.example/dataset/v1/receive',
+      secret: 'from-env',
+      maxBatchBytes: 2048,
+      maxArchiveBytes: 512 * 1024 * 1024,
+    })
+  })
+})

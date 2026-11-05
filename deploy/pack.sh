@@ -63,12 +63,16 @@ cp -R "$ROOT/node_modules/ws" "$STAGE/app/node_modules/ws"
 cp "$HERE/README.md" "$STAGE/README.md"
 cp "$HERE/install.sh" "$STAGE/install.sh"
 cp "$HERE/nginx-websocket.conf" "$STAGE/nginx-websocket.conf"
+cp "$HERE/nginx-dataset.conf" "$STAGE/nginx-dataset.conf"
+cp "$HERE/dataset-flush.sh" "$STAGE/dataset-flush.sh"
+cp "$HERE/dsh-mizar-dataset-flush.service" "$STAGE/dsh-mizar-dataset-flush.service"
+cp "$HERE/dsh-mizar-dataset-flush.timer" "$STAGE/dsh-mizar-dataset-flush.timer"
 cp "$DOC" "$STAGE/DEPLOYMENT-FULL.md"
 # The bundle's own file list, with the version it was cut at.
 sed "s/v[0-9][0-9.]* — 文件说明/v$VERSION — 文件说明/" "$HERE/文件说明.txt" > "$STAGE/文件说明.txt"
 
 chmod 600 "$STAGE/app/relay.config.json"
-chmod +x "$STAGE/install.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/dataset-flush.sh"
 
 mkdir -p "$OUT"
 rm -f "$OUT/dsh-mizar-relay-$VERSION.tar.gz"

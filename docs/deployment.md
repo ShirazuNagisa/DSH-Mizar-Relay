@@ -1525,3 +1525,76 @@ identities, and inventing `ip:` rows would corrupt the account relay's view. The
 address meter lives in memory, and `quota.ip` plus `anomalies` in `/healthz` plus
 the log are its whole surface. That is the honest surface: it answers "where is
 the bandwidth going", not "who is spending it".
+
+### 11.12 Anonymous session dataset (opt-in, both roles)
+
+AGI Mizar offers an onboarding switch (default on, removable) that shares the
+last twelve months of finished turns, anonymised on the computer. The account
+relay accepts the batches; at 04:00 local time it ships one archive to the free
+relay and deletes its cache only after the free relay acknowledges the sha256.
+The free relay keeps the archive for Mizarllm training.
+
+**Config.** Add a block to the deployment's `relay.config.json`. Role 1 needs
+`receiveURL` and the secret; role 0 needs only the secret. `MIZAR_DATASET_SECRET`
+overrides the file, which is the recommended way to keep the shared secret out of
+a config that gets copied between machines.
+
+```json
+"dataset": {
+  "enabled": true,
+  "dataDir": "/www/wwwroot/dsh-mizar-relay/data",
+  "receiveURL": "https://dshmizar.shirazu-nagisa.com/dataset/v1/receive",
+  "secret": ""
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` when the block exists | Serve this role's endpoint |
+| `dataDir` | `./data` | `dataset/incoming`, `archive`, `extracted`, `receive` live under it |
+| `receiveURL` | `""` | Role 1 only: the free relay's `/dataset/v1/receive` |
+| `secret` | `""` | HMAC key shared by both roles |
+| `maxBatchBytes` | `1048576` | Largest desktop batch |
+| `maxArchiveBytes` | `536870912` | Largest daily archive |
+
+**Endpoints.** `POST /dataset/v1/ingest` exists only on a role-1 relay with
+`accounts.enabled: true`. On the production pair that is the 443 relay
+(`dsh-mizar-relay.service`), not the 8443 account gateway
+(`dsh-mizar-relay-account`), which keeps no account store and only verifies and
+proxies sessions upstream. The desktop points at 443 by default and can be moved
+with `MIZAR_DATASET_URL`. The ingest handler it authenticates the desktop's account session token, stores
+`incoming/<UTC-day>/<batchId>.ndjson` plus a `.meta.json`, and never stores the
+account id, device id, token hash or address. `POST /dataset/v1/receive` exists
+only on a role-0 relay; it authenticates an HMAC over
+`<timestamp>.<sha256(body)>` and refuses clocks more than five minutes apart.
+
+**nginx.** Include [`deploy/nginx-dataset.conf`](../deploy/nginx-dataset.conf) in
+the free relay's server block. The body is streamed (`proxy_request_buffering
+off`) because a morning's archive can be hundreds of megabytes; ingest stays under
+the existing 2 MiB location.
+
+**The timer.** In the source tree these files are under `deploy/`; in the
+unpacked bundle they sit at the bundle root. Run this from the bundle root:
+
+```sh
+install -m 644 dsh-mizar-dataset-flush.service /etc/systemd/system/
+install -m 644 dsh-mizar-dataset-flush.timer   /etc/systemd/system/
+install -m 755 dataset-flush.sh               /www/wwwroot/dsh-mizar-relay/
+systemctl daemon-reload
+systemctl enable --now dsh-mizar-dataset-flush.timer
+systemctl list-timers dsh-mizar-dataset-flush.timer --no-pager
+```
+
+`OnCalendar` uses the server's local timezone; check `timedatectl` and change it
+if the machine is not on Asia/Shanghai. A failed transfer exits non-zero and
+leaves every batch in place, so the next day is a retry, not a loss. The archive
+is `dataset-YYYYMMDD-HHMMSS.tar.gz` containing `manifest.json` and `batches/`.
+
+**What is deliberately absent.** There is no delete-by-account path: the account
+is not stored with the data, so the server has no row to find. Turning the switch
+off stops future uploads; the settings page and the privacy policy say exactly
+that rather than promising a deletion the architecture cannot honour.
+
+**Disk.** A turn is roughly 2–5 KB; the free relay's 40 GB disk holds years of
+turns at realistic opt-in rates. If `MAX_ARCHIVE` or the disk fills, the receiver
+answers 413 and the sender keeps its cache — the failure is safe by construction.

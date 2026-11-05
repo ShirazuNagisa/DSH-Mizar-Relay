@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily 04:00 flush of anonymous dataset batches
+Documentation=https://github.com/ShirazuNagisa/DSH-Mizar
+
+[Timer]
+# Local server time. On both production relays that is Asia/Shanghai; check with
+# `timedatectl` before assuming this fires at 04:00 China time.
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=dsh-mizar-dataset-flush.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=AGI Mizar dataset flush (anonymous turns, account relay -> free relay)
+Documentation=https://github.com/ShirazuNagisa/DSH-Mizar
+After=network-online.target dsh-mizar-relay.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/www/wwwroot/dsh-mizar-relay/dataset-flush.sh
+User=root
+Nice=10
+IOSchedulingClass=idle
+# One run must not outlive the next day's timer. A transfer that cannot finish in
+# an hour is a network problem the next run retries; the batches are still there.
+TimeoutStartSec=3600

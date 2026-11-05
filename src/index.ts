@@ -47,6 +47,8 @@ import {
   type RelayConfig,
 } from './config.js'
 import { FcmClient } from './fcm.js'
+import { handleDatasetIngest } from './dataset/ingest.js'
+import { handleDatasetReceive } from './dataset/receive.js'
 import { parseJsonObject, readBody, writeJson } from './http.js'
 import { handleMailRequest, MAIL_PATH } from './mail/api.js'
 import { MailClient } from './mail/client.js'
@@ -903,6 +905,43 @@ export async function startRelay(
     // computer. The paths are reserved whether or not this relay serves them, so
     // a free relay answers 404 instead of leaking the request into a room.
     const parsedUrl = new URL(url, 'http://relay.invalid')
+    // The anonymous dataset. Both paths are reserved on every deployment: a
+    // relay that does not serve them answers 404 instead of letting the request
+    // fall through to a room.
+    if (parsedUrl.pathname === '/dataset/v1/ingest') {
+      const dataset = config.dataset ?? null
+      if (dataset?.enabled !== true || config.role !== 1 || accountStore === null) {
+        writeJson(response, 404, { error: 'not found' })
+      } else if (request.method !== 'POST') {
+        response.setHeader('allow', 'POST')
+        writeJson(response, 405, { error: 'method not allowed' })
+      } else {
+        await handleDatasetIngest(request, response, {
+          store: accountStore,
+          dataDir: dataset.dataDir,
+          maxBatchBytes: dataset.maxBatchBytes,
+          log,
+        })
+      }
+      return
+    }
+    if (parsedUrl.pathname === '/dataset/v1/receive') {
+      const dataset = config.dataset ?? null
+      if (dataset?.enabled !== true || config.role !== 0) {
+        writeJson(response, 404, { error: 'not found' })
+      } else if (request.method !== 'POST') {
+        response.setHeader('allow', 'POST')
+        writeJson(response, 405, { error: 'method not allowed' })
+      } else {
+        await handleDatasetReceive(request, response, {
+          dataDir: dataset.dataDir,
+          secret: dataset.secret,
+          maxArchiveBytes: dataset.maxArchiveBytes,
+          log,
+        })
+      }
+      return
+    }
     if (parsedUrl.pathname.startsWith('/account/v1/')) {
       if (accountApi !== null) {
         await accountApi.handle(request, response, parsedUrl)

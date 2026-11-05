@@ -110,6 +110,16 @@ export interface RelayConfig {
    */
   readonly accounts: AccountsConfig | null
   /**
+   * Anonymous session-data sharing, or `null` when this relay takes no part.
+   *
+   * The account relay (role 1) accepts batches at `/dataset/v1/ingest` and
+   * flushes them to the free relay at 04:00. The free relay (role 0) accepts
+   * that daily archive at `/dataset/v1/receive` and keeps it for training. A
+   * relay with no block does neither, which is the right default: the feature
+   * is an operator decision, not something a version upgrade turns on.
+   */
+  readonly dataset?: DatasetConfig | null
+  /**
    * Data-plane abuse limits. Optional on the type so a hand-written config or
    * an older test fixture keeps compiling; `loadConfig` always fills it, and
    * {@link resolveAbuse} fills the defaults when a caller left it out.
@@ -308,6 +318,66 @@ export const DEFAULT_ABUSE: AbuseLimits = {
   trafficAlertBytesPerDay: 500 * 1024 * 1024,
   trafficAlertBytesPerDayPaid: 5 * 1024 * 1024 * 1024,
   trafficAlertGrowthFactor: 8,
+}
+
+/** How this relay takes part in anonymous session-data sharing. */
+export interface DatasetConfig {
+  /** Whether the role's endpoint is served. */
+  readonly enabled: boolean
+  /** Where cached batches (role 1) or received archives (role 0) live. */
+  readonly dataDir: string
+  /** Role 1: where the 04:00 flush posts its archive. */
+  readonly receiveURL: string
+  /** Shared HMAC secret: role 1 signs, role 0 verifies. */
+  readonly secret: string
+  /** Largest batch a desktop may POST, in bytes. */
+  readonly maxBatchBytes: number
+  /** Largest daily archive role 0 will accept, in bytes. */
+  readonly maxArchiveBytes: number
+}
+
+/**
+ * The `dataset` block as it appears in the config file; every field optional so
+ * an operator can set only what differs from the defaults.
+ */
+interface DatasetFileConfig {
+  readonly enabled?: boolean
+  readonly dataDir?: string
+  readonly receiveURL?: string
+  readonly secret?: string
+  readonly maxBatchBytes?: number
+  readonly maxArchiveBytes?: number
+}
+
+/**
+ * Resolve the dataset block.
+ *
+ * Secrets come from the environment first, for the same reason mail does: the
+ * config file is a deployment artefact that gets copied between machines, and a
+ * shared HMAC secret in it is one more copy to leak. An absent block is `null`
+ * -- not "enabled with defaults" -- so upgrading a relay never starts accepting
+ * user content by itself.
+ */
+function readDataset(
+  env: NodeJS.ProcessEnv,
+  file: DatasetFileConfig | null,
+): DatasetConfig | null {
+  if (file === null) return null
+  const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
+    fromEnv !== undefined && fromEnv !== '' ? (fromEnv as unknown as T) : (fromFile ?? fallback)
+  const enabled = flag(pick(env['MIZAR_DATASET_ENABLED'], file.enabled, true))
+  return {
+    enabled,
+    dataDir: pick(env['MIZAR_DATASET_DIR'], file.dataDir, './data'),
+    receiveURL: pick(env['MIZAR_DATASET_RECEIVE_URL'], file.receiveURL, ''),
+    secret: pick(env['MIZAR_DATASET_SECRET'], file.secret, ''),
+    maxBatchBytes: Number(
+      pick(env['MIZAR_DATASET_MAX_BATCH'], file.maxBatchBytes, 1 * 1024 * 1024),
+    ),
+    maxArchiveBytes: Number(
+      pick(env['MIZAR_DATASET_MAX_ARCHIVE'], file.maxArchiveBytes, 512 * 1024 * 1024),
+    ),
+  }
 }
 
 /** What the account service needs to run. */
@@ -511,6 +581,7 @@ export function loadConfig(
     fcm: readFcm(env, (file.fcm ?? null) as FcmFileConfig | null),
     role,
     accounts: readAccounts(env, (file.accounts ?? null) as AccountsFileConfig | null, role),
+    dataset: readDataset(env, (file.dataset ?? null) as DatasetFileConfig | null),
     abuse: readAbuse(env, (file.abuse ?? null) as AbuseFileConfig | null),
     mail: readMail(env, (file.mail ?? null) as MailFileConfig | null),
   }

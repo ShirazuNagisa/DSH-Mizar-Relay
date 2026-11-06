@@ -11,9 +11,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { startRelay, type Relay } from '../src/index.js'
+import { startRelay, type Relay, type RelayDependencies } from '../src/index.js'
 import type { RelayConfig } from '../src/config.js'
 import { hashPassword } from '../src/accounts/passwords.js'
+import { generateLanCA } from '../src/accounts/lan.js'
 import {
   APPSTORE_NOW,
   APPSTORE_TEST_ROOT,
@@ -82,11 +83,15 @@ function config(overrides: Partial<RelayConfig> = {}): RelayConfig {
   }
 }
 
-async function boot(overrides: Partial<RelayConfig> = {}): Promise<string> {
+async function boot(
+  overrides: Partial<RelayConfig> = {},
+  deps: RelayDependencies = {},
+): Promise<string> {
   relay = await startRelay(config(overrides), () => undefined, {
     now: () => NOW,
     passwordParams: FAST,
     appstoreRoots: [APPSTORE_TEST_ROOT],
+    ...deps,
   })
   return `http://127.0.0.1:${relay.port}`
 }
@@ -213,6 +218,24 @@ describe('registration and login', () => {
     expect(connect.status).toBe(200)
     expect(connect.body['token']).toBe('mz_issued_for_phone')
     expect(connect.body['room']).toBe(room)
+
+    // A desktop peer is a paid capability; this account is still free.
+    const peerOnFree = await fetch(`${base}/account/v1/connect`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${macToken}`,
+        'x-mizar-client-id': 'device-0002',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ deviceId: 'device-0002', engine: 'dsh', kind: 'peer' }),
+    })
+    expect(peerOnFree.status).toBe(402)
+    expect(((await peerOnFree.json()) as Record<string, unknown>)['error']).toBe('PAID_REQUIRED')
+
+    // A phone still uses the free path, even when the target is a desktop.
+    const phoneConnect = await json(base, '/account/v1/connect', { deviceId: 'device-0002' }, token)
+    expect(phoneConnect.status).toBe(200)
+    expect(phoneConnect.body['token']).toBe('mz_issued_for_phone')
 
     // A device that is not on this account is refused.
     const stranger = await json(base, '/account/v1/connect', { deviceId: 'device-9' }, token)
@@ -519,3 +542,177 @@ async function connectFakeHost(base: string): Promise<string> {
   })
   return welcome.room
 }
+
+
+describe('LAN device certificates', () => {
+  it('signs a desktop certificate the Rust verifier can check', async () => {
+    const ca = generateLanCA()
+    const base = await boot({}, { lanCA: ca })
+    const { token } = await register(base)
+    const mac = await json(base, '/account/v1/login', {
+      identifier: 'shirazu',
+      password: 'correct horse battery',
+      device: {
+        id: 'device-0002', name: 'Mac mini', model: 'Mac', platform: 'macos',
+        appVersion: '0.1.0',
+      },
+    })
+    expect(mac.status).toBe(200)
+    const macToken = String(mac.body['token'])
+    const keys = {
+      ed25519Public: Buffer.alloc(32, 1).toString('base64'),
+      x25519Public: Buffer.alloc(32, 2).toString('base64'),
+    }
+    const response = await fetch(`${base}/account/v1/lan/certificate`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${macToken}`,
+        'x-mizar-client-id': 'device-0002',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(keys),
+    })
+    expect(response.status).toBe(200)
+    const issued = (await response.json()) as {
+      body: Record<string, unknown>
+      signature: string
+    }
+    const me = await fetch(`${base}/account/v1/me`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    const accountId = ((await me.json()) as { user: { id: string } }).user.id
+    expect(issued.body['accountId']).toBe(accountId)
+    expect(issued.body['deviceId']).toBe('device-0002')
+    expect(issued.body['expiresAt']).toBeGreaterThan(NOW)
+    const { verify } = await import('node:crypto')
+    expect(
+      verify(
+        null,
+        Buffer.from(JSON.stringify(issued.body)),
+        ca.publicKey,
+        Buffer.from(issued.signature, 'base64'),
+      ),
+    ).toBe(true)
+
+    // A different device id is not silently signed for this caller.
+    const other = await fetch(`${base}/account/v1/lan/certificate`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${macToken}`,
+        'x-mizar-client-id': 'device-9999',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(keys),
+    })
+    expect(other.status).toBe(404)
+
+    // A phone is not a LAN desktop.
+    const phone = await fetch(`${base}/account/v1/lan/certificate`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-mizar-client-id': 'device-0001',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(keys),
+    })
+    expect(phone.status).toBe(403)
+  })
+
+  it('answers 503 when the relay has no CA', async () => {
+    const base = await boot()
+    const { token } = await register(base)
+    const response = await fetch(`${base}/account/v1/lan/certificate`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-mizar-client-id': 'device-0001',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        ed25519Public: Buffer.alloc(32, 1).toString('base64'),
+        x25519Public: Buffer.alloc(32, 2).toString('base64'),
+      }),
+    })
+    expect(response.status).toBe(503)
+    expect(((await response.json()) as Record<string, unknown>)['error']).toBe('LAN_NOT_CONFIGURED')
+  })
+})
+
+
+describe('paid desktop peers', () => {
+  it('provisions a peer after an invite makes the account paid', async () => {
+    const base = await boot()
+    const { token } = await register(base)
+    const mac = await json(base, '/account/v1/login', {
+      identifier: 'shirazu',
+      password: 'correct horse battery',
+      device: {
+        id: 'device-0002', name: 'Mac mini', model: 'Mac', platform: 'macos',
+        appVersion: '0.1.0',
+      },
+    })
+    expect(mac.status).toBe(200)
+    const macToken = String(mac.body['token'])
+
+    // An admin invite is the supported way to grant paid days in this fixture.
+    const cookie = await adminLogin(base)
+    const csrf = await csrfFor(base, cookie)
+    const invite = await fetch(`${base}/admin/invites`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
+      body: new URLSearchParams({ _csrf: csrf, code: 'MZ-PAIDPEER', days: '30', maxUses: '1' }),
+      redirect: 'manual',
+    })
+    expect(invite.status).toBe(303)
+    const redeem = await json(base, '/account/v1/invite/redeem', { code: 'MZ-PAIDPEER' }, token)
+    expect(redeem.status).toBe(200)
+    expect((redeem.body['user'] as Record<string, unknown>)['plan']).toBe('paid')
+
+    const socket = new WebSocket(`${base.replace('http', 'ws')}/tunnel`, {
+      headers: {
+        authorization: 'Bearer account-test-token',
+        'x-mizar-session': macToken,
+        'x-mizar-client-id': 'device-0002',
+      },
+    })
+    const welcome = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      socket.once('message', (data: Buffer) => resolve(JSON.parse(data.toString('utf8'))))
+      socket.once('error', reject)
+    })
+    const room = String(welcome['room'])
+    let provision: Record<string, unknown> | null = null
+    socket.on('message', (data: Buffer) => {
+      const frame = JSON.parse(data.toString('utf8')) as { t?: string; id?: string; peer?: boolean }
+      if (frame.t === 'provision' && typeof frame.id === 'string') {
+        provision = frame as Record<string, unknown>
+        socket.send(JSON.stringify({ t: 'provision-result', id: frame.id, token: 'mz_paid_peer' }))
+      }
+    })
+    // Wait until presence lists the desktop.
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const listed = await fetch(`${base}/account/v1/desktops`, {
+        headers: { authorization: `Bearer ${token}` },
+      })
+      const body = (await listed.json()) as { desktops?: Record<string, unknown>[] }
+      if (body.desktops?.[0]?.['online'] === true) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    const connect = await fetch(`${base}/account/v1/connect`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${macToken}`,
+        'x-mizar-client-id': 'device-0002',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ deviceId: 'device-0002', engine: 'dsh', kind: 'peer' }),
+    })
+    expect(connect.status).toBe(200)
+    const answer = (await connect.json()) as Record<string, unknown>
+    expect(answer['room']).toBe(room)
+    expect(answer['token']).toBe('mz_paid_peer')
+    expect(provision).not.toBeNull()
+    expect((provision as unknown as Record<string, unknown>)['peer']).toBe(true)
+    socket.close()
+  })
+})

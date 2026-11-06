@@ -236,6 +236,7 @@ export class Tunnel {
     phoneDeviceId: string,
     phoneName: string,
     engine?: string,
+    peer = false,
   ): Promise<string> {
     if (this.#closed) throw new TunnelGoneError()
 
@@ -257,6 +258,7 @@ export class Tunnel {
           phoneDeviceId,
           phoneName,
           ...(engine === undefined || engine === '' ? {} : { engine }),
+          ...(peer ? { peer: true } : {}),
         })
       ) {
         clearTimeout(timer)

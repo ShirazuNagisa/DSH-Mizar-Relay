@@ -18,6 +18,7 @@ import { hashToken, validateDevice, validateEmail, validatePassword, validateUse
 import { AccountError, type DeviceInput, type GitHubIdentity } from './types.js'
 import type { VerificationCodes } from './verification.js'
 import { RateWindow } from './rate.js'
+import { issueLanCertificate, LanCertificateError, type LanCA } from './lan.js'
 import { GitHubOAuth, escape, githubBoundPage, githubDonePage, githubErrorPage } from './github.js'
 import { readBody, writeJson, writeHtml, redirect, parseJsonObject, stringField } from '../http.js'
 
@@ -65,6 +66,8 @@ export interface AccountApiOptions {
   readonly mail?: MailClient | null
   /** Appeal address printed on `ACCOUNT_DISABLED`. */
   readonly contact?: string
+  /** The account CA that signs LAN device certificates; absent disables LAN. */
+  readonly lanCA?: LanCA | null
   /**
    * Which of an account's devices currently have a tunnel, by device id → room.
    *
@@ -78,7 +81,12 @@ export interface AccountApiOptions {
     readonly provision: (
       userId: string,
       hostDeviceId: string,
-      phone: { readonly id: string; readonly name: string; readonly engine?: string },
+      phone: {
+        readonly id: string
+        readonly name: string
+        readonly engine?: string
+        readonly peer?: boolean
+      },
     ) => Promise<{ readonly room: string; readonly token: string } | null>
   }
 }
@@ -142,6 +150,7 @@ export class AccountApi {
   readonly #mail: MailClient | null
   readonly #contact: string
   readonly #hosts: AccountApiOptions['hosts']
+  readonly #lanCA: LanCA | null
   /** Password-reset starts, per address; a reset is a mail-bombing surface too. */
   readonly #resetWindow = new RateWindow(5, 60 * 60_000)
 
@@ -155,6 +164,8 @@ export class AccountApi {
     this.#mail = options.mail ?? null
     this.#contact = options.contact ?? 'shirazunagisa@icloud.com'
     this.#hosts = options.hosts
+    this.#lanCA = options.lanCA ?? null
+    this.#lanCA = options.lanCA ?? null
     this.#appleWeb = options.appleWeb ?? null
     this.#appleCallbackURL =
       options.publicBaseURL === undefined
@@ -244,6 +255,9 @@ export class AccountApi {
           break
         case 'POST /connect':
           await this.#connect(context)
+          break
+        case 'POST /lan/certificate':
+          await this.#lanCertificate(context)
           break
         case 'POST /logout':
           await this.#logout(context)
@@ -648,15 +662,81 @@ export class AccountApi {
     const phoneId = deviceIdOf(context.request) ?? 'phone'
     const phone = user.devices.find((device) => device.id === phoneId)
     const engine = typeof body.engine === 'string' ? body.engine : ''
+    const requestedPeer = body['kind'] === 'peer'
+    if (requestedPeer && phone !== undefined && phone.platform === 'ios') {
+      throw new AccountError('PEER_REQUIRES_DESKTOP', 'a phone cannot act as a peer', 403)
+    }
+    // A desktop caller is a peer even if an older client forgets `kind`: the
+    // distinction is what lets the target apply peer scope and what gates WAN
+    // behind the paid plan. A phone caller keeps the existing free path.
+    const peer = requestedPeer || (phone !== undefined && phone.platform !== 'ios')
+    if (peer && user.plan !== 'paid') {
+      throw new AccountError(
+        'PAID_REQUIRED',
+        'remote delegation over the relay requires the paid plan',
+        402,
+      )
+    }
     const issued = await this.#hosts?.provision(user.id, deviceId, {
       id: phoneId,
       name: phone?.name ?? 'Phone',
       engine,
+      peer,
     })
     if (issued === null || issued === undefined) {
       throw new AccountError('DESKTOP_OFFLINE', 'that computer is not connected', 409)
     }
     writeJson(context.response, 200, { room: issued.room, token: issued.token })
+  }
+
+  /**
+   * Sign one LAN device certificate.
+   *
+   * The caller proves the account session and the device id; the body carries
+   * the two public keys the Noise handshake will use. Nothing secret is stored
+   * by the relay, and the private keys never leave the device.
+   */
+  async #lanCertificate(context: RequestContext): Promise<void> {
+    const ca = this.#lanCA
+    if (ca === null) {
+      throw new AccountError(
+        'LAN_NOT_CONFIGURED',
+        'this relay has no account CA for LAN certificates',
+        503,
+      )
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const token = bearer(context.request)
+    const deviceId = deviceIdOf(context.request)
+    if (deviceId === null) {
+      throw new AccountError('INVALID_INPUT', 'x-mizar-client-id is required', 400)
+    }
+    const user = await this.#store.me(token, deviceId)
+    const device = user.devices.find((entry) => entry.id === deviceId)
+    if (device === undefined) {
+      throw new AccountError('NO_SUCH_DEVICE', 'that device is not on this account', 404)
+    }
+    if (device.platform === 'ios') {
+      throw new AccountError('LAN_REQUIRES_DESKTOP', 'LAN certificates are for desktops', 403)
+    }
+    let issued
+    try {
+      issued = issueLanCertificate(
+        ca,
+        user.id,
+        deviceId,
+        body['ed25519Public'],
+        body['x25519Public'],
+        this.#now(),
+      )
+    } catch (error) {
+      if (error instanceof LanCertificateError) {
+        throw new AccountError(error.code, error.message, error.status)
+      }
+      throw error
+    }
+    writeJson(context.response, 200, issued)
   }
 
   async #me(context: RequestContext): Promise<void> {

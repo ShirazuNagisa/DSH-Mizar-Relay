@@ -95,6 +95,8 @@ export interface TunnelProvision {
   readonly phoneDeviceId: string
   /** What the computer's device list should call the phone. */
   readonly phoneName: string
+  /** True when the caller is another desktop, not a phone. */
+  readonly peer?: boolean
 }
 
 /** The computer's answer to {@link TunnelProvision}. */

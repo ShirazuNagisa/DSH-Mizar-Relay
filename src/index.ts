@@ -48,6 +48,7 @@ import {
 } from './config.js'
 import { FcmClient } from './fcm.js'
 import { handleDatasetIngest } from './dataset/ingest.js'
+import { lanCaFromEnvironment, type LanCA } from './accounts/lan.js'
 import { handleDatasetReceive } from './dataset/receive.js'
 import { parseJsonObject, readBody, writeJson } from './http.js'
 import { handleMailRequest, MAIL_PATH } from './mail/api.js'
@@ -104,6 +105,8 @@ export interface RelayDependencies {
   readonly fetchImpl?: typeof fetch
   readonly passwordParams?: import('./accounts/passwords.js').ScryptParams
   readonly appstoreRoots?: readonly string[]
+  /** The account CA for LAN device certificates; absent leaves LAN off. */
+  readonly lanCA?: LanCA | null
 }
 
 /** The headers worth carrying to the computer: everything that describes the request. */
@@ -711,9 +714,22 @@ export async function startRelay(
     const phoneId = clientIdOf(request) ?? 'phone'
     const phone = (user.devices ?? []).find((device) => device.id === phoneId)
     const engine = typeof body?.engine === 'string' ? body.engine : undefined
+    const requestedPeer = body?.kind === 'peer'
+    if (requestedPeer && phone !== undefined && phone.platform === 'ios') {
+      writeJson(response, 403, { error: 'PEER_REQUIRES_DESKTOP', message: 'a phone cannot act as a peer' })
+      return
+    }
+    const peer = requestedPeer || (phone !== undefined && phone.platform !== 'ios')
+    if (peer && user.plan !== 'paid') {
+      writeJson(response, 402, {
+        error: 'PAID_REQUIRED',
+        message: 'remote delegation over the relay requires the paid plan',
+      })
+      return
+    }
     const room = [...hostPresence.entries()].find(([, entry]) => entry === host)?.[0] ?? ''
     try {
-      const token = await host.tunnel.provision(user.id, phoneId, phone?.name ?? 'Phone', engine)
+      const token = await host.tunnel.provision(user.id, phoneId, phone?.name ?? 'Phone', engine, peer)
       writeJson(response, 200, { room, token })
     } catch (error) {
       log(`relay: connect failed — ${error instanceof Error ? error.message : String(error)}`)
@@ -780,6 +796,7 @@ export async function startRelay(
                     phone.id,
                     phone.name,
                     phone.engine,
+                    phone.peer === true,
                   )
                   return { room, token }
                 } catch (error) {
@@ -795,6 +812,7 @@ export async function startRelay(
             },
           },
           notificationsEnabled: accountsConfig?.appstore.notificationsEnabled ?? true,
+          lanCA: deps.lanCA ?? lanCaFromEnvironment(),
           ...(accountsConfig?.github === undefined || accountsConfig.github === null
             ? {}
             : { github: accountsConfig.github }),
@@ -920,6 +938,7 @@ export async function startRelay(
           store: accountStore,
           dataDir: dataset.dataDir,
           maxBatchBytes: dataset.maxBatchBytes,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
           log,
         })
       }

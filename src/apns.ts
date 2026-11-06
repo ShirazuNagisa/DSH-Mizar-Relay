@@ -603,11 +603,26 @@ export class ApnsClient {
    */
   async sendLiveActivityStart(start: ApnsLiveActivityStart): Promise<ApnsResult> {
     const payload = JSON.stringify(buildLiveActivityStartPayload(start, Date.now()))
-    return await this.#deliver(
-      { deviceToken: start.token, environment: start.environment },
-      payload,
-      (freshToken) => this.#liveActivityHeaders(start.token, payload, freshToken),
-    )
+    const target = { deviceToken: start.token, environment: start.environment }
+    let result: ApnsResult = { delivered: false, unregistered: false, status: 0, reason: 'TransportError' }
+    // A start is the one push with no activity token to fall back to. If the
+    // HTTP/2 connection to Apple is reset between the request and the answer,
+    // there is no later update to save the card: the phone stays empty until
+    // somebody opens the app. Retry a transport failure on a fresh session.
+    // A real Apple answer (410, BadDeviceToken, PayloadTooLarge, ...) is not
+    // retried; only the absence of an answer is.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      result = await this.#deliver(
+        target,
+        payload,
+        (freshToken) => this.#liveActivityHeaders(start.token, payload, freshToken),
+      )
+      if (result.delivered || (result.reason !== 'TransportError' && result.reason !== 'Timeout')) {
+        return result
+      }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
+    }
+    return result
   }
 
   /**

@@ -23,6 +23,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
+import { pathToFileURL } from 'node:url'
 import { startStunServer } from './stun.js'
 import { UdpGuard } from './udp-guard.js'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -1955,6 +1956,11 @@ export function main(): void {
 }
 
 // Run when invoked directly, stay importable when a test wants a relay.
-if (process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].split('/').pop() ?? '')) {
+//
+// Compare URLs, not file names: on Windows `process.argv[1]` is
+// `D:\...\lib\index.js`, so splitting on '/' leaves the whole path and
+// `endsWith` never matches — `node lib/index.js` then exits 0 without
+// listening, which looks exactly like a crashed deploy.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main()
 }

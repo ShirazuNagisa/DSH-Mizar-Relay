@@ -921,6 +921,28 @@ unavailable, logs it once, and keeps serving sessions. A relay that refuses to b
 notification key is missing would take the tunnel down with it, and the tunnel is the part that
 matters.
 
+### 10.2.1 The account relay on `:8443` is a second process
+
+`AGI Mizar` and the iOS account client both default to
+`https://dshmizar-1.shirazu-nagisa.com:8443`, which is served by the
+`dsh-mizar-relay-account` unit (loopback `:8797`), **not** by the `:443`
+production unit. They have separate `relay.config.json` files.
+
+If the `:8443` config has no `apns` block, `/healthz` there says `push:false`
+and every notification/Live Activity push is silently discarded: the computer
+still reports sessions, the phone still reads history, but no card can start or
+end without the app being opened. Copy the `apns` block from the `:443` config
+(or create a second APNs key) into the account relay config, keep the file
+`0600`, restart `dsh-mizar-relay-account`, and verify:
+
+```sh
+curl -s http://127.0.0.1:8797/healthz
+# {"ok":true,...,"push":true,...,"pushDevices":N}
+```
+
+A relay restart clears push registrations; the phone must connect once
+afterwards so it can re-register its alert and Live Activity tokens.
+
 ### 10.3 Serving Android phones (FCM)
 
 An Android phone registers a **different kind of token**, and it is not hex: it is a long opaque

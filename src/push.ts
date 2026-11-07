@@ -293,6 +293,14 @@ export class PushRegistry {
       this.#rooms.set(room, devices)
     }
     if (!devices.has(device.deviceId) && devices.size >= MAX_DEVICES_PER_ROOM) return false
+    // One phone can get a new host-side device id across a reinstall or an
+    // account migration. The alert token is the same physical address; keeping
+    // both records sends every notification twice and can start two Live
+    // Activities. The token is the identity here, not the id the computer just
+    // minted for this launch.
+    for (const [id, existing] of [...devices]) {
+      if (id !== device.deviceId && existing.token === device.token) devices.delete(id)
+    }
     devices.set(device.deviceId, { ...device, registeredAt: Date.now() })
     return true
   }

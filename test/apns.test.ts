@@ -1006,7 +1006,7 @@ describe('the registry', () => {
       expect(
         registry.register('a', {
           deviceId: `p${index}`,
-          token: 'aa',
+          token: `t${index}`,
           platform: 'ios',
           environment: 'sandbox',
           locale: 'en',
@@ -1014,7 +1014,7 @@ describe('the registry', () => {
       ).toBe(true)
     }
     expect(
-      registry.register('a', { deviceId: 'p99', token: 'aa', platform: 'ios', environment: 'sandbox', locale: 'en' }),
+      registry.register('a', { deviceId: 'p99', token: 't99', platform: 'ios', environment: 'sandbox', locale: 'en' }),
     ).toBe(false)
     // Re-registering an existing device is not a new one.
     expect(
@@ -1022,13 +1022,20 @@ describe('the registry', () => {
     ).toBe(true)
   })
 
-  it('forgets every record holding a retired token', () => {
+  it('forgets the record holding a retired token', () => {
+    const registry = new PushRegistry()
+    registry.register('a', { deviceId: 'p1', token: 'aa', platform: 'ios', environment: 'sandbox', locale: 'en' })
+    registry.register('a', { deviceId: 'p2', token: 'bb', platform: 'ios', environment: 'sandbox', locale: 'en' })
+    expect(registry.forgetToken('a', 'aa')).toBe(1)
+    expect(registry.devices('a').map((device) => device.deviceId)).toEqual(['p2'])
+  })
+
+  it('moves an install to a new device id when its Apple token is unchanged', () => {
     const registry = new PushRegistry()
     registry.register('a', { deviceId: 'p1', token: 'aa', platform: 'ios', environment: 'sandbox', locale: 'en' })
     registry.register('a', { deviceId: 'p2', token: 'aa', platform: 'ios', environment: 'sandbox', locale: 'en' })
-    registry.register('a', { deviceId: 'p3', token: 'bb', platform: 'ios', environment: 'sandbox', locale: 'en' })
-    expect(registry.forgetToken('a', 'aa')).toBe(2)
-    expect(registry.devices('a').map((device) => device.deviceId)).toEqual(['p3'])
+    expect(registry.devices('a')).toHaveLength(1)
+    expect(registry.devices('a')[0]?.deviceId).toBe('p2')
   })
 
   it('clears one device\'s activity token, and only while it is still the current one', () => {

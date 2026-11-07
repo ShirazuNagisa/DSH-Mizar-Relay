@@ -285,10 +285,18 @@ export class GitHubOAuth {
  * this page is secret -- the code is single-use, short-lived, and worthless
  * without the device that claims it.
  *
+ * Apple uses the same page (the code, the paste flow and the polling are
+ * provider-agnostic), but the heading has to name the provider the user
+ * actually picked -- an Apple sign-in that says "GitHub 登录成功" reads like the
+ * wrong account got linked.
+ *
  * @param code - the handoff code, `MZ-XXXX-XXXX`.
+ * @param provider - which button started the round-trip; `github` by default so
+ *   existing callers keep their copy.
  * @returns the HTML.
  */
-export function githubDonePage(code: string): string {
+export function githubDonePage(code: string, provider: 'github' | 'apple' = 'github'): string {
+  const label = provider === 'apple' ? 'Apple' : 'GitHub'
   const safe = escape(code)
   return `<!doctype html>
 <html lang="zh-CN">
@@ -315,7 +323,7 @@ export function githubDonePage(code: string): string {
 </head>
 <body>
 <main>
-  <h1>GitHub 登录成功</h1>
+  <h1>${label} 登录成功</h1>
   <p>回到 Mizar 即自动完成登录；若没有跳转，在账户页输入此代码。</p>
   <code>${safe}</code>
   <div class="actions">

@@ -550,7 +550,7 @@ export class AccountApi {
       })
       const handoff = this.#newHandoff(result.user.id, now)
       this.#loginResults.set(state, { code: handoff.code, expiresAt: handoff.expiresAt })
-      writeHtml(context.response, 200, githubDonePage(handoff.code))
+      writeHtml(context.response, 200, githubDonePage(handoff.code, 'apple'))
     } catch (error) {
       fail(
         'APPLE_SIGN_IN_FAILED',

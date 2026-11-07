@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { startRelay, type Relay } from '../src/index.js'
 import { loadConfig, type RelayConfig } from '../src/config.js'
 import { hashPassword } from '../src/accounts/passwords.js'
+import { githubDonePage } from '../src/accounts/github.js'
 
 const NOW = 1_769_000_000_000
 const FAST = { N: 1024, r: 8, p: 1 }
@@ -435,5 +436,25 @@ describe('the github config gate', () => {
     await writeFile(path, JSON.stringify({ accounts: { enabled: true, github: { enabled: true } } }))
     expect(() => loadConfig(path, {})).toThrow(/accounts\.github needs clientId, clientSecret and callbackURL/)
     await rm(cfgDir, { recursive: true, force: true })
+  })
+})
+
+describe('the handoff page', () => {
+  it('names the provider that started the round-trip', () => {
+    const github = githubDonePage('MZ-7Q2K-9WXA')
+    expect(github).toContain('GitHub 登录成功')
+    expect(github).not.toContain('Apple 登录成功')
+
+    // Apple reuses the page; saying "GitHub" made the Apple flow look like it
+    // had linked the wrong account.
+    const apple = githubDonePage('MZ-7Q2K-9WXA', 'apple')
+    expect(apple).toContain('Apple 登录成功')
+    expect(apple).not.toContain('GitHub 登录成功')
+
+    // Both keep the deep link the phones understand (mizar://github/login),
+    // because the clients only parse that spelling.
+    for (const page of [github, apple]) {
+      expect(page).toContain('mizar://github/login?code=MZ-7Q2K-9WXA')
+    }
   })
 })

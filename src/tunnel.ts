@@ -39,8 +39,15 @@ export interface StreamHandlers {
 
 /** A stream opened through the tunnel. */
 export interface TunnelStream {
-  /** Send one message toward the computer. */
-  send(data: Buffer, binary: boolean): void
+  /**
+   * Send one message toward the computer.
+   *
+   * `false` means it did not go: the tunnel is closed, or its write buffer is
+   * over the cap. Callers must not treat that as delivery -- a silently dropped
+   * frame is a phone waiting out a full request timeout, and for an upload
+   * chunk it is "chunk out of order" much later.
+   */
+  send(data: Buffer, binary: boolean): boolean
   /** Close the stream toward the computer. */
   close(code?: number, reason?: string): void
 }
@@ -173,6 +180,14 @@ export class TunnelTimeoutError extends Error {
 /** The transport a room speaks to its computer over. */
 export interface TunnelSocket {
   send(text: string): void
+  /**
+   * Send one binary message, when the host supports framed `ws-msg`.
+   *
+   * Optional so a test double, or a socket that predates the capability, keeps
+   * working: without it the tunnel encodes `ws-msg` as JSON + base64, which is
+   * what every relay did before 0.3.7.
+   */
+  sendBytes?(data: Buffer): void
   close(code?: number, reason?: string): void
   on(event: 'message', listener: (data: Buffer) => void): void
   on(event: 'close', listener: () => void): void
@@ -180,11 +195,68 @@ export interface TunnelSocket {
   readonly bufferedAmount: number
 }
 
+/** The first byte of a binary tunnel frame: a `ws-msg`. */
+export const FRAME_WS_MSG = 0x01
+
+/**
+ * Encode one `ws-msg` as a binary frame.
+ *
+ * The JSON + base64 encoding at 33% overhead and two full passes over every
+ * byte was the largest fixed cost of a history download through the relay, and
+ * it is pure waste on the hop that already knows the payload is a WebSocket
+ * message. A frame is a kind byte, a length-prefixed id, a flags byte and the
+ * payload -- no escaping, no base64, no outer JSON.
+ *
+ * @param id - the tunnel stream id, ASCII and short (`r12`).
+ * @param binary - whether the payload was a binary WebSocket message.
+ * @param payload - the message body.
+ * @returns the bytes to send on the tunnel socket.
+ */
+export function encodeWsMsg(id: string, binary: boolean, payload: Buffer): Buffer {
+  const idBytes = Buffer.from(id, 'utf8')
+  if (idBytes.length > 255) throw new RangeError('a tunnel stream id must fit in one byte')
+  return Buffer.concat([
+    Buffer.from([FRAME_WS_MSG, idBytes.length]),
+    idBytes,
+    Buffer.from([binary ? 1 : 0]),
+    payload,
+  ])
+}
+
+/**
+ * Decode one binary `ws-msg` frame.
+ *
+ * Returns `null` rather than throwing: this runs inside the tunnel's `message`
+ * handler, where one malformed frame from one computer must not take the relay
+ * down for every other room.
+ *
+ * @param data - the frame.
+ * @returns the id, the payload and its kind, or `null`.
+ */
+export function decodeWsMsg(data: Buffer): { id: string; binary: boolean; payload: Buffer } | null {
+  if (data.length < 3 || data[0] !== FRAME_WS_MSG) return null
+  const idLength = data[1]!
+  const start = 2 + idLength
+  if (idLength === 0 || data.length < start + 1) return null
+  const id = data.subarray(2, start).toString('utf8')
+  const binary = data[start] === 1
+  return { id, binary, payload: data.subarray(start + 1) }
+}
+
 /** One computer's tunnel. */
 export class Tunnel {
   readonly #socket: TunnelSocket
   readonly #requestTimeoutMs: number
   readonly #maxBufferedBytes: number
+  /**
+   * Whether this tunnel's host advertised binary `ws-msg` frames.
+   *
+   * Per tunnel, not global: a computer running an older build does not send the
+   * upgrade header, and must keep receiving the JSON + base64 spelling it
+   * understands. A relay newer than the computer is a normal state during a
+   * rollout.
+   */
+  readonly #binary: boolean
   readonly #pendingRequests = new Map<string, PendingRequest>()
   readonly #pendingStreams = new Map<string, PendingStream>()
   readonly #pendingProvisions = new Map<string, PendingProvision>()
@@ -197,15 +269,27 @@ export class Tunnel {
    * @param requestTimeoutMs - how long a request may wait for the computer.
    * @param maxBufferedBytes - drop rather than queue past this, so one slow computer
    *   cannot grow the relay's memory without bound.
+   * @param binary - whether the host advertised binary `ws-msg` frames.
    */
-  constructor(socket: TunnelSocket, requestTimeoutMs: number, maxBufferedBytes = 8 * 1024 * 1024) {
+  constructor(
+    socket: TunnelSocket,
+    requestTimeoutMs: number,
+    maxBufferedBytes = 8 * 1024 * 1024,
+    binary = false,
+  ) {
     this.#socket = socket
     this.#requestTimeoutMs = requestTimeoutMs
     this.#maxBufferedBytes = maxBufferedBytes
+    this.#binary = binary && typeof socket.sendBytes === 'function'
 
-    socket.on('message', (data: Buffer) => this.#receive(data.toString('utf8')))
+    socket.on('message', (data: Buffer) => this.#receive(data))
     socket.on('close', () => this.#failEverything('the tunnel closed'))
     socket.on('error', () => this.#failEverything('the tunnel errored'))
+  }
+
+  /** Whether this tunnel carries `ws-msg` as binary frames. */
+  get binaryFrames(): boolean {
+    return this.#binary
   }
 
   /** Whether this tunnel can still carry traffic. */
@@ -346,6 +430,10 @@ export class Tunnel {
     const id = this.#allocate()
     const timer = setTimeout(() => {
       if (this.#pendingStreams.delete(id)) {
+        // Tell the computer too. Without this the local socket it may still be
+        // dialling has nobody waiting for it, and both ends keep a stream entry
+        // until the whole tunnel reconnects.
+        this.#write({ t: 'ws-close', id, code: 1001, reason: 'the phone went away' })
         handlers.onError('the computer did not accept the stream in time')
       }
     }, this.#requestTimeoutMs)
@@ -362,7 +450,11 @@ export class Tunnel {
 
     return {
       send: (data, binary) => {
-        this.#write({ t: 'ws-msg', id, data: data.toString('base64'), binary })
+        // The frame path that carries every conversation byte. Binary when the
+        // host advertised it: no base64, no outer JSON, one pass over the
+        // payload instead of three.
+        if (this.#binary && this.#writeBytes(encodeWsMsg(id, binary, data))) return true
+        return this.#write({ t: 'ws-msg', id, data: data.toString('base64'), binary })
       },
       close: (code, reason) => {
         const safe = saneCloseCode(code)
@@ -402,9 +494,33 @@ export class Tunnel {
     }
   }
 
+  /** Write one binary frame, refusing rather than queueing past the buffer cap. */
+  #writeBytes(data: Buffer): boolean {
+    if (this.#closed || !this.#binary) return false
+    if (this.#socket.bufferedAmount > this.#maxBufferedBytes) return false
+    try {
+      this.#socket.sendBytes?.(data)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   /** Route one frame from the computer. */
-  #receive(text: string): void {
-    const frame = parseHostFrame(text)
+  #receive(data: Buffer): void {
+    // A binary frame is a `ws-msg` and nothing else; every control frame stays
+    // JSON. A host that did not advertise the capability never sends one, so a
+    // stale build cannot be fed a framing it cannot parse.
+    if (this.#binary && data.length > 0 && data[0] === FRAME_WS_MSG) {
+      const decoded = decodeWsMsg(data)
+      if (decoded === null) return
+      const stream = this.#pendingStreams.get(decoded.id)
+      if (stream === undefined) return
+      stream.onMessage(decoded.payload, decoded.binary)
+      return
+    }
+
+    const frame = parseHostFrame(data.toString('utf8'))
     if (frame === null) return
     const id = (frame as { id?: unknown }).id
     if (typeof id !== 'string') return

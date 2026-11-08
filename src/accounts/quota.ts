@@ -59,6 +59,22 @@ export interface DataQuotaOptions {
   readonly requestsPerMinute: number
   /** Burst allowance for the request bucket; defaults to a small multiple of the rate. */
   readonly burst?: number
+  /**
+   * Sustained bridged frames per minute per identity. `0` disables.
+   *
+   * Deliberately not part of the `abuse` config block: this is a circuit
+   * breaker against a frame flood, not a product limit an operator tunes. A
+   * bridged socket's frames are not requests and used to be priced as if they
+   * were (see {@link DataQuota.carry}), which capped a whole conversation at
+   * five frames a second. This bucket replaces that accident with a bound that
+   * is far above anything a real socket emits -- twenty times the request rate
+   * with a 600/min floor (6000/min at the usual 300) -- and far below what would
+   * cost the relay meaningful CPU. It defaults to disabled when the request rate
+   * is disabled, because "no rate limit" has to mean no rate limit.
+   */
+  readonly framesPerMinute?: number
+  /** Burst allowance for the frame bucket; defaults to a tenth of the rate. */
+  readonly frameBurst?: number
   /** Carried bytes allowed per identity per UTC day. `0` disables the budget. */
   readonly bytesPerDay: number
   /** Identity entries kept; the least recently used are evicted past this. */
@@ -84,6 +100,10 @@ interface QuotaEntry {
   tokens: number
   /** When the bucket was last refilled. */
   refilledAt: number
+  /** Frame tokens left in the bucket. */
+  frameTokens: number
+  /** When the frame bucket was last refilled. */
+  framesRefilledAt: number
   /** The UTC day the byte counters belong to. */
   day: string
   /** Bytes carried today. */
@@ -108,6 +128,8 @@ const MAX_RETRY_AFTER_SECONDS = 3600
 export class DataQuota {
   readonly #requestsPerMinute: number
   readonly #burst: number
+  readonly #framesPerMinute: number
+  readonly #frameBurst: number
   readonly #bytesPerDay: number
   readonly #maxEntries: number
   readonly #now: () => number
@@ -130,6 +152,24 @@ export class DataQuota {
     this.#burst = Math.max(
       2,
       Math.floor(options.burst ?? Math.max(2, this.#requestsPerMinute / 6)),
+    )
+    // Twenty times the request rate with a 600/min floor, and off when the
+    // request rate is off. A frame is much cheaper than a request (no tunnel
+    // round trip), so its bound has to sit well above the request one; 6000/min
+    // at the usual 300 is a hundred a second, which no real socket approaches
+    // and which still costs the relay almost nothing if somebody tries. The
+    // floor keeps a deliberately tight request limit from turning into a
+    // silently tight frame limit.
+    this.#framesPerMinute = Math.max(
+      0,
+      Math.floor(
+        options.framesPerMinute ??
+          (this.#requestsPerMinute === 0 ? 0 : Math.max(600, this.#requestsPerMinute * 20)),
+      ),
+    )
+    this.#frameBurst = Math.max(
+      10,
+      Math.floor(options.frameBurst ?? Math.max(100, this.#framesPerMinute / 10)),
     )
     this.#bytesPerDay = Math.max(0, Math.floor(options.bytesPerDay))
     this.#maxEntries = Math.max(16, options.maxEntries ?? 20_000)
@@ -218,6 +258,76 @@ export class DataQuota {
   }
 
   /**
+   * Whether one WebSocket frame may carry `bytes`.
+   *
+   * A frame is not a request, and charging it one token from the request bucket
+   * is what made a bridged phone socket look like a flood: with the default
+   * 300/min and a burst of 50, a phone could put about five frames a second on
+   * the wire, and every frame past that was dropped in silence (the socket
+   * stayed up, so the request it belonged to waited out its full timeout). A
+   * streamed turn alone emits more than that, and a bounded-parallel sync
+   * multiplies it again -- the limiter, not the uplink, was the ceiling.
+   *
+   * So this checks a **separate, much higher** bucket (see
+   * `DataQuotaOptions.framesPerMinute`) plus the day's bytes. The request bucket
+   * keeps counting what it was built for: HTTP requests and socket upgrades,
+   * each of which buys a tunnel round trip. The frame bucket is a circuit
+   * breaker against a flood of tiny frames, not a product limit -- a real socket
+   * does not approach it.
+   *
+   * @param identity - the traffic ledger's identity key.
+   * @param bytes - payload bytes about to be carried.
+   * @returns the decision. `rate` means the frame flood breaker tripped;
+   *   `budget` means the day's bytes are spent.
+   */
+  carry(identity: string, bytes = 0): QuotaDecision {
+    if (identity === '') return { allowed: true }
+    if (this.#framesPerMinute === 0 && this.#bytesPerDay === 0) return { allowed: true }
+
+    const now = this.#now()
+    const entry = this.#entry(identity, now)
+
+    if (this.#framesPerMinute > 0) {
+      this.#refillFrames(entry, now)
+      if (entry.frameTokens < 1) {
+        this.#refusedRate += 1
+        return {
+          allowed: false,
+          reason: 'rate',
+          retryAfterSeconds: this.#frameRetryAfter(entry, now),
+        }
+      }
+      entry.frameTokens -= 1
+    }
+
+    if (this.#bytesPerDay === 0) {
+      entry.touchedAt = now
+      return { allowed: true }
+    }
+
+    const day = dayKey(now)
+    if (entry.day !== day) {
+      entry.day = day
+      entry.bytes = 0
+      entry.warnedAt = 0
+      entry.exhaustedDay = ''
+    }
+    if (entry.bytes + bytes > this.#bytesPerDay) {
+      this.#refusedBudget += 1
+      this.#warnSpend(identity, entry, now)
+      this.#noteExhausted(identity, entry, now)
+      return {
+        allowed: false,
+        reason: 'budget',
+        retryAfterSeconds: secondsUntilNextDay(now),
+      }
+    }
+    entry.bytes += bytes
+    entry.touchedAt = now
+    return { allowed: true }
+  }
+
+  /**
    * Account bytes already carried, without spending a request token.
    *
    * For the case where the size is only known after the fact -- an HTTP answer
@@ -277,6 +387,8 @@ export class DataQuota {
     const entry: QuotaEntry = {
       tokens: this.#burst,
       refilledAt: now,
+      frameTokens: this.#frameBurst,
+      framesRefilledAt: now,
       day: dayKey(now),
       bytes: 0,
       touchedAt: now,
@@ -306,6 +418,22 @@ export class DataQuota {
     const perMs = this.#requestsPerMinute / 60_000
     if (perMs <= 0) return MAX_RETRY_AFTER_SECONDS
     const deficit = 1 - entry.tokens
+    return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(1, Math.ceil(deficit / perMs / 1000)))
+  }
+
+  /** Refill the frame bucket for the elapsed time. */
+  #refillFrames(entry: QuotaEntry, now: number): void {
+    const perMs = this.#framesPerMinute / 60_000
+    const elapsed = Math.max(0, now - entry.framesRefilledAt)
+    entry.frameTokens = Math.min(this.#frameBurst, entry.frameTokens + elapsed * perMs)
+    entry.framesRefilledAt = now
+  }
+
+  /** Seconds until one frame token exists, capped like the request one. */
+  #frameRetryAfter(entry: QuotaEntry, now: number): number {
+    const perMs = this.#framesPerMinute / 60_000
+    if (perMs <= 0) return MAX_RETRY_AFTER_SECONDS
+    const deficit = 1 - entry.frameTokens
     return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(1, Math.ceil(deficit / perMs / 1000)))
   }
 

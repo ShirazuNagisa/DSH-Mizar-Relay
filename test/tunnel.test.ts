@@ -195,6 +195,24 @@ describe('Tunnel streams', () => {
     expect(tunnel.inFlight).toBe(0)
   })
 
+  it('reports a send the tunnel could not carry instead of dropping it', () => {
+    // A silently dropped frame is the phone waiting out a full request timeout
+    // (or, for an upload, a gap discovered chunks later). `send` has to say so.
+    const socket = new FakeSocket()
+    const tunnel = makeTunnel(socket)
+    const stream = tunnel.openStream('/mizar/v1/ws', {}, {
+      onOpened: vi.fn(),
+      onMessage: vi.fn(),
+      onClose: vi.fn(),
+      onError: vi.fn(),
+    })
+    const openFrame = socket.last()
+    socket.reply({ t: 'ws-open-ok', id: openFrame['id'] })
+    socket.bufferedAmount = 9 * 1024 * 1024
+    expect(stream?.send(Buffer.from('back'), false)).toBe(false)
+    expect(socket.frames().filter((frame) => frame['t'] === 'ws-msg')).toHaveLength(0)
+  })
+
   it('reports a stream the computer never accepted', async () => {
     const socket = new FakeSocket()
     const tunnel = makeTunnel(socket, 20)
@@ -207,6 +225,9 @@ describe('Tunnel streams', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(onError).toHaveBeenCalledWith(expect.stringContaining('did not accept'))
+    // The computer is told too: otherwise the local socket it may still be
+    // dialling keeps a stream nobody can close.
+    expect(socket.frames().some((frame) => frame['t'] === 'ws-close')).toBe(true)
   })
 
   it('drops a stream when the computer reports an error for it', () => {

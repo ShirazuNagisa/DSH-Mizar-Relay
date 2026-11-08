@@ -53,6 +53,92 @@ describe('the request rate', () => {
   })
 })
 
+describe('frames on an open socket', () => {
+  it('does not spend the request bucket', () => {
+    // A bridged WebSocket is one request and many frames. Charging each frame a
+    // request token is what capped a conversation at five frames a second (the
+    // 300/min default) and silently dropped the rest -- the phone then waited
+    // out a full request timeout for an answer that had been discarded.
+    let now = Date.parse('2026-10-20T12:00:00Z')
+    const quota = new DataQuota({
+      requestsPerMinute: 60,
+      burst: 2,
+      bytesPerDay: 0,
+      now: () => now,
+    })
+    quota.admit(ID)
+    quota.admit(ID)
+    // The bucket is empty, yet a hundred frames still move.
+    for (let index = 0; index < 100; index += 1) {
+      expect(quota.carry(ID, 100).allowed).toBe(true)
+    }
+    // And the request meter is untouched: a minute later it refills to the
+    // burst and works exactly as it did before the frames.
+    now += 60_000
+    expect(quota.admit(ID).allowed).toBe(true)
+  })
+
+  it('still refuses a frame that would spend the day', () => {
+    // Bytes are what the operator pays for, so carrying them is not free even
+    // when the frame is not a request.
+    let now = Date.parse('2026-10-20T12:00:00Z')
+    const quota = new DataQuota({ requestsPerMinute: 0, bytesPerDay: 1000, now: () => now })
+    expect(quota.carry(ID, 900).allowed).toBe(true)
+    const refused = quota.carry(ID, 200)
+    expect(refused.allowed).toBe(false)
+    expect(refused.reason).toBe('budget')
+    expect(refused.retryAfterSeconds).toBeGreaterThan(0)
+  })
+
+  it('charges carried bytes, so the next frame sees them', () => {
+    const quota = new DataQuota({ requestsPerMinute: 0, bytesPerDay: 1000 })
+    expect(quota.carry(ID, 600).allowed).toBe(true)
+    // Not refused yet: 600 + 400 is exactly the day.
+    expect(quota.carry(ID, 400).allowed).toBe(true)
+    expect(quota.carry(ID, 1).allowed).toBe(false)
+  })
+
+  it('trips a separate, much higher breaker on a frame flood', () => {
+    // Frames are not requests, so they do not spend the request bucket -- but a
+    // flood of tiny frames still costs the relay CPU, so `carry` has its own
+    // bucket. It has to be far above the request rate (a streamed turn alone
+    // emits several frames a second) and still bounded.
+    let now = Date.parse('2026-10-20T12:00:00Z')
+    const quota = new DataQuota({
+      requestsPerMinute: 60,
+      // Deliberately small for the test: ten frames, then paced.
+      framesPerMinute: 60,
+      frameBurst: 10,
+      bytesPerDay: 0,
+      now: () => now,
+    })
+    for (let index = 0; index < 10; index += 1) {
+      expect(quota.carry(ID, 10).allowed).toBe(true)
+    }
+    const refused = quota.carry(ID, 10)
+    expect(refused.allowed).toBe(false)
+    expect(refused.reason).toBe('rate')
+    expect(refused.retryAfterSeconds).toBeGreaterThan(0)
+    // A minute later the frame bucket has refilled -- and, crucially, the
+    // request bucket was never touched by any of it.
+    now += 60_000
+    expect(quota.carry(ID, 10).allowed).toBe(true)
+    expect(quota.admit(ID).allowed).toBe(true)
+  })
+
+  it('is unlimited when the budget is off', () => {
+    const quota = new DataQuota({
+      requestsPerMinute: 60,
+      burst: 2,
+      framesPerMinute: 0,
+      bytesPerDay: 0,
+    })
+    for (let index = 0; index < 500; index += 1) {
+      expect(quota.carry(ID, 10_000).allowed).toBe(true)
+    }
+  })
+})
+
 describe('the byte budget', () => {
   it('refuses a caller that has spent its day, and forgives it tomorrow', () => {
     let now = Date.parse('2026-10-20T12:00:00Z')

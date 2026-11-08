@@ -3,6 +3,7 @@ import WebSocket from 'ws'
 import { startRelay, type Relay } from '../src/index.js'
 import { DEFAULT_ABUSE, type RelayConfig } from '../src/config.js'
 import { deriveRoom } from '../src/room.js'
+import { decodeWsMsg, encodeWsMsg } from '../src/tunnel.js'
 
 const TOKEN = 'test-tunnel-token'
 const ROOM = deriveRoom(TOKEN)
@@ -42,13 +43,38 @@ class FakeMac {
   readonly room: string
   readonly requests: Array<Record<string, unknown>> = []
   #handler: (frame: Record<string, unknown>) => void = () => undefined
+  /** Whether this tunnel carries `ws-msg` as binary frames. */
+  #binary = false
+  /** How many binary `ws-msg` frames arrived, so a test can prove the framing. */
+  binaryFrames = 0
 
-  private constructor(socket: WebSocket, room: string) {
+  private constructor(socket: WebSocket, room: string, binary: boolean) {
     this.#socket = socket
     this.room = room
+    this.#binary = binary
     socket.on('message', (data: Buffer) => {
+      // A binary frame is a `ws-msg`: decode it into the same shape the JSON
+      // spelling produces, so every handler and assertion below reads one
+      // vocabulary.
+      if (data[0] === 1) {
+        const decoded = decodeWsMsg(data)
+        if (decoded === null) return
+        this.binaryFrames += 1
+        const frame: Record<string, unknown> = {
+          t: 'ws-msg',
+          id: decoded.id,
+          data: decoded.payload.toString('base64'),
+          binary: decoded.binary,
+        }
+        this.requests.push(frame)
+        this.#handler(frame)
+        return
+      }
       const frame = JSON.parse(data.toString('utf8')) as Record<string, unknown>
-      if (frame['t'] === 'welcome') return
+      if (frame['t'] === 'welcome') {
+        this.#binary = frame['wsMsgBinary'] === true
+        return
+      }
       if (frame['t'] === 'ping') {
         socket.send(JSON.stringify({ t: 'pong', id: frame['id'] }))
         return
@@ -56,6 +82,17 @@ class FakeMac {
       this.requests.push(frame)
       this.#handler(frame)
     })
+  }
+
+  /** Send one frame the way this tunnel's negotiation says it should go. */
+  #send(frame: Record<string, unknown>): void {
+    if (this.#binary && frame['t'] === 'ws-msg' && typeof frame['data'] === 'string') {
+      this.#socket.send(
+        encodeWsMsg(String(frame['id']), frame['binary'] === true, Buffer.from(frame['data'], 'base64')),
+      )
+      return
+    }
+    this.#socket.send(JSON.stringify(frame))
   }
 
   static async connect(
@@ -73,21 +110,19 @@ class FakeMac {
         reject(new Error(`upgrade refused with ${response.statusCode}`)),
       )
     })
-    return new FakeMac(socket, String(welcome['room']))
+    return new FakeMac(socket, String(welcome['room']), welcome['wsMsgBinary'] === true)
   }
 
   /** Answer every request with a fixed status and body. */
   respondWith(status: number, body: string, headers: Record<string, string> = {}): void {
     this.#handler = (frame) => {
-      this.#socket.send(
-        JSON.stringify({
+      this.#send({
           t: 'res',
           id: frame['id'],
           status,
           headers: { 'content-type': 'application/json', ...headers },
           body: Buffer.from(body).toString('base64'),
-        }),
-      )
+      })
     }
   }
 
@@ -99,15 +134,24 @@ class FakeMac {
         return
       }
       if (frame['t'] === 'ws-msg') {
-        const text = Buffer.from(String(frame['data']), 'base64').toString('utf8')
-        this.#socket.send(
-          JSON.stringify({
+        const payload = Buffer.from(String(frame['data']), 'base64')
+        if (frame['binary'] === true) {
+          // The state channel's frames are binary and start with 0x53; echo the
+          // bytes unchanged so a test can prove the kind survived.
+          this.#send({
             t: 'ws-msg',
             id: frame['id'],
-            data: Buffer.from(`echo:${text}`).toString('base64'),
-            binary: false,
-          }),
-        )
+            data: payload.toString('base64'),
+            binary: true,
+          })
+          return
+        }
+        this.#send({
+          t: 'ws-msg',
+          id: frame['id'],
+          data: Buffer.from(`echo:${payload.toString('utf8')}`).toString('base64'),
+          binary: false,
+        })
       }
     }
   }
@@ -310,6 +354,66 @@ describe('relay tunnel admission', () => {
 })
 
 describe('relay WebSocket bridging', () => {
+  it('carries ws-msg as binary frames when the computer advertises it', async () => {
+    // The JSON + base64 spelling costs 33% and two extra passes over every byte
+    // of a history page. A computer new enough to say it reads framed `ws-msg`
+    // gets the payload straight; the phone must see exactly what it saw before,
+    // because this changes the tunnel's framing, not the wire the phone speaks.
+    relay = await startRelay(config(), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`, TOKEN, {
+      'x-mizar-tunnel-frames': 'binary',
+    })
+    mac.echoStreams()
+
+    const phone = new WebSocket(`ws://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/ws`)
+    await new Promise<void>((resolve, reject) => {
+      phone.once('open', () => resolve())
+      phone.once('error', reject)
+    })
+    const reply = new Promise<string>((resolve) => {
+      phone.once('message', (data: Buffer) => resolve(data.toString('utf8')))
+    })
+    phone.send('history page')
+    expect(await reply).toBe('echo:history page')
+    // The host received the phone's frame, not a base64 blob: the bridge
+    // decoded the tunnel framing before handing it the payload.
+    expect(mac.binaryFrames).toBeGreaterThan(0)
+    const streamFrame = mac.requests.find((frame) => frame['t'] === 'ws-msg')
+    expect(streamFrame).toBeDefined()
+    expect(Buffer.from(String(streamFrame?.['data']), 'base64').toString('utf8')).toBe('history page')
+    phone.close()
+  })
+
+  it('carries a binary state frame end to end without changing its kind', async () => {
+    // The live state channel is binary (first byte 0x53, then a session id and a
+    // state frame). The relay's bridge must not turn it into text, and the
+    // binary tunnel framing must keep its flags: a phone that got these bytes as
+    // a text message would close the socket, not draw a progress line.
+    relay = await startRelay(config(), () => undefined)
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`, TOKEN, {
+      'x-mizar-tunnel-frames': 'binary',
+    })
+    mac.echoStreams()
+
+    const phone = new WebSocket(`ws://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/ws`)
+    await new Promise<void>((resolve, reject) => {
+      phone.once('open', () => resolve())
+      phone.once('error', reject)
+    })
+
+    // The envelope the desktop puts on the wire: length-prefixed session id,
+    // then the state frame.
+    const state = Buffer.from([0x53, 0x03, 0x73, 0x31, 0x00, 0x01, 0x02, 0x03])
+    const reply = new Promise<{ data: Buffer; binary: boolean }>((resolve) => {
+      phone.once('message', (data: Buffer, isBinary: boolean) => resolve({ data, binary: isBinary }))
+    })
+    phone.send(state)
+    const got = await reply
+    expect(got.binary).toBe(true)
+    expect([...got.data]).toEqual([...state])
+    phone.close()
+  })
+
   it('bridges a phone socket through to the computer', async () => {
     relay = await startRelay(config(), () => undefined)
     const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
@@ -328,6 +432,57 @@ describe('relay WebSocket bridging', () => {
     })
     phone.send('hello from the phone')
     expect(await reply).toBe('echo:hello from the phone')
+    phone.close()
+  })
+
+  it('does not price a bridged frame as a request', async () => {
+    // The old shape charged one request token per frame from a 300/min bucket
+    // with a burst of 50: a streamed turn exceeded it on its own, and every
+    // frame past the burst was dropped with the socket still up, so the phone
+    // waited out a full request timeout for an answer the relay had discarded.
+    // A tight limit makes the old accounting fail this test in a second.
+    relay = await startRelay(
+      config({
+        abuse: {
+          ...DEFAULT_ABUSE,
+          requestsPerMinute: 2,
+          burst: 2,
+          bytesPerDay: 0,
+          bytesPerDayPerIp: 0,
+        },
+      }),
+      () => undefined,
+    )
+    const mac = await FakeMac.connect(`ws://127.0.0.1:${relay.port}`)
+    mac.echoStreams()
+
+    const phone = new WebSocket(`ws://127.0.0.1:${relay.port}/r/${mac.room}/mizar/v1/ws`)
+    await new Promise<void>((resolve, reject) => {
+      phone.once('open', () => resolve())
+      phone.once('error', reject)
+    })
+
+    const frames = 40
+    const replies: string[] = []
+    const delivered = new Promise<void>((resolve, reject) => {
+      phone.on('message', (data: Buffer) => {
+        replies.push(data.toString('utf8'))
+        if (replies.length === frames) resolve()
+      })
+      phone.on('error', reject)
+    })
+    for (let index = 0; index < frames; index += 1) phone.send(`frame-${index}`)
+
+    // Bounded here rather than by the test runner: a dropped frame would
+    // otherwise show up as a five-second hang with no line saying which rule
+    // refused it.
+    const timeout = setTimeout(() => {
+      phone.close()
+      reject(new Error(`only ${replies.length} of ${frames} frames were bridged`))
+    }, 3000)
+    await delivered
+    clearTimeout(timeout)
+    expect(replies).toEqual(Array.from({ length: frames }, (_, index) => `echo:frame-${index}`))
     phone.close()
   })
 

@@ -244,7 +244,14 @@ export async function startRelay(
   const rooms = new RoomRegistry()
   /** Live tunnels per source address. Not a security boundary, a resource one. */
   const tunnelsPerIp = new Map<string, number>()
-  const wss = new WebSocketServer({ noServer: true })
+  // `ws` defaults to a 100 MiB payload, so the configured limits were applied
+  // only after the whole frame had been allocated. The bound here is the
+  // largest legitimate frame: a tunnel HTTP body or a bridged message, with the
+  // base64/JSON wrapper's headroom.
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: Math.max(config.maxBodyBytes, config.maxMessageBytes) * 2,
+  })
   /** The data-plane abuse limits, resolved once and used by the meter and the probe. */
   const abuse: AbuseLimits = resolveAbuse(config)
   /** Every room's notification endpoints. See `push.ts` for why this is memory. */
@@ -543,6 +550,35 @@ export async function startRelay(
     const decision = quota.admit(identityKey, bytes)
     if (!decision.allowed || ipKey === null) return decision
     return ipQuota.admit(ipKey, bytes)
+  }
+
+  /**
+   * The same two meters for one already-established socket's frame.
+   *
+   * Deliberately **not** {@link admitBytes}: a frame is not a request. The
+   * request bucket prices the two things a request costs -- a tunnel round trip
+   * and a map lookup -- and a frame on a socket that is already open costs
+   * neither. Charging the bucket per frame put a hard ceiling of five frames a
+   * second on every bridged phone (300/min, burst 50), dropped everything past
+   * it without telling the phone, and left the request it belonged to waiting
+   * out its full timeout. That ceiling sat far below the relay's actual uplink,
+   * which is why the servers looked idle while transfers crawled.
+   *
+   * The byte budget is still charged, in the same identity-then-address order as
+   * {@link admitBytes} and for the same reason: the bytes are what the operator
+   * pays for, and they are the thing that must not be free. What is *not* free
+   * either is a flood of tiny frames: `carry` has its own bucket, twenty times
+   * the request rate, as a circuit breaker. A real socket does not approach it.
+   *
+   * @param ipKey - from {@link addressKey}, or `null` to skip the address meter.
+   * @param identityKey - the traffic ledger's identity key.
+   * @param bytes - payload bytes about to be carried.
+   * @returns the first refusal, or an allowance.
+   */
+  function admitFrameBytes(ipKey: string | null, identityKey: string, bytes: number): QuotaDecision {
+    const decision = quota.carry(identityKey, bytes)
+    if (!decision.allowed || ipKey === null) return decision
+    return ipQuota.carry(ipKey, bytes)
   }
 
   /**
@@ -1468,6 +1504,11 @@ export async function startRelay(
     const onSocketGone = (): void => {
       clearTimeout(entry.timer)
       waiting.delete(entry)
+      // Tell the computer as well. `ws` does not call back for a socket that is
+      // already destroyed when the upgrade completes, so a stream the computer
+      // opened after the phone left would otherwise keep its local socket and
+      // its map entry until the tunnel reconnects.
+      opened.stream?.close(1001, 'the phone went away')
     }
     socket.on('close', onSocketGone)
     socket.on('error', onSocketGone)
@@ -1495,6 +1536,14 @@ export async function startRelay(
         waiting.delete(entry)
         socket.removeListener('close', onSocketGone)
         socket.removeListener('error', onSocketGone)
+        // The phone can leave while the computer is still dialling its local
+        // listener. `ws` silently destroys an unusable socket during the upgrade
+        // and never calls back, so asking first is the only way to avoid a
+        // stream nobody can close.
+        if (socket.destroyed || !socket.writable) {
+          stream.close(1001, 'the phone went away')
+          return
+        }
         wss.handleUpgrade(request, socket, head, (phone: WebSocket) => {
           opened.phone = phone
           bridgePhone(phone, stream, identity, ipKey)
@@ -1534,12 +1583,32 @@ export async function startRelay(
           return
         }
         traffic.record(identity.key, 0, data.length)
-        // Computer -> phone bytes spend the same daily budget. Refusing here is
-        // dropping the frame rather than the connection: the caller is over its
-        // allowance, but the session the phone already holds should survive
-        // until the day turns over.
-        if (!admitBytes(ipKey, identity.key, data.length).allowed) return
-        opened.phone?.send(data, { binary })
+        // Computer -> phone bytes spend the same daily budget. A refusal here
+        // used to drop the frame and keep the socket, which is the worst of the
+        // two: the request it answered then waits out its full 60 s timeout and
+        // the app never learns the allowance is gone (it only reads the close
+        // reason). Close with the reason instead -- the day is over for this
+        // identity either way.
+        const decision = admitFrameBytes(ipKey, identity.key, data.length)
+        if (!decision.allowed) {
+          const reason =
+            decision.reason === 'budget' ? 'traffic allowance spent' : 'frame rate exceeded'
+          opened.phone?.close(1008, reason)
+          opened.stream?.close(1008, reason)
+          return
+        }
+        // A phone that has stopped reading must not grow the relay's memory
+        // without bound. The tunnel side has always had this cap; the phone side
+        // did not.
+        const phone = opened.phone
+        if (phone === null) return
+        if (phone.bufferedAmount > 8 * 1024 * 1024) {
+          log(`relay: closing a phone in room ${split.room} — it stopped reading`)
+          phone.close(1011, 'the phone stopped reading')
+          opened.stream?.close(1011, 'the phone stopped reading')
+          return
+        }
+        phone.send(data, { binary })
       },
       onClose: (code, reason) => {
         clearTimeout(entry.timer)
@@ -1578,20 +1647,29 @@ export async function startRelay(
       }
       // Phone -> computer bytes spend the budget too. A *budget* refusal closes
       // the socket: the day is genuinely over for this account. A *rate*
-      // refusal does not: a launch burst of frames is not somebody spending
-      // their traffic, and closing with "traffic allowance spent" made the app
-      // tell people their quota was gone when it was not. The frame is dropped
-      // and the socket stays, exactly like the computer -> phone direction.
-      const decision = admitBytes(ipKey, identity.key, data.length)
+      // refusal is the frame-flood breaker (see `admitFrameBytes`), and it
+      // closes too, with its own sentence: dropping the frame while keeping the
+      // socket up is what used to make a refused request look like a hung one
+      // for the next sixty seconds.
+      const decision = admitFrameBytes(ipKey, identity.key, data.length)
       if (!decision.allowed) {
         if (decision.reason === 'budget') {
           phone.close(1008, 'traffic allowance spent')
           stream.close(1008, 'traffic allowance spent')
+        } else {
+          phone.close(1008, 'frame rate exceeded')
+          stream.close(1008, 'frame rate exceeded')
         }
         return
       }
       traffic.record(identity.key, data.length, 0)
-      stream.send(Buffer.isBuffer(data) ? data : Buffer.from(String(data)), isBinary)
+      // A refused write is not delivery. Closing is the only signal left after
+      // the frame is gone: the alternative is the phone waiting out a timeout
+      // (or an upload discovering a gap chunks later).
+      if (!stream.send(Buffer.isBuffer(data) ? data : Buffer.from(String(data)), isBinary)) {
+        phone.close(1011, 'the tunnel could not carry the frame')
+        stream.close(1011, 'the tunnel could not carry the frame')
+      }
     })
     phone.on('close', (code: number, reason: Buffer) => {
       // The phone's code is forwarded, and a `close` handler is given reserved
@@ -1676,9 +1754,14 @@ export async function startRelay(
 
     wss.handleUpgrade(request, socket, head, (host: WebSocket) => {
       tunnelsPerIp.set(peerKey, (tunnelsPerIp.get(peerKey) ?? 0) + 1)
+      // The computer says on its upgrade whether it can read framed `ws-msg`.
+      // A build older than this header keeps the JSON + base64 spelling, which
+      // is what makes a relay deployment and a desktop update independent.
+      const binaryFrames = request.headers['x-mizar-tunnel-frames'] === 'binary'
       const tunnel = new Tunnel(
         {
           send: (text) => host.send(text),
+          ...(binaryFrames ? { sendBytes: (data: Buffer) => host.send(data) } : {}),
           close: (code, reason) => host.close(code, reason),
           on: (event, listener) => host.on(event, listener as never),
           get bufferedAmount() {
@@ -1686,6 +1769,8 @@ export async function startRelay(
           },
         },
         config.requestTimeoutMs,
+        8 * 1024 * 1024,
+        binaryFrames,
       )
 
       const displaced = rooms.register(room, tunnel)
@@ -1718,7 +1803,10 @@ export async function startRelay(
         // computer is connected and still not in the phone's list.
         log('relay: tunnel connected without an account session — it will not appear in /desktops')
       }
-      log(`relay: tunnel for room ${room} connected${displaced ? ' (replaced a stale one)' : ''}`)
+      log(
+        `relay: tunnel for room ${room} connected${displaced ? ' (replaced a stale one)' : ''}` +
+          (binaryFrames ? ' with binary ws-msg' : ''),
+      )
 
       let released = false
       host.on('close', () => {
@@ -1738,6 +1826,10 @@ export async function startRelay(
           t: 'welcome',
           room,
           protocolVersion: TUNNEL_PROTOCOL_VERSION,
+          // Said back so the computer knows this relay will read binary frames
+          // before it sends any. Both directions are on or off together: a
+          // half-negotiated direction would be a framing bug waiting to happen.
+          ...(binaryFrames ? { wsMsgBinary: true } : {}),
         }),
       )
     })

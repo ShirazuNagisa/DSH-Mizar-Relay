@@ -561,8 +561,23 @@ export async function deliver(
     if (!request.endLiveActivity || apnsClient === null) return
     await Promise.all(
       devices.map(async (device): Promise<void> => {
+        if (device.platform !== 'ios') return
+        // The token-free wake is the only end path for a card started by
+        // push-to-start whose activity token has not reached the host yet. It
+        // also runs beside an activity-token end rather than instead of it:
+        // ending twice is idempotent, and whichever one works wins while the
+        // card is on screen.
+        const wake = await apnsClient.sendSilentActivityEnd({
+          token: device.token,
+          environment: device.environment ?? 'production',
+        })
+        if (!wake.delivered) {
+          options.log(
+            `push: silent live-activity end for ${device.deviceId} in room ${room} failed (${wake.status} ${wake.reason ?? 'no reason'})`,
+          )
+        }
         const token = device.liveActivityToken
-        if (device.platform !== 'ios' || typeof token !== 'string' || token === '') return
+        if (typeof token !== 'string' || token === '') return
         const result = await apnsClient.sendLiveActivityEnd({
           token,
           environment: device.environment ?? 'production',

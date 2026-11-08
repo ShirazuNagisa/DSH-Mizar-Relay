@@ -170,6 +170,14 @@ export interface ApnsActivityApproval {
   readonly detail: string
 }
 
+/** A silent wake that asks the app to end its own card. */
+export interface ApnsSilentEnd {
+  /** The phone's alert token, not an activity token. */
+  readonly token: string
+  /** Which APNs minted the token. */
+  readonly environment: ApnsEnvironment
+}
+
 /** A Live Activity to start on a phone that has none. */
 export interface ApnsLiveActivityStart {
   /**
@@ -314,6 +322,23 @@ export function buildPayload(
  * There are no dates in it, so no encoding strategy can disagree about it.
  */
 const FINISHED_CONTENT_STATE = { rows: [] as const } as const
+
+/**
+ * Build the silent wake that asks the app to end its own card.
+ *
+ * The key outside `aps` is the app's marker. No alert is included: this exists
+ * for the background handler, not for the Lock Screen, and an alert would make
+ * every finished turn ring twice.
+ */
+export function buildSilentEndPayload(now: number): Record<string, unknown> {
+  return {
+    aps: {
+      'content-available': 1,
+    },
+    mizarEndLiveActivity: true,
+    timestamp: Math.floor(now / 1000),
+  }
+}
 
 /**
  * Build the payload that ends one Live Activity.
@@ -591,6 +616,23 @@ export class ApnsClient {
   }
 
   /**
+   * Wake the app without an alert so it can end its own activity.
+   *
+   * This is the fallback for a card whose activity token never reached the app:
+   * the push-to-start token creates a card, but only a running app can turn that
+   * card's token into an end address. A background push can still wake the app,
+   * which enumerates its activities locally and ends the finished one.
+   */
+  async sendSilentActivityEnd(end: ApnsSilentEnd): Promise<ApnsResult> {
+    const payload = JSON.stringify(buildSilentEndPayload(Date.now()))
+    return await this.#deliverActivity(
+      { deviceToken: end.token, environment: end.environment },
+      payload,
+      (freshToken) => this.#backgroundHeaders(end.token, payload, freshToken),
+    )
+  }
+
+  /**
    * Start one Live Activity on a phone that has none.
    *
    * Addressed to the push-to-start token, which is the one credit this design
@@ -663,6 +705,31 @@ export class ApnsClient {
       // announces a session that is finished, an update kept for later is a card
       // that is wrong in both directions.
       'apns-expiration': 0,
+      'content-type': 'application/json',
+      [constants.HTTP2_HEADER_CONTENT_LENGTH]: Buffer.byteLength(payload),
+    }
+  }
+
+  /**
+   * The framing and headers for a silent background notification.
+   *
+   * The topic is the app's own, unlike an activity push: this wakes the app
+   * process, not one card. Background pushes use priority 5 by Apple's contract;
+   * priority 10 on `background` is answered with a bad-priority error.
+   */
+  #backgroundHeaders(
+    token: string,
+    payload: string,
+    freshToken: boolean,
+  ): Record<string, string | number> {
+    return {
+      [constants.HTTP2_HEADER_METHOD]: 'POST',
+      [constants.HTTP2_HEADER_PATH]: `/3/device/${token}`,
+      [constants.HTTP2_HEADER_AUTHORIZATION]: `bearer ${this.#currentToken(freshToken)}`,
+      'apns-topic': this.#config.topic,
+      'apns-push-type': 'background',
+      'apns-priority': 5,
+      'apns-expiration': Math.floor(Date.now() / 1000) + 300,
       'content-type': 'application/json',
       [constants.HTTP2_HEADER_CONTENT_LENGTH]: Buffer.byteLength(payload),
     }

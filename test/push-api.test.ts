@@ -347,7 +347,13 @@ describe('registering a device', () => {
     expect(cleared.status).toBe(200)
     received = []
     await post(base, '/push/v1/notify', MAC_A, { ...notification, endLiveActivity: true })
-    expect(received.map((entry) => entry.path)).toEqual(['/3/device/deadbeef'])
+    // Two requests to the phone's alert token: the visible turn-end alert, and
+    // the silent wake that lets the app end a card whose activity token it never
+    // learned. They are deliberately both sent; ending twice is harmless.
+    expect(received.map((entry) => entry.path)).toEqual([
+      '/3/device/deadbeef',
+      '/3/device/deadbeef',
+    ])
   })
 
   it('refuses an activity token that is not hex', async () => {

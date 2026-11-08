@@ -22,7 +22,7 @@ import {
 } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { spawn } from 'node:child_process'
 import { Readable } from 'node:stream'
 import { pathToFileURL } from 'node:url'
@@ -209,7 +209,13 @@ async function removeBatches(incoming: string, batches: readonly Batch[]): Promi
 
 function tar(archive: string, staging: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn('tar', ['-czf', archive, '-C', staging, 'manifest.json', 'batches'], {
+    // Run tar inside the staging directory and name the archive relatively.
+    // GNU tar (Git Bash on Windows) reads the drive letter in an absolute
+    // `D:\\...` path as an rsh host — "tar: Cannot connect to D: resolve
+    // failed", exit 2 — so the flush fails before it ever reaches the receiver.
+    // A bare file name is unambiguous for both GNU tar and bsdtar.
+    const child = spawn('tar', ['-czf', basename(archive), 'manifest.json', 'batches'], {
+      cwd: staging,
       stdio: 'ignore',
       timeout: 120_000,
     })

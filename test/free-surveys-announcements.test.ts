@@ -170,6 +170,24 @@ async function json(
   return { status: response.status, body: (await response.json().catch(() => ({}))) as Record<string, unknown> }
 }
 
+async function adminLogin(base: string): Promise<string> {
+  const response = await fetch(`${base}/admin/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ password: 'admin-password' }),
+    redirect: 'manual',
+  })
+  expect(response.status).toBe(303)
+  return String(response.headers.get('set-cookie')).split(';')[0] ?? ''
+}
+
+async function csrfFrom(base: string, cookie: string, path: string): Promise<string> {
+  const html = await (await fetch(`${base}${path}`, { headers: { cookie } })).text()
+  const match = /name="_csrf" value="([^"]+)"/.exec(html)
+  expect(match).not.toBeNull()
+  return match?.[1] ?? ''
+}
+
 async function register(base: string, username = 'shirazu'): Promise<{ token: string; user: Record<string, unknown> }> {
   const reply = await json(base, '/account/v1/register', {
     username,
@@ -390,4 +408,56 @@ it('refuses a second redemption of a once-per-account invite, by the same accoun
   const second = await register(base, 'second-user')
   const other = await json(base, '/account/v1/invite/redeem', { code: 'TESTFLIGHT-30' }, second.token)
   expect(other.status).toBe(200)
+})
+
+it('sends a banner from the admin page and lists it afterwards', async () => {
+  const { base } = await boot(accountConfig({ internal: { secret: SECRET, host: '127.0.0.1', port: 0 } }))
+  const cookie = await adminLogin(base)
+  const csrf = await csrfFrom(base, cookie, '/admin/announcements')
+  const sent = await fetch(`${base}/admin/announcements`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
+    body: new URLSearchParams({
+      _csrf: csrf,
+      title: 'Admin banner',
+      body: 'Sent from the panel.',
+      symbol: 'megaphone.fill',
+      tone: 'info',
+      buttonLabel: 'Open logs',
+      buttonTarget: 'logs',
+      minutes: '30',
+    }),
+    redirect: 'manual',
+  })
+  expect(sent.status).toBe(303)
+  const page = await fetch(`${base}/admin/announcements`, { headers: { cookie } })
+  expect(page.status).toBe(200)
+  const html = await page.text()
+  expect(html).toContain('Admin banner')
+  expect(html).toContain('Open logs')
+  expect(html).toContain('logs')
+})
+
+it('renders the questionnaires page even when no origin is configured', async () => {
+  // The page exists on every account relay; without an upstream it says so
+  // instead of failing the whole admin session.
+  const { base } = await boot(accountConfig())
+  const cookie = await adminLogin(base)
+  const page = await fetch(`${base}/admin/surveys`, { headers: { cookie } })
+  expect(page.status).toBe(200)
+  const html = await page.text()
+  expect(html.length).toBeGreaterThan(200)
+})
+
+it('refuses an announcement socket with no session', async () => {
+  const { relay } = await boot(accountConfig({ internal: { secret: SECRET, host: '127.0.0.1', port: 0 } }))
+  const socket = new WebSocket(`ws://127.0.0.1:${relay.port}/app/v1/announcements`)
+  const status = await new Promise<number>((resolve, reject) => {
+    socket.on('unexpected-response', (_request, response) => resolve(response.statusCode ?? 0))
+    socket.on('open', () => reject(new Error('the socket opened without a session')))
+    socket.on('error', () => undefined)
+    setTimeout(() => reject(new Error('no answer to the unauthenticated upgrade')), 3000)
+  })
+  expect(status).toBe(401)
+  socket.terminate()
 })

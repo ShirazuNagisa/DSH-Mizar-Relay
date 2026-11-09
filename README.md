@@ -1,5 +1,7 @@
 # DSH-Mizar 中继服务器
 
+当前版本 **0.3.8**。
+
 **让手机从任何网络连上你的电脑**，即使电脑所在的网络封禁入站连接（校园网、公司网、
 运营商 CGNAT 都是这样）。同一个中继也负责把推送转给 Apple。
 
@@ -79,7 +81,7 @@ bundle 里已经带好编译后的 `lib/`、唯一依赖 `ws`、`install.sh`（�
 
 ```sh
 npm install
-npm test              # 200+ 个测试
+npm test              # 345 个测试
 npm run typecheck
 npm run build         # tsc → lib/（lib/ 不进仓库，bundle 里才有）
 npm start             # 用 relay.config.json 起一个本地实例

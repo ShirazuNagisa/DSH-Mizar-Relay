@@ -6,11 +6,11 @@
 运营商 CGNAT 都是这样）。
 
 原理很简单：**电脑主动出站**连到这台服务器，之后手机就通过那条连接找到它。
-服务器不解析 Mizar 协议，只搬运字节——**手机的身份验证仍然由你电脑上的插件完成**，
+服务器不解析 Mizar 协议，只搬运字节——**手机的身份验证仍然由你电脑上的 AGI Mizar 桌面端完成**，
 和同一个 Wi-Fi 下的情况完全一样。
 
 ```
-电脑插件 ──出站 wss──▶ 这台服务器 ◀──https── 手机
+AGI Mizar 桌面端 ──出站 wss──▶ 这台服务器 ◀──https── 手机
    /tunnel                    │        /r/<房间号>/...
                               └─ 转给电脑上的 127.0.0.1:19390
 ```
@@ -56,10 +56,10 @@
 ## 推送（APNs）
 
 中继还负责把「审批/提问/跑完」的推送转给 Apple——手机不在前台时的通知走这条路，
-插件本身拿不到、也不该拿到 Apple 的签名密钥。要用推送就把 `apns` 配进
+手机和 AGI Mizar 桌面端拿不到、也不该拿到 Apple 的签名密钥。要用推送就把 `apns` 配进
 `app/relay.config.json`（`keyId` / `teamId` / `topic` / `key`），步骤见
 `DEPLOYMENT-FULL.md` 第 10 节。**不配也不会坏**：中继照常转发消息，只是不发推送，
-插件启动日志里会写 `push: this relay has no push API …`。
+AGI Mizar 日志里会写 `push: this relay has no push API …`。
 
 ---
 
@@ -123,24 +123,14 @@ sudo ./install.sh
 **不做这一步会怎样**：nginx 会把 `Upgrade` 请求头丢掉，WebSocket 握手失败。
 症状是手机能连上又立刻断开，或者电脑的日志里隧道反复重连。
 
-### 第三步：配置电脑上的插件
+### 第三步：让 AGI Mizar 连接这台中继
 
-编辑 `~/.dsh/profiles/<你的profile>/cordis.patch.yml`，加上：
+**0.9.0 起，中继隧道由 AGI Mizar 桌面端持有，DSH 插件不再监听端口，也不再有
+`relay` / `bind` 的 cordis 配置。** DSH 插件只负责把 DSH 进程接到 AGI Mizar。
 
-```yaml
-- id: mizar
-  config:
-    relay:
-      enabled: true
-      url: "https://你的域名"
-      token: "第一步打印出来的那串 token"
-    bind:
-      mode: loopback        # 有隧道时不需要再把端口暴露在局域网上
-```
-
-**重启 DSH**。面板会显示中继已连接、房间号，以及给手机用的配对地址。
-
-**手机重新扫码配对**——二维码里现在带的是中继地址。
+打开 AGI Mizar 并登录拥有这台中继的账户；自托管启动时用 `AGI_RELAY_URL` /
+`AGI_RELAY_TOKEN` 指定这台中继。配对面板显示「中继已连接」和房间号后，手机重新扫码配对
+——二维码里现在带的是中继地址。具体的桌面端配置入口见 AGI Mizar 的 README 与设置页。
 
 ---
 
@@ -195,12 +185,12 @@ relay: tunnel for room XXXXXXXXXXXX connected
 |---|---|---|
 | **提示没装 node，但宝塔里明明装了** | **宝塔的 Node 不在 shell 的 PATH 里** | 见下方说明；`install.sh` 会自动去找 |
 | 自检通过了，但手机连不上 | 问题在反代，不在中继 | 检查 `nginx-websocket.conf` 有没有粘全 |
-| 电脑日志 `401` | token 不一致 | 对比插件配置和 `app/relay.config.json` 里的 `tokens[0]` |
+| 电脑日志 `401` | token 不一致 | 对比 AGI Mizar 的 relay token 和 `app/relay.config.json` 里的 `tokens[0]` |
 | `curl /healthz` 返回 404 | 反代没配好，请求没到 relay | 检查目标 URL 是不是 `http://127.0.0.1:8787` |
 | 手机扫码后 `404` | 房间号不对，或电脑没连上 | 看 `healthz` 的 `rooms`；重新扫码 |
 | 手机连上又立刻断开 | **WebSocket 头没配** | 粘贴 `nginx-websocket.conf`，重载 nginx |
 | 隧道每分钟重连一次 | `proxy_read_timeout` 还是默认 60s | 见上一行，改成 `3600s` |
-| 手机 `502` | 电脑没应答 | 电脑上的 DSH 在跑吗？看插件日志 |
+| 手机 `502` | 电脑没应答 | AGI Mizar 在跑吗？看 AGI Mizar 日志 |
 | **第 5 台电脑连不上，日志 429** | 0.2.2 及更早把 nginx 的 `127.0.0.1` 当成所有隧道来源，4 条之后全站拒绝 | 升级到 0.2.3+（`install.sh` 会保留 `relay.config.json`），并确认反代传了 `X-Real-IP` |
 | 手机请求回 `429`，`x-mizar-quota: budget` | 这个**来源地址**当天的 2 GiB 用完了（整个 NAT 共享这一份额度） | 正常护栏；看 `healthz` 的 `quota.ip.refusedBudget`。大户需要更多就把 `bytesPerDayPerIp` 调大 |
 | 手机请求回 `429`，`x-mizar-quota: rate` | 这个身份或地址的请求频率超了 | 正常护栏；`requestsPerMinute(PerIp)` 可调 |

@@ -6,11 +6,11 @@
 运营商 CGNAT 都是这样）。同一个中继也负责把推送转给 Apple。
 
 原理很简单：**电脑主动出站**连到这台服务器，之后手机就通过那条连接找到它。
-服务器不解析 Mizar 协议，只搬运字节 —— **手机的身份验证仍然由你电脑上的插件完成**，
+服务器不解析 Mizar 协议，只搬运字节 —— **手机的身份验证仍然由你电脑上的 AGI Mizar 桌面端完成**，
 和同一个 Wi-Fi 下的情况完全一样。
 
 ```
-电脑插件 ──出站 wss──▶ 这台服务器 ◀──https── 手机
+AGI Mizar 桌面端 ──出站 wss──▶ 这台服务器 ◀──https── 手机
    /tunnel                    │        /r/<房间号>/...
                               ├─ 转给电脑上的 127.0.0.1:19390
                               └─ 推送：/push/v1/notify ──▶ Apple (APNs) ──▶ 手机
@@ -73,7 +73,7 @@ bundle 里已经带好编译后的 `lib/`、唯一依赖 `ws`、`install.sh`（�
 源码里对应 `deploy/README.md`。
 
 **推送（APNs）是可选的。** 配置里不写 `apns` 也能正常转发消息，只是不发推送；
-插件启动日志会写 `push: this relay has no push API …`。要开推送就把 Apple 的
+AGI Mizar 日志会写 `push: this relay has no push API …`。要开推送就把 Apple 的
 `keyId` / `teamId` / `topic` / 私钥填进服务器的 `app/relay.config.json`，
 步骤见 `docs/deployment.md` 第 10 节。
 

@@ -134,6 +134,16 @@ export interface RelayConfig {
    * in tests and embedders keep compiling.
    */
   readonly mail?: MailConfig | null
+  /**
+   * The private relay-to-relay listener, or `null` when this relay has none.
+   *
+   * Optional so the many hand-built configs in tests keep compiling; an absent
+   * block means "serve every internal endpoint on the public listener", which
+   * is the behaviour before this existed.
+   */
+  readonly internal?: InternalConfig | null
+  /** The survey store, or `null` when this relay takes no part in surveys. */
+  readonly surveys?: SurveysConfig | null
 }
 
 /** What this relay does with mail. */
@@ -221,6 +231,20 @@ export interface PaidGateConfig {
    * to.
    */
   readonly allowUnaccounted: boolean
+  /**
+   * Whether a signed-in *free* account may use this relay, at the free plan's
+   * allowance.
+   *
+   * Off by default: the paid relay exists to carry paying traffic. It is on
+   * from 0.9.9, when every phone -- free plan included -- is routed here, and
+   * the anti-abuse machinery is what keeps the paid lane protected instead of
+   * the paywall: the gate still refuses revoked, disabled and anonymous
+   * callers, the byte budget is still chosen per plan at admission (see
+   * `abuse.bytesPerDayFree`), and the traffic ledger's warnings and bans still
+   * apply to both plans. A free account is not a paid one: it does not become
+   * a paying caller by being let in.
+   */
+  readonly allowFreeAccounts?: boolean
   /** How long a verified entitlement may be reused, in ms. */
   readonly cacheTtlMs: number
   /**
@@ -251,8 +275,17 @@ export interface AbuseLimits {
   readonly requestsPerMinute: number
   /** Burst allowance for the request bucket; `0` picks a derived default. */
   readonly burst: number
-  /** Carried bytes per identity per UTC day. `0` disables. */
+  /** Carried bytes per identity per UTC day, for a paid account. `0` disables. */
   readonly bytesPerDay: number
+  /**
+   * The same ceiling for a free account, when the relay carries both plans.
+   *
+   * The account relay's `bytesPerDay` is the paid plan's 5 GiB; a free account
+   * that is let in (see `paidGate.allowFreeAccounts`) must not spend it. `0`
+   * falls back to `bytesPerDay`, which is what a relay that only carries paid
+   * traffic wants -- one number, no second plan.
+   */
+  readonly bytesPerDayFree: number
   /**
    * Sustained data-plane requests per minute per source address. `0` disables.
    *
@@ -281,6 +314,7 @@ export interface AbuseFileConfig {
   readonly requestsPerMinute?: number
   readonly burst?: number
   readonly bytesPerDay?: number
+  readonly bytesPerDayFree?: number
   readonly requestsPerMinutePerIp?: number
   readonly bytesPerDayPerIp?: number
   readonly probeRepliesPerSecond?: number
@@ -311,6 +345,9 @@ export const DEFAULT_ABUSE: AbuseLimits = {
   requestsPerMinute: 300,
   burst: 0,
   bytesPerDay: 500 * 1024 * 1024,
+  // A relay that has not been told about a second plan has only one ceiling:
+  // `bytesPerDay`. This is the fallback that says so.
+  bytesPerDayFree: 0,
   requestsPerMinutePerIp: 1200,
   bytesPerDayPerIp: 4 * 500 * 1024 * 1024,
   probeRepliesPerSecond: 200,
@@ -318,6 +355,44 @@ export const DEFAULT_ABUSE: AbuseLimits = {
   trafficAlertBytesPerDay: 500 * 1024 * 1024,
   trafficAlertBytesPerDayPaid: 5 * 1024 * 1024 * 1024,
   trafficAlertGrowthFactor: 8,
+}
+
+/**
+ * The relay-to-relay channel.
+ *
+ * 主力0 and 主力1 sit in one private network (10.0.0.0/22). Everything they say
+ * to each other -- traffic reports, mail, survey answers, the archive -- used to
+ * cross the public internet through nginx; this is the listener that carries it
+ * over the private link instead, on a port the public vhost does not expose.
+ *
+ * Off unless `port` and `host` are both set, which keeps tests and single-host
+ * deployments working unchanged: with no internal block the same endpoints are
+ * still served on the public listener, exactly as before this existed.
+ */
+export interface InternalConfig {
+  /** Shared secret every internal caller presents as a bearer token. */
+  readonly secret: string
+  /** The private address to bind, e.g. `10.0.0.6`. */
+  readonly host: string
+  /** The private port, e.g. `8790`. */
+  readonly port: number
+}
+
+/**
+ * Where the questionnaires live.
+ *
+ * The origin relay (主力0) owns the definitions and the answers -- it is the
+ * store the operator reads, and it keeps no accounts. The account relay (主力1)
+ * knows who may fill one in and who has already been paid for it, and reaches
+ * 主力0 over {@link InternalConfig}.
+ */
+export interface SurveysConfig {
+  /** Role 0: serve the internal survey endpoints from `dataDir`. */
+  readonly enabled: boolean
+  /** Where `definitions.json` and `responses.jsonl` live. */
+  readonly dataDir: string
+  /** Role 1: the origin relay's internal base URL, e.g. `http://10.0.0.12:8790`. */
+  readonly upstreamURL: string
 }
 
 /** How this relay takes part in anonymous session-data sharing. */
@@ -472,6 +547,7 @@ export interface AccountsFileConfig {
     /** `true`/`false` are accepted as shorthand for `enforce`/`off`. */
     readonly mode?: PaidGateMode | boolean
     readonly allowUnaccounted?: boolean
+    readonly allowFreeAccounts?: boolean
     readonly cacheTtlMs?: number
     /**
      * Refuse to start when the gate is not actually protecting a paid relay.
@@ -584,7 +660,62 @@ export function loadConfig(
     dataset: readDataset(env, (file.dataset ?? null) as DatasetFileConfig | null),
     abuse: readAbuse(env, (file.abuse ?? null) as AbuseFileConfig | null),
     mail: readMail(env, (file.mail ?? null) as MailFileConfig | null),
+    internal: readInternal(env, (file.internal ?? null) as InternalFileConfig | null),
+    surveys: readSurveys(env, (file.surveys ?? null) as SurveysFileConfig | null),
   }
+}
+
+/** The `internal` block as it appears in the config file. */
+interface InternalFileConfig {
+  readonly secret?: string
+  readonly host?: string
+  readonly port?: number
+}
+
+/**
+ * Resolve the private listener.
+ *
+ * Both halves are required: a port without an address would bind every
+ * interface, which is the one thing this must not do, and an address without a
+ * secret would hand the internal endpoints to whoever finds the port.
+ */
+function readInternal(env: NodeJS.ProcessEnv, file: InternalFileConfig | null): InternalConfig | null {
+  const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
+    fromEnv !== undefined && fromEnv !== '' ? (fromEnv as unknown as T) : (fromFile ?? fallback)
+  const rawPort = Number(pick(env['MIZAR_INTERNAL_PORT'], file?.port, 0))
+  const port = Number.isFinite(rawPort) ? Math.floor(rawPort) : 0
+  if (port < 0) return null
+  const host = pick(env['MIZAR_INTERNAL_HOST'], file?.host, '')
+  // No block at all is port 0 and no host. A test asks for port 0 *with* a
+  // host, which binds an ephemeral loopback port -- reachable by the test and
+  // by nothing else.
+  if (host === '' && port === 0) return null
+  if (host === '') {
+    throw new Error('internal.port is set but internal.host is empty; bind one private address, not every interface')
+  }
+  const secret = pick(env['MIZAR_INTERNAL_SECRET'], file?.secret, '')
+  if (secret === '') {
+    throw new Error('internal.port is set but internal.secret is empty; the private listener would be open')
+  }
+  return { secret, host, port }
+}
+
+/** The `surveys` block as it appears in the config file. */
+interface SurveysFileConfig {
+  readonly enabled?: boolean
+  readonly dataDir?: string
+  readonly upstreamURL?: string
+}
+
+/** Resolve the survey block; `null` when this relay takes no part. */
+function readSurveys(env: NodeJS.ProcessEnv, file: SurveysFileConfig | null): SurveysConfig | null {
+  const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
+    fromEnv !== undefined && fromEnv !== '' ? (fromEnv as unknown as T) : (fromFile ?? fallback)
+  const enabled = flag(pick(env['MIZAR_SURVEYS_ENABLED'], file?.enabled, false))
+  const dataDir = pick(env['MIZAR_SURVEYS_DIR'], file?.dataDir, './data/surveys')
+  const upstreamURL = pick(env['MIZAR_SURVEYS_UPSTREAM'], file?.upstreamURL, '').replace(/\/+$/, '')
+  if (!enabled && upstreamURL === '') return null
+  return { enabled, dataDir, upstreamURL }
 }
 
 /** The `mail` block as it appears in the config file; every field optional. */
@@ -728,6 +859,11 @@ function readAbuse(env: NodeJS.ProcessEnv, file: AbuseFileConfig | null): AbuseL
     ),
     burst: num(env['MIZAR_ABUSE_BURST'], file?.burst, DEFAULT_ABUSE.burst),
     bytesPerDay: num(env['MIZAR_ABUSE_BYTES_PER_DAY'], file?.bytesPerDay, DEFAULT_ABUSE.bytesPerDay),
+    bytesPerDayFree: num(
+      env['MIZAR_ABUSE_BYTES_PER_DAY_FREE'],
+      file?.bytesPerDayFree,
+      DEFAULT_ABUSE.bytesPerDayFree,
+    ),
     requestsPerMinutePerIp: num(
       env['MIZAR_ABUSE_REQUESTS_PER_MINUTE_PER_IP'],
       file?.requestsPerMinutePerIp,
@@ -1020,6 +1156,12 @@ function readPaidGate(
         env['MIZAR_PAID_GATE_ALLOW_UNACCOUNTED'] !== ''
         ? env['MIZAR_PAID_GATE_ALLOW_UNACCOUNTED']
         : (file.allowUnaccounted ?? false),
+      false,
+    ),
+    allowFreeAccounts: flagOr(
+      env['MIZAR_PAID_GATE_ALLOW_FREE'] !== undefined && env['MIZAR_PAID_GATE_ALLOW_FREE'] !== ''
+        ? env['MIZAR_PAID_GATE_ALLOW_FREE']
+        : (file.allowFreeAccounts ?? false),
       false,
     ),
     cacheTtlMs,

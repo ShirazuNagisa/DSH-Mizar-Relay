@@ -34,6 +34,21 @@ AGI Mizar 桌面端 ──出站 wss──▶ 这台服务器 ◀──https─�
   - 汇总流量：主力0 每 30 秒把身份计数上报到主力1
 - 账户数据只写入配置的 `dataDir`（`accounts.json`、`invites.json`、
   `traffic.json`、`audit.log`），不进入代码仓库。
+- 0.4.0 起（0.9.9 客户端）：
+  - **免费账户也走主力1（443）**：`paidGate.allowFreeAccounts` 打开后，登录的免费
+    账户不再吃 `402`，而是按每天 500 MiB 的额度放行；未登录仍然 401。付费账户保持
+    5 GiB/天。`/healthz` 的 `paidGateAllowFree` 是它的开关状态。
+  - **应用内公告**：`/app/v1/announcements`（WebSocket，`x-mizar-session` 鉴权）
+    推横幅，`/account/v1/announcements` 是轮询孪生；运营用
+    `POST /internal/v1/announcements` 创建，可带一个跳设置页的按钮。
+  - **问卷**：`role: 0` 用 `data/surveys/` 存定义和答案（`responses.jsonl`
+    追加写），`role: 1` 代理手机的 `GET /account/v1/surveys` 与
+    `POST /account/v1/surveys/submit`，答案先落到主力0 再发奖励，每个账户每份问卷
+    只发一次；`lib/survey-cli.js` 负责派发和导出。
+  - **两台服务器的互传全部走内网**：`accounts.reportTo`、`surveys.upstreamURL`、
+    `mail.service.url` 都指向 `10.0.0.6` / `10.0.0.12` 的 80 端口，
+    nginx 用 `location ^~ /internal/v1/ { allow 10.0.0.0/22; deny all; ... }`
+    只放行私有网段；公网访问该路径是 `403`。
 - 付费账户有两种来源：**App Store 月度自动续期订阅**（StoreKit 2，价格在
   App Store Connect 设置）和**邀请码/后台授予**；两者独立记账，取较晚到期时间。
 - 邮箱注册账户最多 2 台设备；Apple 登录账户不限设备。

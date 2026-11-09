@@ -74,6 +74,14 @@ export interface PaidGateOptions {
   readonly store: AccountStore
   readonly mode: PaidGateMode
   readonly allowUnaccounted: boolean
+  /**
+   * Whether a signed-in free account is carried at the free plan's allowance.
+   *
+   * See `PaidGateConfig.allowFreeAccounts`. Absent means false, which is the
+   * paywall this class was written as; the account relay turns it on when it
+   * carries both plans.
+   */
+  readonly allowFreeAccounts?: boolean
   readonly cacheTtlMs: number
   /** Clock, injectable for tests. */
   readonly now?: () => number
@@ -87,6 +95,8 @@ export interface PaidGateOptions {
 interface CacheEntry {
   readonly userId: string
   readonly paidUntil: number | null
+  /** Which plan the allowance was for, so a free one can be reused too. */
+  readonly plan: 'paid' | 'free'
   readonly checkedAt: number
 }
 
@@ -130,6 +140,7 @@ export class PaidGate {
   readonly #store: AccountStore
   readonly #mode: PaidGateMode
   readonly #allowUnaccounted: boolean
+  readonly #allowFreeAccounts: boolean
   readonly #cacheTtlMs: number
   readonly #now: () => number
   readonly #log: (message: string) => void
@@ -148,6 +159,7 @@ export class PaidGate {
     this.#store = options.store
     this.#mode = options.mode
     this.#allowUnaccounted = options.allowUnaccounted
+    this.#allowFreeAccounts = options.allowFreeAccounts ?? false
     this.#cacheTtlMs = Math.max(0, options.cacheTtlMs)
     this.#now = options.now ?? Date.now
     this.#log = options.log ?? (() => undefined)
@@ -218,6 +230,20 @@ export class PaidGate {
           cached: true,
         }
       }
+      // A free allowance is reused while the flag is on. It has no paid period
+      // to run out, so the only thing that can revoke it before the TTL is the
+      // store's listener, which deletes the entry.
+      if (cached.plan === 'free' && this.#allowFreeAccounts) {
+        this.#cachedHits += 1
+        this.#allowed += 1
+        return {
+          allowed: true,
+          userId: cached.userId,
+          tokenHash,
+          paidUntil: null,
+          cached: true,
+        }
+      }
       // The cached period ran out while it sat in the cache. Fall through to the
       // store: a renewal may have landed since.
     }
@@ -239,17 +265,37 @@ export class PaidGate {
     }
 
     if (!entitlement.paid) {
-      return this.#refuse(
-        'PAID_REQUIRED',
-        402,
-        'the paid relay is for paid accounts; this account is on the free plan',
-        'observe-if-watching',
-      )
+      if (!this.#allowFreeAccounts) {
+        return this.#refuse(
+          'PAID_REQUIRED',
+          402,
+          'the paid relay is for paid accounts; this account is on the free plan',
+          'observe-if-watching',
+        )
+      }
+      // A free account is carried at the free allowance. Its identity is still
+      // the verified token hash, which is what makes the quota trustworthy:
+      // the bytes are charged to an account, not to a header the phone chose.
+      this.#remember(tokenHash, {
+        userId: entitlement.userId,
+        paidUntil: null,
+        plan: 'free',
+        checkedAt: now,
+      })
+      this.#allowed += 1
+      return {
+        allowed: true,
+        userId: entitlement.userId,
+        tokenHash,
+        paidUntil: null,
+        cached: false,
+      }
     }
 
     this.#remember(tokenHash, {
       userId: entitlement.userId,
       paidUntil: entitlement.paidUntil,
+      plan: 'paid',
       checkedAt: now,
     })
     this.#allowed += 1

@@ -153,6 +153,8 @@ export interface CreateInviteInput {
   readonly days: number
   readonly maxUses: number
   readonly expiresAt: number | null
+  /** One grant per account, whatever `maxUses` says. */
+  readonly oncePerAccount?: boolean
 }
 
 /** The account store. */
@@ -766,6 +768,16 @@ export class AccountStore {
       const user = this.#users.get(session.userId)
       if (user === undefined) throw new AccountError('UNAUTHENTICATED', 'this account no longer exists', 401)
       if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
+      if (
+        invite.oncePerAccount === true &&
+        invite.redemptions.some((redemption) => redemption.userId === user.id)
+      ) {
+        throw new AccountError(
+          'INVITE_ALREADY_USED',
+          'this account has already used that invite code',
+          400,
+        )
+      }
       const base = Math.max(now, user.entitlements.grantedPaidUntil ?? 0)
       user.entitlements.grantedPaidUntil = base + invite.days * 86_400_000
       user.updatedAt = now
@@ -791,6 +803,54 @@ export class AccountStore {
       this.#entitlementsChanged(userId)
       await this.#saveAccounts()
       await this.#audit('grant-changed', { userId, days })
+      return this.#public(user, null, now)
+    })
+  }
+
+  /** Surveys this account has been paid for, as `surveyId -> submittedAt`. */
+  surveyCompletions(userId: string): Record<string, number> {
+    return { ...(this.#users.get(userId)?.surveyCompletions ?? {}) }
+  }
+
+  /**
+   * Mark one survey done for one account and grant its reward.
+   *
+   * The one place a survey turns into paid days. It is serialized through the
+   * same mutation queue as every other grant, so two submissions racing each
+   * other cannot both be paid: the second sees the completion the first wrote.
+   *
+   * @param userId - the account.
+   * @param surveyId - the survey, as the origin relay names it.
+   * @param days - the reward the survey definition carries.
+   * @returns the updated public user, paid until the new grant runs out.
+   * @throws {AccountError} when the account is gone, disabled, or has already
+   *   been paid for this survey.
+   */
+  async completeSurvey(userId: string, surveyId: string, days: number): Promise<PublicUser> {
+    const now = this.#now()
+    const reward = Math.round(days)
+    if (!Number.isFinite(reward) || reward < 1 || reward > 365) {
+      throw new AccountError('INVALID_INPUT', 'the survey reward must be between 1 and 365 days', 400)
+    }
+    return this.#queue.run(async () => {
+      const user = this.#users.get(userId)
+      if (user === undefined) throw new AccountError('UNAUTHENTICATED', 'this account no longer exists', 401)
+      if (user.disabled) throw new AccountError('ACCOUNT_DISABLED', 'this account is disabled', 403)
+      const done = user.surveyCompletions ?? {}
+      if (done[surveyId] !== undefined) {
+        throw new AccountError(
+          'SURVEY_ALREADY_DONE',
+          'this account has already been paid for that survey',
+          409,
+        )
+      }
+      user.surveyCompletions = { ...done, [surveyId]: now }
+      const base = Math.max(now, user.entitlements.grantedPaidUntil ?? 0)
+      user.entitlements.grantedPaidUntil = base + reward * 86_400_000
+      user.updatedAt = now
+      this.#entitlementsChanged(user.id)
+      await this.#saveAccounts()
+      await this.#audit('survey-completed', { userId: user.id, surveyId, days: reward })
       return this.#public(user, null, now)
     })
   }
@@ -1157,6 +1217,7 @@ export class AccountStore {
         disabled: false,
         createdAt: now,
         redemptions: [],
+        ...(input.oncePerAccount === true ? { oncePerAccount: true } : {}),
       }
       this.#invites.set(code, invite)
       await this.#saveInvites()

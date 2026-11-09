@@ -16,6 +16,7 @@ import type { MailClient } from '../mail/client.js'
 import type { AccountStore } from './store.js'
 import { hashToken, validateDevice, validateEmail, validatePassword, validateUsername } from './store.js'
 import { AccountError, type DeviceInput, type GitHubIdentity } from './types.js'
+import type { SurveyClient } from '../surveys/client.js'
 import type { VerificationCodes } from './verification.js'
 import { RateWindow } from './rate.js'
 import { issueLanCertificate, LanCertificateError, type LanCA } from './lan.js'
@@ -68,6 +69,13 @@ export interface AccountApiOptions {
   readonly contact?: string
   /** The account CA that signs LAN device certificates; absent disables LAN. */
   readonly lanCA?: LanCA | null
+  /**
+   * The origin relay's survey store; absent answers `SURVEY_UNAVAILABLE`.
+   *
+   * The answers live on the other machine and the reward lives here. This is
+   * the wire between the two, and it is the only thing this API needs from it.
+   */
+  readonly surveys?: SurveyClient | null
   /**
    * Which of an account's devices currently have a tunnel, by device id → room.
    *
@@ -151,6 +159,9 @@ export class AccountApi {
   readonly #contact: string
   readonly #hosts: AccountApiOptions['hosts']
   readonly #lanCA: LanCA | null
+  readonly #surveys: SurveyClient | null
+  /** Survey submissions, keyed by account: one form is not a flood. */
+  readonly #surveyWindow = new RateWindow(10, 10 * 60_000)
   /** Password-reset starts, per address; a reset is a mail-bombing surface too. */
   readonly #resetWindow = new RateWindow(5, 60 * 60_000)
 
@@ -165,7 +176,7 @@ export class AccountApi {
     this.#contact = options.contact ?? 'shirazunagisa@icloud.com'
     this.#hosts = options.hosts
     this.#lanCA = options.lanCA ?? null
-    this.#lanCA = options.lanCA ?? null
+    this.#surveys = options.surveys ?? null
     this.#appleWeb = options.appleWeb ?? null
     this.#appleCallbackURL =
       options.publicBaseURL === undefined
@@ -276,6 +287,12 @@ export class AccountApi {
           break
         case 'POST /appstore/notifications':
           await this.#appStoreNotification(context)
+          break
+        case 'GET /surveys':
+          await this.#surveyList(context)
+          break
+        case 'POST /surveys/submit':
+          await this.#surveySubmit(context)
           break
         default:
           writeJson(response, 404, { error: 'NOT_FOUND', message: 'no such account endpoint' })
@@ -774,6 +791,96 @@ export class AccountApi {
     }
     const user = await this.#store.redeemInvite(token, code)
     writeJson(context.response, 200, { user })
+  }
+
+  // MARK: - Surveys
+
+  /**
+   * The surveys this phone may fill in, with its own completion state.
+   *
+   * Definitions come from the origin relay; "already done" is the account
+   * service's record, because that is the fact the reward depends on.
+   */
+  async #surveyList(context: RequestContext): Promise<void> {
+    const client = this.#surveys
+    if (client === null || !client.configured) {
+      throw new AccountError('SURVEY_UNAVAILABLE', 'surveys are not configured on this relay', 503)
+    }
+    const user = await this.#store.me(bearer(context.request), deviceIdOf(context.request))
+    const surveys = await client.list()
+    if (surveys === null) {
+      throw new AccountError('SURVEY_UNAVAILABLE', 'the survey server did not answer', 503)
+    }
+    const done = this.#store.surveyCompletions(user.id)
+    writeJson(context.response, 200, {
+      surveys: surveys.map((survey) => ({
+        ...survey,
+        completed: done[survey.id] !== undefined,
+        completedAt: done[survey.id] ?? null,
+      })),
+    })
+  }
+
+  /**
+   * Accept one filled-in survey and pay for it.
+   *
+   * The order is the whole rule: the origin relay has to store the answers
+   * first, and only then does this service grant the days. A reward for an
+   * answer that was never stored would be a grant nobody can audit; an answer
+   * stored for an account the origin already has is refused there, and the
+   * account relay refuses a second submission here even if it somehow got
+   * past the client.
+   */
+  async #surveySubmit(context: RequestContext): Promise<void> {
+    const client = this.#surveys
+    if (client === null || !client.configured) {
+      throw new AccountError('SURVEY_UNAVAILABLE', 'surveys are not configured on this relay', 503)
+    }
+    const body = await this.#json(context)
+    if (body === null) return
+    const surveyId = requireString(body, 'surveyId')
+    const rawAnswers = body['answers']
+    if (!Array.isArray(rawAnswers)) {
+      throw new AccountError('INVALID_INPUT', 'answers must be an array', 400)
+    }
+    const answers = rawAnswers
+      .filter((entry): entry is { questionId: string; value: unknown } =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as { questionId?: unknown }).questionId === 'string',
+      )
+      .map((entry) => ({
+        questionId: entry.questionId,
+        value: entry.value as string | string[],
+      }))
+    const token = bearer(context.request)
+    const key = hashToken(token)
+    if (!this.#surveyWindow.check(key)) {
+      this.#tooMany(context, 'too many survey submissions; try again later')
+      return
+    }
+    const user = await this.#store.me(token, deviceIdOf(context.request))
+    if (this.#store.surveyCompletions(user.id)[surveyId] !== undefined) {
+      throw new AccountError('SURVEY_ALREADY_DONE', 'this account has already answered that survey', 409)
+    }
+    const survey = await client.find(surveyId)
+    if (survey === null) {
+      // The origin may have answered the list but not this one: it is either
+      // closed or gone, and the phone is told the same thing either way.
+      throw new AccountError('SURVEY_NOT_FOUND', 'that survey is not available', 404)
+    }
+    const stored = await client.submit({
+      surveyId,
+      userId: user.id,
+      accountHash: key,
+      answers,
+    })
+    if (!stored.ok) {
+      const status = stored.code === 'SURVEY_ALREADY_DONE' ? 409 : 400
+      throw new AccountError(stored.code, stored.message, status)
+    }
+    const updated = await this.#store.completeSurvey(user.id, surveyId, survey.rewardDays)
+    writeJson(context.response, 200, { user: updated, rewardDays: survey.rewardDays })
   }
 
   async #appStoreTransaction(context: RequestContext): Promise<void> {

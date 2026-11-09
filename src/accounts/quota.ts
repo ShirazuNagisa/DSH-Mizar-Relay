@@ -77,6 +77,19 @@ export interface DataQuotaOptions {
   readonly frameBurst?: number
   /** Carried bytes allowed per identity per UTC day. `0` disables the budget. */
   readonly bytesPerDay: number
+  /**
+   * The day's allowance for one identity, when the plan decides it.
+   *
+   * The account relay carries two plans on one uplink: a paid account's 5 GiB
+   * and a free account's 500 MiB. Both are products of the same meter, and the
+   * ceiling has to be chosen per identity at admission time -- a second
+   * `DataQuota` would double the bookkeeping and let one caller spend both
+   * budgets. When this is set it replaces {@link bytesPerDay} for the identities
+   * it answers; returning 0 means "no byte limit for this identity" (the rate
+   * buckets still apply), which is how a relay with a single flat allowance
+   * keeps working.
+   */
+  readonly bytesPerDayFor?: (identity: string) => number
   /** Identity entries kept; the least recently used are evicted past this. */
   readonly maxEntries?: number
   /** Clock, injectable for tests. */
@@ -131,6 +144,7 @@ export class DataQuota {
   readonly #framesPerMinute: number
   readonly #frameBurst: number
   readonly #bytesPerDay: number
+  readonly #bytesPerDayFor: ((identity: string) => number) | null
   readonly #maxEntries: number
   readonly #now: () => number
   readonly #log: (message: string) => void
@@ -172,10 +186,28 @@ export class DataQuota {
       Math.floor(options.frameBurst ?? Math.max(100, this.#framesPerMinute / 10)),
     )
     this.#bytesPerDay = Math.max(0, Math.floor(options.bytesPerDay))
+    this.#bytesPerDayFor = options.bytesPerDayFor ?? null
     this.#maxEntries = Math.max(16, options.maxEntries ?? 20_000)
     this.#now = options.now ?? Date.now
     this.#log = options.log ?? (() => undefined)
     this.#onExhausted = options.onExhausted ?? null
+  }
+
+  /** Whether any byte budget is configured, flat or per identity. */
+  get #hasByteBudget(): boolean {
+    return this.#bytesPerDay > 0 || this.#bytesPerDayFor !== null
+  }
+
+  /**
+   * The bytes this identity may carry in one UTC day.
+   *
+   * @param identity - the traffic ledger's identity key.
+   * @returns the ceiling, `0` for no ceiling.
+   */
+  #limitFor(identity: string): number {
+    if (this.#bytesPerDayFor === null) return this.#bytesPerDay
+    const value = this.#bytesPerDayFor(identity)
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
   }
 
   /** Counters for `/healthz` and the admin pages. */
@@ -206,7 +238,7 @@ export class DataQuota {
    */
   admit(identity: string, bytes = 0): QuotaDecision {
     if (identity === '') return { allowed: true }
-    const disabled = this.#requestsPerMinute === 0 && this.#bytesPerDay === 0
+    const disabled = this.#requestsPerMinute === 0 && !this.#hasByteBudget
     if (disabled) return { allowed: true }
 
     const now = this.#now()
@@ -229,8 +261,10 @@ export class DataQuota {
     }
 
     // 2. The byte budget, charged for the carried size. Checked before the move
-    //    so an over-budget caller costs a lookup, not a megabyte.
-    if (this.#bytesPerDay > 0) {
+    //    so an over-budget caller costs a lookup, not a megabyte. The ceiling is
+    //    per identity when the plan decides it (see `bytesPerDayFor`).
+    const limit = this.#limitFor(identity)
+    if (limit > 0) {
       const day = dayKey(now)
       if (entry.day !== day) {
         // The day turned over: the allowance is fresh. Cheap to do lazily here
@@ -240,9 +274,9 @@ export class DataQuota {
         entry.warnedAt = 0
         entry.exhaustedDay = ''
       }
-      if (entry.bytes + bytes > this.#bytesPerDay) {
+      if (entry.bytes + bytes > limit) {
         this.#refusedBudget += 1
-        this.#warnSpend(identity, entry, now)
+        this.#warnSpend(identity, entry, limit, now)
         this.#noteExhausted(identity, entry, now)
         return {
           allowed: false,
@@ -282,7 +316,7 @@ export class DataQuota {
    */
   carry(identity: string, bytes = 0): QuotaDecision {
     if (identity === '') return { allowed: true }
-    if (this.#framesPerMinute === 0 && this.#bytesPerDay === 0) return { allowed: true }
+    if (this.#framesPerMinute === 0 && !this.#hasByteBudget) return { allowed: true }
 
     const now = this.#now()
     const entry = this.#entry(identity, now)
@@ -300,7 +334,8 @@ export class DataQuota {
       entry.frameTokens -= 1
     }
 
-    if (this.#bytesPerDay === 0) {
+    const limit = this.#limitFor(identity)
+    if (limit === 0) {
       entry.touchedAt = now
       return { allowed: true }
     }
@@ -312,9 +347,9 @@ export class DataQuota {
       entry.warnedAt = 0
       entry.exhaustedDay = ''
     }
-    if (entry.bytes + bytes > this.#bytesPerDay) {
+    if (entry.bytes + bytes > limit) {
       this.#refusedBudget += 1
-      this.#warnSpend(identity, entry, now)
+      this.#warnSpend(identity, entry, limit, now)
       this.#noteExhausted(identity, entry, now)
       return {
         allowed: false,
@@ -338,7 +373,9 @@ export class DataQuota {
    * @param bytes - payload bytes carried.
    */
   charge(identity: string, bytes: number): void {
-    if (identity === '' || this.#bytesPerDay === 0 || bytes <= 0) return
+    if (identity === '' || bytes <= 0) return
+    const limit = this.#limitFor(identity)
+    if (limit === 0) return
     const now = this.#now()
     const entry = this.#entry(identity, now)
     const day = dayKey(now)
@@ -350,8 +387,8 @@ export class DataQuota {
     }
     entry.bytes += Math.floor(bytes)
     entry.touchedAt = now
-    if (entry.bytes > this.#bytesPerDay) {
-      this.#warnSpend(identity, entry, now)
+    if (entry.bytes > limit) {
+      this.#warnSpend(identity, entry, limit, now)
       this.#noteExhausted(identity, entry, now)
     }
   }
@@ -438,12 +475,12 @@ export class DataQuota {
   }
 
   /** Log a spent budget at most once an hour per identity. */
-  #warnSpend(identity: string, entry: QuotaEntry, now: number): void {
+  #warnSpend(identity: string, entry: QuotaEntry, limit: number, now: number): void {
     if (now - entry.warnedAt < 3_600_000) return
     entry.warnedAt = now
     const label = identity.length > 24 ? `${identity.slice(0, 24)}…` : identity
     this.#log(
-      `quota: ${label} spent its ${Math.round(this.#bytesPerDay / (1024 * 1024))}MiB daily budget ` +
+      `quota: ${label} spent its ${Math.round(limit / (1024 * 1024))}MiB daily budget ` +
         `(${Math.round(entry.bytes / (1024 * 1024))}MiB); further requests are refused until the day turns over`,
     )
   }

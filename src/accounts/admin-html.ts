@@ -18,6 +18,8 @@ function layout(title: string, body: string, options: { readonly signedIn: boole
         <a href="/admin/users">用户</a>
         <a href="/admin/guests">未注册客户端</a>
         <a href="/admin/invites">邀请码</a>
+        <a href="/admin/announcements">公告</a>
+        <a href="/admin/surveys">问卷</a>
         <a href="/admin/traffic">流量</a>
         <a href="/admin/settings">设置</a>
         <form method="post" action="/admin/logout" class="inline"><button type="submit">退出</button></form>
@@ -376,6 +378,8 @@ export interface AdminInviteRow {
   readonly expiresAt: number | null
   readonly disabled: boolean
   readonly createdAt: number
+  /** One grant per account, whatever the use count says. */
+  readonly oncePerAccount: boolean
 }
 
 /** The invites page. */
@@ -383,7 +387,7 @@ export function invitesPage(rows: readonly AdminInviteRow[], csrf: string, notic
   const body = rows
     .map(
       (row) => `<tr>
-        <td class="mono">${h(row.code)}</td>
+        <td class="mono"><a href="/admin/invites/${encodeURIComponent(row.code)}">${h(row.code)}</a>${row.oncePerAccount ? ' <span class="pill paid">限一次</span>' : ''}</td>
         <td>${row.days} 天</td>
         <td>${row.uses} / ${row.maxUses}</td>
         <td>${row.expiresAt === null ? '—' : h(formatTime(row.expiresAt))}</td>
@@ -403,6 +407,7 @@ export function invitesPage(rows: readonly AdminInviteRow[], csrf: string, notic
        <label>自定义码（留空自动生成）<input name="code" maxlength="64" placeholder="MZ-XXXX-XXXX-XXXX"></label>
        <label>天数<input name="days" type="number" min="1" max="3650" value="30" required></label>
        <label>最大使用次数<input name="maxUses" type="number" min="1" max="1000" value="1" required></label>
+       <label class="check"><input name="oncePerAccount" type="checkbox" value="1"> 每个账户只能用一次（多人都能用，但同一账户只领一次）</label>
        <label>过期天数（留空永不过期）<input name="expiresDays" type="number" min="1" max="3650"></label>
        <button type="submit">创建邀请码</button>
      </form>
@@ -490,6 +495,153 @@ export function settingsPage(data: AdminSettingsData): string {
        <tr><th>版本</th><td class="mono">${h(data.version)}</td></tr>
      </tbody></table>
      <p class="muted" style="margin-top:16px">端口、令牌、TLS 等底层配置在 <span class="mono">relay.config.json</span> 中，后台只读展示。</p>`,
+    { signedIn: true },
+  )
+}
+
+
+/** One announcement row for the admin page. */
+export interface AdminAnnouncementRow {
+  readonly id: string
+  readonly title: string
+  readonly body: string
+  readonly symbol: string
+  readonly tone: 'info' | 'notice'
+  readonly button: { readonly label: string; readonly target: string } | null
+  readonly createdAt: number
+  readonly expiresAt: number | null
+  readonly active: boolean
+}
+
+/** The announcement page: what is live, and the form that makes another one. */
+export function announcementsPage(
+  rows: readonly AdminAnnouncementRow[],
+  targets: readonly string[],
+  csrf: string,
+  notice?: string,
+): string {
+  const body = rows
+    .map(
+      (row) => `<tr>
+        <td class="muted mono">${h(formatTime(row.createdAt))}</td>
+        <td><strong>${h(row.title)}</strong><div class="muted">${h(row.body)}</div></td>
+        <td>${row.button === null ? '<span class="muted">—</span>' : `${h(row.button.label)} → ${h(row.button.target)}`}</td>
+        <td>${row.active ? '<span class="pill paid">显示中</span>' : '<span class="pill bad">已停止</span>'}</td>
+        <td class="actions">
+          ${row.active ? `<form method="post" action="/admin/announcements/${encodeURIComponent(row.id)}/stop"><input type="hidden" name="_csrf" value="${h(csrf)}"><button class="ghost" type="submit">停止</button></form>` : ''}
+          <form method="post" action="/admin/announcements/${encodeURIComponent(row.id)}/delete"><input type="hidden" name="_csrf" value="${h(csrf)}"><button class="danger" type="submit">删除</button></form>
+        </td>
+      </tr>`,
+    )
+    .join('')
+  const options = targets.map((target) => `<option value="${h(target)}">${h(target)}</option>`).join('')
+  return layout(
+    '公告',
+    `<h2>应用内公告 <span class="muted">(${rows.length})</span></h2>
+     <p class="muted">发送后立刻出现在所有在线的手机上；没开的手机不会补发。按钮可以选择跳到设置里的某一页，不填就不显示按钮。</p>
+     <form method="post" action="/admin/announcements" class="stack" style="margin-bottom:20px">
+       <input type="hidden" name="_csrf" value="${h(csrf)}">
+       <label>标题<input name="title" maxlength="120" required placeholder="例如：0.9.9 已经可以更新"></label>
+       <label>正文<textarea name="body" maxlength="600" rows="3" required placeholder="一两句话，手机上会折行显示"></textarea></label>
+       <label>图标（SF Symbol，可留空）<input name="symbol" maxlength="60" placeholder="megaphone"></label>
+       <label>配色
+         <select name="tone">
+           <option value="info">强调色（信息）</option>
+           <option value="notice">橙色（注意）</option>
+         </select>
+       </label>
+       <label>按钮文字（留空 = 没有按钮）<input name="buttonLabel" maxlength="24" placeholder="去设置"></label>
+       <label>按钮跳到
+         <select name="buttonTarget"><option value="">不跳转</option>${options}</select>
+       </label>
+       <label>显示多少分钟后自动消失（留空 = 直到手动停止）<input name="minutes" type="number" min="1" max="525600"></label>
+       <button type="submit">发送公告</button>
+     </form>
+     <table><thead><tr><th>发送时间</th><th>公告</th><th>按钮</th><th>状态</th><th></th></tr></thead><tbody>${body || '<tr><td colspan="5" class="muted">还没有发过公告</td></tr>'}</tbody></table>`,
+    { signedIn: true, ...(notice === undefined ? {} : { notice }) },
+  )
+}
+
+/** One survey row for the admin page. */
+export interface AdminSurveyRow {
+  readonly id: string
+  readonly title: string
+  readonly summary: string
+  readonly rewardDays: number
+  readonly questions: number
+  readonly answers: number
+  readonly active: boolean
+  readonly expiresAt: number | null
+}
+
+/** The survey page: what is dispatched, and how many people answered. */
+export function surveysPage(
+  rows: readonly AdminSurveyRow[],
+  reachable: boolean,
+  csrf: string,
+  notice?: string,
+): string {
+  const body = rows
+    .map(
+      (row) => `<tr>
+        <td class="mono">${h(row.id)}</td>
+        <td><strong>${h(row.title)}</strong><div class="muted">${h(row.summary)}</div></td>
+        <td>${row.rewardDays} 天</td>
+        <td>${row.questions}</td>
+        <td>${row.answers}</td>
+        <td>${row.active ? '<span class="pill paid">进行中</span>' : '<span class="pill bad">已结束</span>'}</td>
+      </tr>`,
+    )
+    .join('')
+  const warning = reachable
+    ? ''
+    : '<p class="notice">问卷服务器（主力0）没有回应，下面的数字可能不是最新的。</p>'
+  return layout(
+    '问卷',
+    `<h2>问卷 <span class="muted">(${rows.length})</span></h2>
+     ${warning}
+     <p class="muted">问卷定义与原始答案保存在主力0；这里显示的是定义和回答数。用户填完后由账号服务发放奖励，每份问卷每人只能答一次、只能领一次。</p>
+     <table><thead><tr><th>ID</th><th>问卷</th><th>奖励</th><th>题数</th><th>回答</th><th>状态</th></tr></thead><tbody>${body || '<tr><td colspan="6" class="muted">还没有问卷</td></tr>'}</tbody></table>
+     <p class="muted">新建问卷在主力0上用 <code>node lib/survey-cli.js create &lt;文件&gt;</code>，答案导出用 <code>node lib/survey-cli.js responses</code>。</p>`,
+    { signedIn: true, ...(notice === undefined ? {} : { notice }) },
+  )
+}
+
+/** One invite detail row: who used it. */
+export interface AdminInviteRedemption {
+  readonly username: string
+  readonly email: string | null
+  readonly userId: string
+  readonly at: number
+}
+
+/** One invite code's page: totals, and the accounts that used it. */
+export function inviteDetailPage(input: {
+  readonly code: string
+  readonly days: number
+  readonly uses: number
+  readonly maxUses: number
+  readonly oncePerAccount: boolean
+  readonly disabled: boolean
+  readonly redemptions: readonly AdminInviteRedemption[]
+}): string {
+  const rows = input.redemptions
+    .map(
+      (row) => `<tr>
+        <td><strong>${h(row.username)}</strong></td>
+        <td>${row.email === null ? '<span class="muted">—</span>' : h(row.email)}</td>
+        <td class="mono muted">${h(row.userId)}</td>
+        <td class="muted">${h(formatTime(row.at))}</td>
+      </tr>`,
+    )
+    .join('')
+  return layout(
+    `邀请码 ${input.code}`,
+    `<h2>邀请码 <span class="mono">${h(input.code)}</span></h2>
+     <p class="muted">${input.days} 天 · 已用 ${input.uses} / ${input.maxUses}${input.oncePerAccount ? ' · 每个账户只能用一次' : ''}${input.disabled ? ' · 已停用' : ''}</p>
+     <p><a href="/admin/invites">← 回到邀请码列表</a></p>
+     <h3>使用记录 <span class="muted">(${input.redemptions.length})</span></h3>
+     <table><thead><tr><th>账户</th><th>邮箱</th><th>用户 ID</th><th>时间</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="muted">还没有人使用</td></tr>'}</tbody></table>`,
     { signedIn: true },
   )
 }

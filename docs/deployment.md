@@ -1331,10 +1331,12 @@ The relay strips both before replaying the request to the computer. Identities:
 - `anon:<hash>` — an old client that sent neither header
 
 Counters are per UTC day and per relay, kept 90 days. The free relay posts
-batches every 30 seconds to `/internal/v1/traffic` on the account relay with
+batches every 30 seconds to `/internal/v1/traffic` on the account relay over the
+**private address** (`accounts.reportTo: "http://10.0.0.6"`), with
 `Authorization: Bearer <accounts.internalSecret>`; the account relay merges them
 and the admin UI shows user/guest totals. A failed report is buffered in memory
-and retried; relaying itself never waits for it.
+and retried; relaying itself never waits for it. See 11.13 for why it is HTTP on
+port 80 rather than a private port.
 
 The paid relay reads one more header, `x-mizar-session`, which carries the
 session token itself rather than its hash — the gate described in 11.7 needs to
@@ -1365,7 +1367,7 @@ the token is used for nothing but this check.
 | token unknown / expired | `401` | `UNAUTHENTICATED` | sign in again |
 | token signed out elsewhere | `401` | `SESSION_REVOKED` | sign in again |
 | account disabled | `403` | `ACCOUNT_DISABLED` | contact the operator |
-| signed in, not paying | `402` | `PAID_REQUIRED` | subscribe, or use the free relay |
+| signed in, not paying | `402` | `PAID_REQUIRED` | subscribe; with `allowFreeAccounts` the same account is carried at the free ceiling instead |
 
 Refusals also carry `x-mizar-gate: <code>`, so a proxy log is enough to tell a
 paywall rejection from a network failure.
@@ -1395,6 +1397,7 @@ actually spent.
 | `paidGate.mode` | `MIZAR_PAID_GATE` | `enforce` when `role=1` and accounts are enabled, else `off` | `off` does not check, `observe` counts and logs refusals but lets them through, `enforce` refuses. `true`/`false` are accepted as shorthand for `enforce`/`off` |
 | `paidGate.allowUnaccounted` | `MIZAR_PAID_GATE_ALLOW_UNACCOUNTED` | `false` | let a phone with **no** account at all through. For a client that cannot sign in yet (Android today); it does not let a free *account* through. **This is a rollout crutch, not a security setting**: the relay cannot tell an Android from anyone else who simply omits the header, so while it is on, the paywall only stops accounts that do present a token |
 | `paidGate.cacheTtlMs` | `MIZAR_PAID_GATE_CACHE_TTL` | `60000` | how long a verified entitlement is reused. A refund, sign-out or downgrade invalidates it immediately through the store's listener, so this only bounds the cost of the common case |
+| `paidGate.allowFreeAccounts` | `MIZAR_PAID_GATE_ALLOW_FREE` | `false` | carry a **signed-in free account** at the free allowance instead of refusing it with `402`. From 0.9.9 the iOS app sends every plan to this relay, so a production account relay sets this to `true`; the paywall then costs a free account bytes rather than the door. A phone with no account is still refused unless `allowUnaccounted` is also on |
 
 `mode` is validated at startup: a typo throws rather than silently leaving the
 paywall down, and `enforce` with `accounts.enabled: false` is refused outright —
@@ -1620,3 +1623,136 @@ that rather than promising a deletion the architecture cannot honour.
 **Disk.** A turn is roughly 2–5 KB; the free relay's 40 GB disk holds years of
 turns at realistic opt-in rates. If `MAX_ARCHIVE` or the disk fills, the receiver
 answers 413 and the sender keeps its cache — the failure is safe by construction.
+
+### 11.13 Internal relay-to-relay traffic, surveys, and in-app announcements (0.4.0)
+
+Three features shipped together in 0.4.0, because two of them depend on the
+first: the two relays now talk to each other **only over the private network**,
+the free relay stores the operator's surveys, and the account relay pushes
+banners to phones.
+
+#### Internal traffic, and why it is HTTP on port 80
+
+The obvious design is a second listener on a private port
+(`internal: { host: "10.0.0.12", port: 8790 }`). On these two VMs the cloud
+security group does not open 8790 (or any port except 22/80/443/8443), and the
+group is not editable from the shell, so that listener is unreachable from the
+other host even though it binds correctly. The relay still supports it (and the
+tests use it), but the production pair uses nginx instead:
+
+```nginx
+# In each relay's vhost, before the catch-all location:
+location ^~ /internal/v1/ {
+    allow 10.0.0.0/22;      # the private subnet only
+    deny all;               # everyone else gets 403, including the public IP
+    proxy_pass http://127.0.0.1:8787;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    client_max_body_size 256k;
+}
+```
+
+Two more nginx details are needed on the free relay (主力0), whose vhost forces
+HTTPS from the same server block:
+
+```nginx
+listen 80 default_server;         # so Host: 10.0.0.12 reaches this vhost
+# and, inside the HTTPS_TO_HTTPS block, before the rewrite:
+if ( $uri ~ ^/internal/v1/ ) { set $isRedcert 1; }
+```
+
+With that, `http://10.0.0.12/internal/v1/*` (port 80, private address) works and
+`https://dshmizar.shirazu-nagisa.com/internal/v1/*` from the internet answers
+`403`. The payloads are plain HTTP, which is acceptable because they never leave
+the VPC; the alternative — TLS on the private IP — fails certificate
+verification, and using the public hostname would leave the VPC.
+
+What rides it:
+
+| Path | From → to | Used by |
+|---|---|---|
+| `/internal/v1/traffic` | 主力0 → 主力1 | traffic ledger batches |
+| `/internal/v1/mail` | 主力1 → 主力0 | verification and reset mail |
+| `/internal/v1/surveys*` | 主力1 → 主力0 | survey definitions and answers |
+| `/internal/v1/invites`, `/internal/v1/announcements` | operator → 主力1 | admin tooling (loopback on the server) |
+
+All of them require `Authorization: Bearer <accounts.internalSecret>`; a missing
+or wrong secret is `401`. `accounts.internalSecret` must be the same 64-character
+value on both hosts (it already was, for the traffic reports).
+
+**Config on 主力0 (role 0):**
+
+```json
+"surveys": { "enabled": true, "dataDir": "/www/wwwroot/dsh-mizar-relay/data/surveys" },
+"accounts": { "reportTo": "http://10.0.0.6" }
+```
+
+**Config on 主力1 (role 1):**
+
+```json
+"surveys": { "upstreamURL": "http://10.0.0.12" },
+"mail": { "service": { "url": "http://10.0.0.12" } },
+"abuse": { "bytesPerDayFree": 524288000 },
+"accounts": { "paidGate": { "mode": "enforce", "allowUnaccounted": false, "allowFreeAccounts": true } }
+```
+
+`mail.service.url` without a port means 80; the old public URL still works for
+rollback, but the internal one keeps the mail token off the public listener.
+
+#### Surveys
+
+Definitions and answers live in `data/surveys/` on the relay that answers
+`/internal/v1/surveys` (主力0):
+
+- `definitions.json` — the surveys, written atomically.
+- `responses.jsonl` — append-only; one line per submission, never rewritten.
+
+The account relay (主力1) is what phones call (`GET /account/v1/surveys`,
+`POST /account/v1/surveys/submit`). It proxies definitions, and on submission it
+**stores the answer on the origin first** — no reward without a stored answer —
+then pays `rewardDays` through the account store. The completion is recorded per
+account in `accounts.json` (`surveyCompletions`), so the same account cannot be
+paid twice for one survey even if it submits twice concurrently.
+
+Operate it with `survey-cli` (run on the host that owns the store):
+
+```bash
+node lib/survey-cli.js list
+node lib/survey-cli.js create survey.json      # {id,title,summary,rewardDays,minutes,questions}
+node lib/survey-cli.js responses <id>          # one line per answer
+node lib/survey-cli.js close <id>
+node lib/survey-cli.js export answers.json     # the whole file, for analysis
+```
+
+The admin UI has a 问卷 page that lists definitions, response counts and closes
+one; the responses themselves are the JSONL, deliberately not editable from the
+browser.
+
+#### In-app announcements
+
+The account relay owns the banners (`data/announcements/announcements.json`,
+atomic, 200 kept). Phones open a WebSocket to
+`wss://dshmizar-1.shirazu-nagisa.com/app/v1/announcements` with
+`x-mizar-session: <token>` (or `?session=`); the relay sends a `snapshot` frame
+on connect and an `announcement` frame whenever one is created. A phone that
+cannot hold a socket reads the same objects from `GET /account/v1/announcements`.
+
+An announcement is `{id,title,body,symbol,tone,button,createdAt,expiresAt,active}`
+where `button` is `null` or `{label, target}` and `target` is a settings shelf id
+(`account`, `notifications`, `sending`, `transfer`, `localAgent`, `files`,
+`community`, `logs`, `about`). The phone hides a button whose target it does not
+know, so adding a shelf later cannot break an old build.
+
+Create one (on the account host, loopback):
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/internal/v1/announcements \
+  -H "authorization: Bearer $INTERNAL_SECRET" -H 'content-type: application/json' \
+  -d '{"title":"…","body":"…","symbol":"megaphone.fill","tone":"info",
+       "buttonLabel":"打开通知设置","buttonTarget":"notifications","minutes":60}'
+```
+
+Or use the admin UI's 公告 page. `minutes` is how long it stays live; omitting it
+means until `stop`ped. Stopping one (`DELETE /internal/v1/announcements/<id>`)
+does not retract the frame from phones that already received it — a banner is a
+broadcast, not a queue, and each phone shows a given id once.

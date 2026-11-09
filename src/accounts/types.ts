@@ -108,6 +108,15 @@ export interface UserRecord {
   readonly createdAt: number
   updatedAt: number
   lastSeenAt: number
+  /**
+   * Surveys this account has been paid for, as `surveyId -> submittedAt`.
+   *
+   * The origin relay stores the answers; this is the one fact the reward needs,
+   * and keeping it here is what makes "one grant per account per survey" a rule
+   * the account service owns rather than something the client promises.
+   * Absent on accounts written before surveys existed.
+   */
+  surveyCompletions?: Record<string, number>
   /** The device roster; rewritten by `#normalizeDevices` on load and sign-in. */
   devices: DeviceRecord[]
   entitlements: Entitlements
@@ -150,6 +159,15 @@ export interface InviteRecord {
   disabled: boolean
   readonly createdAt: number
   readonly redemptions: Array<{ userId: string; at: number }>
+  /**
+   * Whether one account may redeem it only once.
+   *
+   * Off for the historical codes, where `maxUses` was the only bound; on for a
+   * capability like the TestFlight code, where the intent is one grant per
+   * person and `maxUses` only bounds how many people can have it. Absent on
+   * records written before this existed, which reads as false.
+   */
+  readonly oncePerAccount?: boolean
 }
 
 /** The persistent invite file. */

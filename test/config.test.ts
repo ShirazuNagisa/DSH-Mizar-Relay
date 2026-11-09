@@ -247,6 +247,9 @@ describe('the relay role and account service', () => {
     expect(config.accounts?.paidGate).toEqual({
       mode: 'enforce',
       allowUnaccounted: false,
+      // The free lane is off unless an operator asks for it: the relay is the
+      // paid one, and 0.9.9 turns this on deliberately.
+      allowFreeAccounts: false,
       cacheTtlMs: 60_000,
       strict: false,
     })

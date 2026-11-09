@@ -17,15 +17,20 @@ import { verifyPassword } from './passwords.js'
 import { RateWindow } from './rate.js'
 import type { AccountStore } from './store.js'
 import type { TrafficLedger } from './traffic.js'
+import { ANNOUNCEMENT_TARGETS, type AnnouncementStore } from '../announcements/store.js'
+import type { SurveyClient } from '../surveys/client.js'
 import { effectivePaidUntil } from './appstore/entitlements.js'
 import { dayKey } from './traffic.js'
 import {
+  announcementsPage,
   dashboardPage,
   formatBytes,
   guestsPage,
+  inviteDetailPage,
   invitesPage,
   loginPage,
   settingsPage,
+  surveysPage,
   trafficPage,
   userPage,
   usersPage,
@@ -34,6 +39,7 @@ import {
   type AdminTrafficData,
   type AdminUserDetail,
   type AdminUserRow,
+  type AdminSurveyRow,
 } from './admin-html.js'
 
 /** The cookie the admin session lives in. */
@@ -59,6 +65,10 @@ export interface AdminOptions {
   readonly trustProxy: boolean
   /** The paid gate's mode, for the settings page. */
   readonly paidGate?: string
+  /** The banner store, when this relay has one. */
+  readonly announcements?: AnnouncementStore | null
+  /** The origin relay's surveys, when this relay can reach them. */
+  readonly surveys?: SurveyClient | null
   readonly now?: () => number
 }
 
@@ -117,12 +127,17 @@ export class AdminApi {
             return this.#guests(response)
           case '/admin/invites':
             return this.#invites(response, url, session.csrf)
+          case '/admin/announcements':
+            return this.#announcementsPage(response, url, session.csrf)
+          case '/admin/surveys':
+            return await this.#surveysPage(response, url, session.csrf)
           case '/admin/traffic':
             return this.#traffic(response)
           case '/admin/settings':
             return this.#settings(response)
           default:
             if (path.startsWith('/admin/users/')) return this.#user(response, url, session.csrf)
+            if (path.startsWith('/admin/invites/')) return this.#inviteDetail(response, url)
             break
         }
       }
@@ -397,8 +412,99 @@ export class AdminApi {
       expiresAt: invite.expiresAt,
       disabled: invite.disabled,
       createdAt: invite.createdAt,
+      oncePerAccount: invite.oncePerAccount === true,
     }))
     writeHtml(response, 200, invitesPage(rows, csrf, url.searchParams.get('notice') ?? undefined))
+    return true
+  }
+
+  /** Announcements page. */
+  #announcementsPage(response: ServerResponse, url: URL, csrf: string): boolean {
+    const store = this.#options.announcements ?? null
+    if (store === null) {
+      writeHtml(response, 404, '<!doctype html><title>404</title><p>这个中继没有公告。</p>')
+      return true
+    }
+    const rows = store.list().map((one) => ({
+      id: one.id,
+      title: one.title,
+      body: one.body,
+      symbol: one.symbol,
+      tone: one.tone,
+      button: one.button,
+      createdAt: one.createdAt,
+      expiresAt: one.expiresAt,
+      active: one.active && (one.expiresAt === null || one.expiresAt > this.#now()),
+    }))
+    writeHtml(
+      response,
+      200,
+      announcementsPage(
+        rows,
+        ANNOUNCEMENT_TARGETS,
+        csrf,
+        url.searchParams.get('notice') ?? undefined,
+      ),
+    )
+    return true
+  }
+
+  /** Surveys page: definitions and how many people answered. */
+  async #surveysPage(response: ServerResponse, url: URL, csrf: string): Promise<boolean> {
+    const client = this.#options.surveys ?? null
+    const definitions = client === null ? null : await client.list()
+    const summary = client === null ? null : await client.summary()
+    const counts = new Map(
+      (summary?.counts ?? []).map((entry) => [entry.id, entry.answers] as const),
+    )
+    const rows: AdminSurveyRow[] = (definitions ?? []).map((survey) => ({
+      id: survey.id,
+      title: survey.title,
+      summary: survey.summary,
+      rewardDays: survey.rewardDays,
+      questions: survey.questions.length,
+      answers: counts.get(survey.id) ?? 0,
+      active: survey.active && (survey.expiresAt === null || survey.expiresAt > this.#now()),
+      expiresAt: survey.expiresAt,
+    }))
+    writeHtml(
+      response,
+      200,
+      surveysPage(rows, definitions !== null, csrf, url.searchParams.get('notice') ?? undefined),
+    )
+    return true
+  }
+
+  /** One invite code's page: totals, and who used it. */
+  #inviteDetail(response: ServerResponse, url: URL): boolean {
+    const code = decodeURIComponent(url.pathname.slice('/admin/invites/'.length))
+    const invite = this.#options.store.allInvites().find((one) => one.code === code)
+    if (invite === undefined) {
+      writeHtml(response, 404, '<!doctype html><title>404</title><p>没有这个邀请码。</p>')
+      return true
+    }
+    const redemptions = invite.redemptions.map((redemption) => {
+      const user = this.#options.store.findUser(redemption.userId)
+      return {
+        username: user?.username ?? '(已删除)',
+        email: user?.email ?? null,
+        userId: redemption.userId,
+        at: redemption.at,
+      }
+    })
+    writeHtml(
+      response,
+      200,
+      inviteDetailPage({
+        code: invite.code,
+        days: invite.days,
+        uses: invite.uses,
+        maxUses: invite.maxUses,
+        oncePerAccount: invite.oncePerAccount === true,
+        disabled: invite.disabled,
+        redemptions,
+      }),
+    )
     return true
   }
 
@@ -522,6 +628,43 @@ export class AdminApi {
       redirect(response, `/admin/users/${encodeURIComponent(id)}?notice=${encodeURIComponent('流量警告已清零')}`)
       return true
     }
+    if (path === '/admin/announcements') {
+      const announcements = this.#options.announcements ?? null
+      if (announcements === null) {
+        writeHtml(response, 404, '<!doctype html><title>404</title><p>这个中继没有公告。</p>')
+        return true
+      }
+      const minutes = Number(form.get('minutes') ?? '')
+      try {
+        await announcements.create({
+          title: form.get('title') ?? '',
+          body: form.get('body') ?? '',
+          symbol: form.get('symbol') ?? '',
+          tone: form.get('tone') === 'notice' ? 'notice' : 'info',
+          buttonLabel: form.get('buttonLabel') ?? null,
+          buttonTarget: form.get('buttonTarget') ?? null,
+          minutes: Number.isFinite(minutes) && minutes > 0 ? minutes : null,
+        })
+        redirect(response, `/admin/announcements?notice=${encodeURIComponent('公告已发送')}`)
+      } catch (error) {
+        redirect(
+          response,
+          `/admin/announcements?notice=${encodeURIComponent((error as Error).message)}`,
+        )
+      }
+      return true
+    }
+    const announcementMatch = /^\/admin\/announcements\/([^/]+)\/(stop|delete)$/.exec(path)
+    if (announcementMatch !== null) {
+      const announcements = this.#options.announcements ?? null
+      const id = decodeURIComponent(announcementMatch[1] ?? '')
+      if (announcements !== null) {
+        if (announcementMatch[2] === 'delete') await announcements.remove(id)
+        else await announcements.stop(id)
+      }
+      redirect(response, `/admin/announcements?notice=${encodeURIComponent('公告已更新')}`)
+      return true
+    }
     if (path === '/admin/invites') {
       const code = form.get('code') ?? ''
       const days = Number(form.get('days') ?? '30')
@@ -531,6 +674,7 @@ export class AdminApi {
         ...(code.trim() === '' ? {} : { code }),
         days: Number.isFinite(days) ? days : 30,
         maxUses: Number.isFinite(maxUses) ? maxUses : 1,
+        oncePerAccount: form.get('oncePerAccount') === '1',
         expiresAt:
           Number.isFinite(expiresDays) && expiresDays > 0
             ? this.#now() + Math.min(3650, Math.round(expiresDays)) * 86_400_000

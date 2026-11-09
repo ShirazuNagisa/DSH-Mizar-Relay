@@ -21,6 +21,7 @@
  * @module dsh-mizar-relay/index
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
 import { pathToFileURL } from 'node:url'
@@ -48,6 +49,9 @@ import {
   type RelayConfig,
 } from './config.js'
 import { FcmClient } from './fcm.js'
+import { AnnouncementError, AnnouncementStore } from './announcements/store.js'
+import { SurveyError, SurveyStore } from './surveys/store.js'
+import { SurveyClient } from './surveys/client.js'
 import { handleDatasetIngest } from './dataset/ingest.js'
 import { lanCaFromEnvironment, type LanCA } from './accounts/lan.js'
 import { handleDatasetReceive } from './dataset/receive.js'
@@ -73,6 +77,16 @@ const RELAY_VERSION = '0.3.5'
 /** Path prefix of the push API. */
 const PUSH_PREFIX = '/push/v1/'
 
+/**
+ * Where a phone holds its announcement socket.
+ *
+ * On the *tunnel* origin, not the account API: an upgrade cannot be proxied by
+ * the account relay's `fetch`-based forwarder, so the socket has to be answered
+ * by the relay that holds the accounts. `/account/v1/announcements` is the
+ * polling twin for a client that cannot hold a socket.
+ */
+const ANNOUNCEMENT_PATH = '/app/v1/announcements'
+
 /** Largest push request body. A notification is a few hundred bytes. */
 const MAX_PUSH_BODY_BYTES = 64 * 1024
 
@@ -96,6 +110,8 @@ const BEARER_PREFIX = 'bearer '
 export interface Relay {
   /** The port it actually bound, which differs from the config when 0 was asked for. */
   readonly port: number
+  /** The private relay-to-relay port, or `null` when this relay has no such listener. */
+  readonly internalPort: number | null
   /** Stop listening and close every tunnel. */
   close(): Promise<void>
 }
@@ -441,6 +457,7 @@ export async function startRelay(
           store: accountStore,
           mode: gateConfig.mode,
           allowUnaccounted: gateConfig.allowUnaccounted,
+          allowFreeAccounts: gateConfig.allowFreeAccounts === true,
           cacheTtlMs: gateConfig.cacheTtlMs,
           ...(deps.now === undefined ? {} : { now: deps.now }),
           log,
@@ -468,10 +485,25 @@ export async function startRelay(
   // The data-plane meter. One instance, keyed by the same identity keys the
   // traffic ledger uses, so a caller cannot get a fresh budget by rotating
   // headers and the two agree on who spent what.
+  const freeBytesPerDay = abuse.bytesPerDayFree > 0 ? abuse.bytesPerDayFree : abuse.bytesPerDay
   const quota = new DataQuota({
     requestsPerMinute: abuse.requestsPerMinute,
     ...(abuse.burst > 0 ? { burst: abuse.burst } : {}),
     bytesPerDay: abuse.bytesPerDay,
+    // Both plans ride this meter once the account relay carries free accounts.
+    // The ceiling is chosen at admission from the store, so a free account can
+    // never spend the paid allowance and the bytes are still charged to an
+    // identity that cannot be rotated.
+    ...(accountStore === null
+      ? {}
+      : {
+          bytesPerDayFor: (identity: string): number => {
+            if (!identity.startsWith('account:')) return freeBytesPerDay
+            return accountStore.planForSessionHash(identity.slice('account:'.length)) === 'paid'
+              ? abuse.bytesPerDay
+              : freeBytesPerDay
+          },
+        }),
     onExhausted: (identity: string, bytes: number, day: string) => {
       // Recorded for the report as well as for the policy: a free relay's
       // account lives on the account relay, and it can only warn if the
@@ -593,6 +625,309 @@ export async function startRelay(
   function chargeBytes(ipKey: string | null, identityKey: string, bytes: number): void {
     quota.charge(identityKey, bytes)
     if (ipKey !== null) ipQuota.charge(ipKey, bytes)
+  }
+
+  /**
+   * The shared secret every internal caller presents.
+   *
+   * `internal.secret` when the private listener exists; the account block's
+   * secret otherwise, which is what a deployment had before the listener did.
+   */
+  const internalSecret =
+    config.internal?.secret !== undefined && config.internal.secret !== ''
+      ? config.internal.secret
+      : (accountsConfig?.internalSecret ?? '')
+
+  // MARK: - Announcements and surveys
+
+  /**
+   * The announcement store, on the relay that owns accounts.
+   *
+   * A free relay has nobody to address a banner to, so it has no store: the
+   * socket endpoint answers 404 there and the admin page does not exist.
+   */
+  const announcements =
+    accountsConfig?.enabled === true
+      ? await AnnouncementStore.open({
+          dataDir: join(accountsConfig.dataDir, 'announcements'),
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+      : null
+
+  /**
+   * The survey store, on the origin relay.
+   *
+   * The account relay forwards answers here and keeps only the completion flag,
+   * because the reward is an entitlement and the answers are the operator's
+   * data. Only one of the two processes has `surveys.enabled`.
+   */
+  const surveys =
+    config.surveys?.enabled === true
+      ? await SurveyStore.open({
+          dataDir: config.surveys.dataDir,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+      : null
+
+  /**
+   * The account relay's wire to the origin store.
+   *
+   * `surveys.upstreamURL` is the private listener's address on the origin
+   * relay, so answers never cross the public internet.
+   */
+  const surveyClient =
+    config.surveys?.upstreamURL !== undefined &&
+    config.surveys.upstreamURL !== '' &&
+    internalSecret !== ''
+      ? new SurveyClient({
+          upstreamURL: config.surveys.upstreamURL,
+          secret: internalSecret,
+          ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          log,
+        })
+      : null
+
+  /** The sockets waiting for the next banner. */
+  const announcementSockets = new Set<WebSocket>()
+
+  /** Send one JSON frame to every phone holding an announcement socket. */
+  function broadcastAnnouncement(payload: unknown): void {
+    const text = JSON.stringify(payload)
+    for (const socket of announcementSockets) {
+      try {
+        if (socket.readyState === 1) socket.send(text)
+      } catch {
+        announcementSockets.delete(socket)
+      }
+    }
+  }
+
+  if (announcements !== null) {
+    announcements.onCreated = (announcement) => {
+      broadcastAnnouncement({ type: 'announcement', announcement })
+      log(`relay: announcement sent — ${announcement.id} (${announcement.title})`)
+    }
+  }
+
+  /** Whether a request on the private listener proved it is one of ours. */
+  function internalAuthorized(request: IncomingMessage): boolean {
+    if (internalSecret === '') return false
+    const presented = bearerToken(request)
+    return presented !== null && secretsEqual(presented, internalSecret)
+  }
+
+  /**
+   * Answer one relay-to-relay request.
+   *
+   * Only reachable on the private listener when one is configured; on a
+   * deployment without one it is reached on the public listener, exactly as
+   * before the private link existed. Every path here is authenticated: the
+   * shared secret for the data endpoints, the mail service's own token for mail.
+   */
+  async function handleInternal(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const parsed = new URL(request.url ?? '/', 'http://relay.invalid')
+    const path = parsed.pathname
+
+    if (path === '/internal/v1/traffic') {
+      await handleTrafficReport(request, response)
+      return
+    }
+    if (path === MAIL_PATH) {
+      if (mailService === null || mailConfig === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      await handleMailRequest(request, response, path, {
+        service: mailService,
+        token: mailConfig.service.token,
+        allowFrom: mailConfig.service.allowFrom,
+        log,
+      })
+      return
+    }
+    if (path.startsWith('/internal/v1/surveys')) {
+      if (surveys === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      if (!internalAuthorized(request)) {
+        writeJson(response, 401, { error: 'the internal secret is required' })
+        return
+      }
+      if (path === '/internal/v1/surveys' && request.method === 'GET') {
+        writeJson(response, 200, { surveys: surveys.active() })
+        return
+      }
+      if (path === '/internal/v1/surveys/answers' && request.method === 'POST') {
+        const raw = await readBody(request, 256 * 1024)
+        if (raw === null) {
+          writeJson(response, 413, { error: 'answer too large' })
+          return
+        }
+        const body = parseJsonObject(raw.toString('utf8'))
+        if (
+          body === null ||
+          typeof body.surveyId !== 'string' ||
+          typeof body.userId !== 'string' ||
+          !Array.isArray(body.answers)
+        ) {
+          writeJson(response, 400, { error: 'surveyId, userId and answers are required' })
+          return
+        }
+        try {
+          const stored = await surveys.submit({
+            surveyId: body.surveyId,
+            userId: body.userId,
+            accountHash: typeof body.accountHash === 'string' ? body.accountHash : '',
+            answers: body.answers as never,
+          })
+          writeJson(response, 200, { ok: true, submittedAt: stored.submittedAt })
+        } catch (error) {
+          if (error instanceof SurveyError) {
+            writeJson(response, 400, { error: error.code, message: error.message })
+          } else {
+            writeJson(response, 500, { error: 'the survey store refused that answer' })
+          }
+        }
+        return
+      }
+      if (path === '/internal/v1/surveys/definitions' && request.method === 'POST') {
+        const raw = await readBody(request, 256 * 1024)
+        const body = raw === null ? null : parseJsonObject(raw.toString('utf8'))
+        if (body === null) {
+          writeJson(response, 400, { error: 'a JSON object is required' })
+          return
+        }
+        try {
+          const survey = await surveys.create({
+            ...(typeof body.id === 'string' ? { id: body.id } : {}),
+            title: String(body.title ?? ''),
+            summary: typeof body.summary === 'string' ? body.summary : '',
+            rewardDays: typeof body.rewardDays === 'number' ? body.rewardDays : 7,
+            questions: Array.isArray(body.questions) ? (body.questions as never) : [],
+            minutes: typeof body.minutes === 'number' ? body.minutes : null,
+          })
+          writeJson(response, 200, { ok: true, survey })
+        } catch (error) {
+          if (error instanceof SurveyError) {
+            writeJson(response, 400, { error: error.code, message: error.message })
+          } else {
+            writeJson(response, 500, { error: 'the survey could not be stored' })
+          }
+        }
+        return
+      }
+      if (path === '/internal/v1/surveys/close' && request.method === 'POST') {
+        const raw = await readBody(request, 4 * 1024)
+        const body = raw === null ? null : parseJsonObject(raw.toString('utf8'))
+        if (body === null || typeof body.id !== 'string') {
+          writeJson(response, 400, { error: 'id is required' })
+          return
+        }
+        writeJson(response, 200, { ok: await surveys.close(body.id) })
+        return
+      }
+      if (path === '/internal/v1/surveys/responses' && request.method === 'GET') {
+        const surveyId = parsed.searchParams.get('surveyId') ?? undefined
+        writeJson(response, 200, {
+          responses: surveys.responses(surveyId),
+          counts: surveys.list().map((survey) => ({
+            id: survey.id,
+            title: survey.title,
+            answers: surveys.countFor(survey.id),
+          })),
+        })
+        return
+      }
+      writeJson(response, 404, { error: 'not found' })
+      return
+    }
+    if (path === '/internal/v1/invites') {
+      if (accountStore === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      if (!internalAuthorized(request)) {
+        writeJson(response, 401, { error: 'the internal secret is required' })
+        return
+      }
+      if (request.method !== 'POST') {
+        writeJson(response, 405, { error: 'method not allowed' })
+        return
+      }
+      const raw = await readBody(request, 8 * 1024)
+      const body = raw === null ? null : parseJsonObject(raw.toString('utf8'))
+      if (body === null) {
+        writeJson(response, 400, { error: 'a JSON object is required' })
+        return
+      }
+      try {
+        const invite = await accountStore.createInvite({
+          ...(typeof body.code === 'string' && body.code.trim() !== '' ? { code: body.code } : {}),
+          days: typeof body.days === 'number' ? body.days : 30,
+          maxUses: typeof body.maxUses === 'number' ? body.maxUses : 1000,
+          oncePerAccount: body.oncePerAccount !== false,
+          expiresAt:
+            typeof body.expiresDays === 'number' && body.expiresDays > 0
+              ? Date.now() + Math.min(3650, body.expiresDays) * 86_400_000
+              : null,
+        })
+        writeJson(response, 200, { ok: true, invite })
+      } catch (error) {
+        writeJson(response, 400, {
+          error: 'INVALID_INPUT',
+          message: error instanceof Error ? error.message : 'the invite could not be created',
+        })
+      }
+      return
+    }
+    if (path === '/internal/v1/announcements') {
+      if (announcements === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      if (!internalAuthorized(request)) {
+        writeJson(response, 401, { error: 'the internal secret is required' })
+        return
+      }
+      if (request.method === 'GET') {
+        writeJson(response, 200, { announcements: announcements.active() })
+        return
+      }
+      if (request.method === 'POST') {
+        const raw = await readBody(request, 16 * 1024)
+        const body = raw === null ? null : parseJsonObject(raw.toString('utf8'))
+        if (body === null) {
+          writeJson(response, 400, { error: 'a JSON object is required' })
+          return
+        }
+        try {
+          const created = await announcements.create({
+            title: String(body.title ?? ''),
+            body: String(body.body ?? ''),
+            symbol: typeof body.symbol === 'string' ? body.symbol : undefined,
+            tone: body.tone === 'notice' ? 'notice' : 'info',
+            buttonLabel: typeof body.buttonLabel === 'string' ? body.buttonLabel : null,
+            buttonTarget: typeof body.buttonTarget === 'string' ? body.buttonTarget : null,
+            minutes: typeof body.minutes === 'number' ? body.minutes : null,
+          })
+          writeJson(response, 200, { ok: true, announcement: created })
+        } catch (error) {
+          if (error instanceof AnnouncementError) {
+            writeJson(response, 400, { error: 'INVALID_INPUT', message: error.message })
+          } else {
+            writeJson(response, 500, { error: 'the announcement could not be stored' })
+          }
+        }
+        return
+      }
+      writeJson(response, 405, { error: 'method not allowed' })
+      return
+    }
+    writeJson(response, 404, { error: 'not found' })
   }
 
   /**
@@ -815,6 +1150,7 @@ export async function startRelay(
       : new AccountApi({
           store: accountStore,
           trustProxy: config.trustProxy,
+          surveys: surveyClient,
           hosts: {
             onlineRooms(userId) {
               const rooms = new Map<string, string>()
@@ -884,6 +1220,8 @@ export async function startRelay(
           version: RELAY_VERSION,
           trustProxy: config.trustProxy,
           paidGate: paidGate?.mode ?? 'off',
+          announcements,
+          surveys: surveyClient,
           ...(deps.now === undefined ? {} : { now: deps.now }),
         })
 
@@ -919,6 +1257,10 @@ export async function startRelay(
         // on either without parsing the config. `gateEnforced` is the single
         // boolean that is true only when both are right.
         paidGateAllowUnaccounted: accountsConfig?.paidGate.allowUnaccounted ?? false,
+        // Whether a signed-in free account is carried, at the free allowance.
+        // `gateEnforced` stays about the paywall: free callers are metered, not
+        // waved through, so this does not turn it off.
+        paidGateAllowFree: accountsConfig?.paidGate.allowFreeAccounts ?? false,
         gateEnforced:
           paidGate?.mode === 'enforce' && (accountsConfig?.paidGate.allowUnaccounted ?? false) === false,
         // The data-plane meters, so an operator can see refusals climbing
@@ -998,6 +1340,30 @@ export async function startRelay(
       }
       return
     }
+    // Relay-to-relay traffic. On a deployment with a private listener this path
+    // does not exist publicly at all: the whole point is that it stops crossing
+    // the internet, and a 404 is how a public request learns that.
+    if (parsedUrl.pathname.startsWith('/internal/v1/')) {
+      if ((config.internal?.port ?? 0) > 0) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      await handleInternal(request, response)
+      return
+    }
+    // The polling twin of the announcement socket. Served here rather than in
+    // the account API so it is answered by the relay that owns the store; the
+    // account relay forwards it upstream like every other account path.
+    if (parsedUrl.pathname === '/account/v1/announcements' && request.method === 'GET') {
+      if (announcements === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      const user = await requireUser(request, response)
+      if (user === null) return
+      writeJson(response, 200, { announcements: announcements.active() })
+      return
+    }
     if (parsedUrl.pathname.startsWith('/account/v1/')) {
       if (accountApi !== null) {
         await accountApi.handle(request, response, parsedUrl)
@@ -1019,23 +1385,6 @@ export async function startRelay(
         return
       }
       await proxyToUpstream(request, response, parsedUrl)
-      return
-    }
-    if (parsedUrl.pathname === '/internal/v1/traffic') {
-      await handleTrafficReport(request, response)
-      return
-    }
-    if (parsedUrl.pathname === MAIL_PATH) {
-      if (mailService === null || mailConfig === null) {
-        writeJson(response, 404, { error: 'not found' })
-        return
-      }
-      await handleMailRequest(request, response, parsedUrl.pathname, {
-        service: mailService,
-        token: mailConfig.service.token,
-        allowFrom: mailConfig.service.allowFrom,
-        log,
-      })
       return
     }
     if (parsedUrl.pathname === '/admin' || parsedUrl.pathname.startsWith('/admin/')) {
@@ -1394,8 +1743,64 @@ export async function startRelay(
     }
   }
 
+  /**
+   * Accept a phone's announcement socket.
+   *
+   * Authenticated with the same session token the data plane uses. The socket
+   * carries no conversation and is not a room: it exists only to hand the phone
+   * a banner the moment one is created. A phone that cannot hold a socket polls
+   * `/account/v1/announcements` instead; the two answer with the same objects.
+   *
+   * @param request - the upgrade request.
+   * @param socket - the raw socket, before `ws` takes it.
+   * @param head - bytes already read from the socket.
+   */
+  async function handleAnnouncementUpgrade(
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+  ): Promise<void> {
+    const refuse = (status: number, reason: string): void => {
+      socket.write(`HTTP/1.1 ${status} ${reason}\r\n\r\n`)
+      socket.destroy()
+    }
+    if (announcements === null) {
+      refuse(404, 'Not Found')
+      return
+    }
+    const parsed = new URL(request.url ?? '/', 'http://relay.invalid')
+    const header = request.headers['x-mizar-session']
+    const headerToken = Array.isArray(header) ? header[0] : header
+    const queryToken = parsed.searchParams.get('session')
+    const token =
+      (typeof headerToken === 'string' && headerToken.trim() !== '' ? headerToken.trim() : null) ??
+      (queryToken !== null && queryToken.trim() !== '' ? queryToken.trim() : null) ??
+      bearerToken(request)
+    const user = token === null ? null : await verifySession(token, clientIdOf(request))
+    if (user === null) {
+      refuse(401, 'Unauthorized')
+      return
+    }
+    wss.handleUpgrade(request, socket, head, (phone: WebSocket) => {
+      announcementSockets.add(phone)
+      phone.on('close', () => announcementSockets.delete(phone))
+      phone.on('error', () => announcementSockets.delete(phone))
+      try {
+        phone.send(JSON.stringify({ type: 'snapshot', announcements: announcements.active() }))
+      } catch {
+        announcementSockets.delete(phone)
+        phone.terminate()
+      }
+    })
+  }
+
   server.on('upgrade', (request, socket, head) => {
     const url = request.url ?? '/'
+
+    if (url === ANNOUNCEMENT_PATH || url.startsWith(`${ANNOUNCEMENT_PATH}?`)) {
+      void handleAnnouncementUpgrade(request, socket, head)
+      return
+    }
 
     if (url === TUNNEL_PATH || url.startsWith(`${TUNNEL_PATH}?`)) {
       handleTunnelUpgrade(request, socket, head)
@@ -1901,6 +2306,35 @@ export async function startRelay(
     })
   })
   log(`relay: listening on ${config.host}:${boundPort}`)
+
+  // The private relay-to-relay listener. Bound to one address on purpose: a
+  // port opened on every interface is not a private link, and the endpoints
+  // behind it carry survey answers and traffic reports.
+  let internalServer: Server | null = null
+  let internalBoundPort: number | null = null
+  const internalConfig = config.internal ?? null
+  if (internalConfig !== null) {
+    const privateServer = createServer((request, response) => {
+      const url = request.url ?? '/'
+      if (!url.startsWith('/internal/v1/')) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      void handleInternal(request, response).catch(() => {
+        if (!response.headersSent) response.writeHead(500)
+        response.end()
+      })
+    })
+    internalServer = privateServer
+    internalBoundPort = await new Promise<number>((resolve, reject) => {
+      privateServer.once('error', reject)
+      privateServer.listen(internalConfig.port, internalConfig.host, () => {
+        const address = privateServer.address()
+        resolve(typeof address === 'object' && address !== null ? address.port : internalConfig.port)
+      })
+    })
+    log(`relay: internal listener on ${internalConfig.host}:${internalBoundPort}`)
+  }
   log(
     config.tokens.length === 0
       ? 'relay: open registration — any plugin may register a room'
@@ -1930,6 +2364,7 @@ export async function startRelay(
 
   return {
     port: boundPort,
+    internalPort: internalBoundPort,
     close: async () => {
       clearInterval(sweeper)
       await traffic.close()
@@ -1938,12 +2373,25 @@ export async function startRelay(
       for (const entry of waiting) clearTimeout(entry.timer)
       waiting.clear()
       rooms.closeAll()
+      // The banner sockets are not rooms: nothing closes them when a phone
+      // goes away, and `wss.close` waits for every one of them.
+      for (const socket of announcementSockets) {
+        try {
+          socket.terminate()
+        } catch {
+          // Already gone.
+        }
+      }
+      announcementSockets.clear()
       apns?.close()
       fcm?.close()
       probe?.close()
       stun?.close()
       await new Promise<void>((resolve) => wss.close(() => resolve()))
       await new Promise<void>((resolve) => server.close(() => resolve()))
+      if (internalServer !== null) {
+        await new Promise<void>((resolve) => internalServer?.close(() => resolve()))
+      }
     },
   }
 }

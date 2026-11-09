@@ -642,6 +642,29 @@ describe('notifying a room', () => {
     expect(updateBody.aps['alert']).toBeUndefined()
   })
 
+  it('does not start a second card while the first card has not reported its token', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1',
+      token: 'aaaa',
+      environment: 'sandbox',
+      liveActivityStartToken: '9999',
+    })
+
+    const rows = [{ sessionId: 'session-1', title: 'Refactor', runningSince: Date.now() }]
+    expect((await post(base, '/push/v1/activity', MAC_A, { phase: 'start', rows })).json)
+      .toMatchObject({ sent: 1 })
+    expect(received.filter((entry) => entry.path === '/3/device/9999')).toHaveLength(1)
+
+    // The socket reconnects before ActivityKit reports the activity token, so
+    // the host publishes the current card again. A second start would put a
+    // second identical island on the lock screen.
+    expect((await post(base, '/push/v1/activity', MAC_A, { phase: 'start', rows })).json)
+      .toMatchObject({ sent: 1 })
+    expect(received.filter((entry) => entry.path === '/3/device/9999')).toHaveLength(1)
+  })
+
   it('carries the approvals waiting on the operator onto the card', async () => {
     const authority = await startFakeApple()
     const base = await boot(authority)

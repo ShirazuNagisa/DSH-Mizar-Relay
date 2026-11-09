@@ -279,6 +279,15 @@ function readExceptDeviceIds(value: unknown): readonly string[] {
 /** Every room's registered devices. */
 export class PushRegistry {
   readonly #rooms = new Map<string, Map<string, PushDevice>>()
+  /**
+   * When this device was last sent a push-to-start that Apple accepted.
+   *
+   * A phone registers on every socket open, and each registration made the host
+   * publish the current card again. Before ActivityKit reports the new card's
+   * activity token there is nothing for the relay to update, so every one of
+   * those publishes became another start -- the duplicate islands.
+   */
+  readonly #startedAt = new Map<string, Map<string, number>>()
 
   /**
    * Record one device.
@@ -300,6 +309,19 @@ export class PushRegistry {
     // minted for this launch.
     for (const [id, existing] of [...devices]) {
       if (id !== device.deviceId && existing.token === device.token) devices.delete(id)
+    }
+    // A reported activity token is proof that a card exists; a fresh
+    // push-to-start token means this install can create one again. Either way
+    // the next start is not the duplicate this guard exists to stop. A plain
+    // re-registration (both tokens unchanged, no activity token yet) keeps the
+    // mark, which is the case that was producing a second card.
+    const previous = devices.get(device.deviceId)
+    if (
+      device.liveActivityToken !== null ||
+      previous === undefined ||
+      previous.liveActivityStartToken !== device.liveActivityStartToken
+    ) {
+      this.forgetLiveActivityStart(room, device.deviceId)
     }
     devices.set(device.deviceId, { ...device, registeredAt: Date.now() })
     return true
@@ -343,6 +365,48 @@ export class PushRegistry {
   }
 
   /**
+   * Whether Apple already accepted a start for this device recently.
+   *
+   * @param room - the room.
+   * @param deviceId - the device.
+   * @param ttlMs - how long a delivered start suppresses another one.
+   * @returns whether a start is still outstanding.
+   */
+  hasLiveActivityStart(room: string, deviceId: string, ttlMs = 10 * 60_000): boolean {
+    const roomMarks = this.#startedAt.get(room)
+    const at = roomMarks?.get(deviceId)
+    if (at === undefined) return false
+    if (Date.now() - at <= ttlMs) return true
+    roomMarks?.delete(deviceId)
+    return false
+  }
+
+  /**
+   * Remember that Apple accepted a push-to-start for this device.
+   *
+   * @param room - the room.
+   * @param deviceId - the device.
+   */
+  markLiveActivityStart(room: string, deviceId: string): void {
+    let roomMarks = this.#startedAt.get(room)
+    if (roomMarks === undefined) {
+      roomMarks = new Map()
+      this.#startedAt.set(room, roomMarks)
+    }
+    roomMarks.set(deviceId, Date.now())
+  }
+
+  /**
+   * Allow the next start again: the card is gone, or the app reported its own.
+   *
+   * @param room - the room.
+   * @param deviceId - the device.
+   */
+  forgetLiveActivityStart(room: string, deviceId: string): void {
+    this.#startedAt.get(room)?.delete(deviceId)
+  }
+
+  /**
    * Forget one device's Live Activity token, and nothing else.
    *
    * Apple answers `Unregistered` for an activity token routinely -- every
@@ -366,6 +430,7 @@ export class PushRegistry {
     if (devices === undefined || device === undefined) return false
     if (device.liveActivityToken !== token) return false
     devices.set(deviceId, { ...device, liveActivityToken: null })
+    this.forgetLiveActivityStart(room, deviceId)
     return true
   }
 
@@ -567,6 +632,7 @@ export async function deliver(
         // also runs beside an activity-token end rather than instead of it:
         // ending twice is idempotent, and whichever one works wins while the
         // card is on screen.
+        options.registry.forgetLiveActivityStart(room, device.deviceId)
         const wake = await apnsClient.sendSilentActivityEnd({
           token: device.token,
           environment: device.environment ?? 'production',
@@ -867,6 +933,15 @@ export async function deliverActivity(
         return
       }
 
+      // One accepted start is the card. Until the app reports that card's
+      // activity token, every later `activity` request is addressed to a token
+      // this registry does not have yet; sending another start is how two
+      // identical islands appeared after a reconnect or a push re-registration.
+      if (options.registry.hasLiveActivityStart(room, device.deviceId)) {
+        options.log(`push: suppressed duplicate live-activity start for ${device.deviceId} in room ${room}`)
+        tally.sent += 1
+        return
+      }
       const startToken = device.liveActivityStartToken
       if (startToken === null) return
       const result = await apns.sendLiveActivityStart({
@@ -880,6 +955,7 @@ export async function deliverActivity(
         },
       })
       if (result.delivered) {
+        options.registry.markLiveActivityStart(room, device.deviceId)
         tally.sent += 1
         return
       }

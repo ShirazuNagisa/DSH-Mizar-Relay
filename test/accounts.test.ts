@@ -393,6 +393,52 @@ describe('invites and admin', () => {
     expect(user['plan']).toBe('free')
   })
 
+  it('lists every account that used a once-per-account code, and the total', async () => {
+    // The TestFlight code is one per account for a thousand accounts: the
+    // admin page is the only place the operator can see who actually used it.
+    const base = await boot()
+    const cookie = await adminLogin(base)
+    const csrf = await csrfFor(base, cookie)
+    const created = await fetch(`${base}/admin/invites`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
+      body: new URLSearchParams({
+        _csrf: csrf,
+        code: 'TESTFLIGHT-30',
+        days: '30',
+        maxUses: '1000',
+        oncePerAccount: '1',
+      }),
+      redirect: 'manual',
+    })
+    expect(created.status).toBe(303)
+
+    const first = await register(base, 'device-0001')
+    const redeemed = await json(base, '/account/v1/invite/redeem', { code: 'TESTFLIGHT-30' }, first.token)
+    expect(redeemed.status).toBe(200)
+    const again = await json(base, '/account/v1/invite/redeem', { code: 'TESTFLIGHT-30' }, first.token)
+    expect(again.status).toBe(400)
+
+    // A second account can use the same code.
+    const second = await json(base, '/account/v1/register', {
+      username: 'second',
+      email: 'second@example.com',
+      password: 'correct horse battery',
+      device: device('device-0002'),
+    })
+    const other = await json(base, '/account/v1/invite/redeem', { code: 'TESTFLIGHT-30' }, String(second.body['token']))
+    expect(other.status).toBe(200)
+
+    const page = await fetch(`${base}/admin/invites/TESTFLIGHT-30`, { headers: { cookie } })
+    expect(page.status).toBe(200)
+    const html = await page.text()
+    expect(html).toContain('TESTFLIGHT-30')
+    expect(html).toContain('shirazu')
+    expect(html).toContain('second')
+    // Total uses, not just the rows.
+    expect(html).toMatch(/已用\s*2\s*\/\s*1000/)
+  })
+
   it('refuses to mint an invite code too short to guess-resistant', async () => {
     // A code is a bearer capability for paid days, so it is held to the same
     // bar the generated ones are: a four-character code is 20 bits and the

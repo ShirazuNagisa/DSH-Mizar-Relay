@@ -305,6 +305,14 @@ export interface AbuseLimits {
   readonly trafficAlertBytesPerDay: number
   /** The same threshold for a paid account; free accounts use the field above. */
   readonly trafficAlertBytesPerDayPaid: number
+  /**
+   * The spike floor for a paid account, when a 100MiB day is not anomalous.
+   *
+   * Free identities keep the 100MiB floor; a paid one gets this larger floor so
+   * a single long sync does not earn a warning while its 5GiB ceiling still
+   * guards the lane. Optional for configs written before the field existed.
+   */
+  readonly trafficSpikeMinBytesPaid?: number
   /** Day-over-day growth multiple that raises a spike anomaly. */
   readonly trafficAlertGrowthFactor: number
 }
@@ -321,6 +329,7 @@ export interface AbuseFileConfig {
   readonly probeRepliesPerSecondPerSource?: number
   readonly trafficAlertBytesPerDay?: number
   readonly trafficAlertBytesPerDayPaid?: number
+  readonly trafficSpikeMinBytesPaid?: number
   readonly trafficAlertGrowthFactor?: number
 }
 
@@ -354,6 +363,7 @@ export const DEFAULT_ABUSE: AbuseLimits = {
   probeRepliesPerSecondPerSource: 5,
   trafficAlertBytesPerDay: 500 * 1024 * 1024,
   trafficAlertBytesPerDayPaid: 5 * 1024 * 1024 * 1024,
+  trafficSpikeMinBytesPaid: 1024 * 1024 * 1024,
   trafficAlertGrowthFactor: 8,
 }
 
@@ -893,6 +903,11 @@ function readAbuse(env: NodeJS.ProcessEnv, file: AbuseFileConfig | null): AbuseL
       env['MIZAR_ABUSE_TRAFFIC_ALERT_BYTES_PAID'],
       file?.trafficAlertBytesPerDayPaid,
       DEFAULT_ABUSE.trafficAlertBytesPerDayPaid,
+    ),
+    trafficSpikeMinBytesPaid: num(
+      env['MIZAR_ABUSE_TRAFFIC_SPIKE_MIN_BYTES_PAID'],
+      file?.trafficSpikeMinBytesPaid,
+      DEFAULT_ABUSE.trafficSpikeMinBytesPaid ?? 1024 * 1024 * 1024,
     ),
     trafficAlertGrowthFactor: num(
       env['MIZAR_ABUSE_TRAFFIC_ALERT_GROWTH'],

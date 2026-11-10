@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  SPIKE_MIN_BYTES,
   TrafficLedger,
   dayKey,
   isValidDay,
@@ -224,6 +225,36 @@ describe('traffic anomaly detection', () => {
     const anomalies = ledger.anomalies()
     expect(anomalies).toHaveLength(1)
     expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'spike', bytes: 100 * MIB + 1 })
+    await ledger.close()
+  })
+
+  it('uses a larger spike floor for an identity the caller says is paid', async () => {
+    let now = Date.parse('2026-10-12T12:00:00Z')
+    const ledger = await TrafficLedger.open({
+      dataDir: null,
+      relayId: 'primary-1',
+      role: 1,
+      reportTo: '',
+      internalSecret: '',
+      now: () => now,
+      alertBytesPerDay: 0,
+      alertGrowthFactor: 8,
+      // The paid floor is 1GiB; every other identity keeps the free 100MiB.
+      spikeFloorFor: (identity) => (identity === ID ? 1024 * MIB : SPIKE_MIN_BYTES),
+    })
+    // Seven quiet days at 2MiB establish the baseline; 100MiB would be a spike
+    // under the free floor, but a paid account's day starts at 1GiB.
+    for (let day = 0; day < 7; day += 1) {
+      ledger.record(ID, 1024 * 1024, 1024 * 1024)
+      now += 86_400_000
+    }
+    ledger.record(ID, 500 * MIB, 500 * MIB)
+    expect(ledger.anomalies()).toHaveLength(0)
+    // Past 1GiB it still counts, so a genuinely huge jump is not hidden.
+    ledger.record(ID, 600 * MIB, 600 * MIB)
+    const anomalies = ledger.anomalies()
+    expect(anomalies).toHaveLength(1)
+    expect(anomalies[0]).toMatchObject({ identity: ID, reason: 'spike' })
     await ledger.close()
   })
 

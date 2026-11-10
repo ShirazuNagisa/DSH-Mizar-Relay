@@ -97,9 +97,18 @@ export interface TrafficOptions {
   /**
    * How many times larger than an identity's own trailing daily average today's
    * total must be to raise a spike anomaly. Defaults to 8. `0` disables. The
-   * day must also pass {@link SPIKE_MIN_BYTES}, whatever the plan.
+   * day must also pass {@link SPIKE_MIN_BYTES}, whatever the plan, unless
+   * {@link spikeFloorFor} raises that floor for this identity.
    */
   readonly alertGrowthFactor?: number
+  /**
+   * The floor a spike must also pass, when it depends on the identity's plan.
+   *
+   * Free identities keep the 100MiB floor; a paid one should not get a warning
+   * for a 100MiB day -- that is below its 5GiB ceiling and, for somebody who
+   * syncs a long history once, ordinary. A sudden multi-GiB jump still counts.
+   */
+  readonly spikeFloorFor?: (identity: string) => number
   /**
    * The daily ceiling for one identity, when it depends on the plan.
    *
@@ -157,7 +166,7 @@ const BASELINE_DAYS = 7
  * that runs out of hard allowance still reports `quota`. Paid and free accounts
  * share this floor -- it is about the size of the day, not the plan.
  */
-const SPIKE_MIN_BYTES = 100 * 1024 * 1024
+export const SPIKE_MIN_BYTES = 100 * 1024 * 1024
 
 /** One identity/day pending report. */
 interface PendingReport {
@@ -186,6 +195,7 @@ export class TrafficLedger {
   readonly #alertBytesPerDay: number
   readonly #alertGrowthFactor: number
   readonly #thresholdFor: ((identity: string) => number) | null
+  readonly #spikeFloorFor: ((identity: string) => number) | null
   readonly #onAnomaly: ((anomaly: TrafficAnomaly) => void) | null
   /** Recent anomalies, newest last, bounded. */
   readonly #anomalies: TrafficAnomaly[] = []
@@ -208,6 +218,7 @@ export class TrafficLedger {
     this.#alertBytesPerDay = Math.max(0, options.alertBytesPerDay ?? 500 * 1024 * 1024)
     this.#alertGrowthFactor = Math.max(0, options.alertGrowthFactor ?? 8)
     this.#thresholdFor = options.thresholdFor ?? null
+    this.#spikeFloorFor = options.spikeFloorFor ?? null
     this.#onAnomaly = options.onAnomaly ?? null
   }
 
@@ -393,13 +404,16 @@ export class TrafficLedger {
     let anomaly: TrafficAnomaly | null = null
     if (ceiling > 0 && today > ceiling) {
       anomaly = { identity, day, bytes: today, reason: 'volume', baseline: ceiling, at }
-    } else if (this.#alertGrowthFactor > 0 && today > SPIKE_MIN_BYTES) {
-      const baseline = trailingAverage(value.days, day, BASELINE_DAYS)
-      // A tiny baseline makes any byte look like a spike, so growth only counts
-      // once the identity has both a meaningful history and a meaningful day --
-      // 1 MiB of history keeps a new account's first request from alerting.
-      if (baseline > 1024 * 1024 && today > baseline * this.#alertGrowthFactor) {
-        anomaly = { identity, day, bytes: today, reason: 'spike', baseline, at }
+    } else {
+      const floor = this.#spikeFloorFor?.(identity) ?? SPIKE_MIN_BYTES
+      if (this.#alertGrowthFactor > 0 && today > floor) {
+        const baseline = trailingAverage(value.days, day, BASELINE_DAYS)
+        // A tiny baseline makes any byte look like a spike, so growth only counts
+        // once the identity has both a meaningful history and a meaningful day --
+        // 1 MiB of history keeps a new account's first request from alerting.
+        if (baseline > 1024 * 1024 && today > baseline * this.#alertGrowthFactor) {
+          anomaly = { identity, day, bytes: today, reason: 'spike', baseline, at }
+        }
       }
     }
     if (anomaly === null) return

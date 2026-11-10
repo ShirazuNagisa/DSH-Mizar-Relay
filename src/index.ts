@@ -38,7 +38,7 @@ import { identityFor, isPrivateHeader } from './accounts/identity.js'
 import { parseHash } from './accounts/passwords.js'
 import { DataQuota, type QuotaDecision } from './accounts/quota.js'
 import { AccountStore } from './accounts/store.js'
-import { TrafficLedger, isValidDay, isValidIdentity } from './accounts/traffic.js'
+import { SPIKE_MIN_BYTES, TrafficLedger, isValidDay, isValidIdentity } from './accounts/traffic.js'
 import { VerificationCodes } from './accounts/verification.js'
 import { addressGroup, clientAddress } from './client-address.js'
 import {
@@ -410,6 +410,15 @@ export async function startRelay(
     internalSecret: accountsConfig?.internalSecret ?? '',
     alertBytesPerDay: abuse.trafficAlertBytesPerDay,
     alertGrowthFactor: abuse.trafficAlertGrowthFactor,
+    spikeFloorFor: (identity: string): number => {
+      if (accountStore !== null && identity.startsWith('account:')) {
+        const plan = accountStore.planForSessionHash(identity.slice('account:'.length))
+        if (plan === 'paid') {
+          return abuse.trafficSpikeMinBytesPaid ?? 1024 * 1024 * 1024
+        }
+      }
+      return SPIKE_MIN_BYTES
+    },
     // The plan-aware ceiling needs the account store; a free relay keeps the
     // flat threshold. `onAnomaly` is wired either way, so the callback does not
     // silently vanish with the store: on the account relay enforcement turns it

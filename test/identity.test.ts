@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ACCOUNT_HEADER,
   CLIENT_ID_HEADER,
+  callerDeviceId,
   identityFor,
   readRelayIdentity,
   withoutPrivateHeaders,
@@ -59,5 +60,31 @@ describe('relay identity', () => {
         'x-mizar-evil': 'kept',
       }),
     ).toEqual({ 'content-type': 'application/json', 'x-mizar-evil': 'kept' })
+  })
+})
+
+describe('caller device', () => {
+  const user = {
+    devices: [
+      { id: 'phone-1', current: false },
+      { id: 'phone-2', current: true },
+      { id: 'mac-1', current: false },
+    ],
+  }
+
+  it('lets the header name the caller when the request carries one', () => {
+    expect(callerDeviceId('phone-1', user)).toBe('phone-1')
+    expect(callerDeviceId('mac-1', user)).toBe('mac-1')
+  })
+
+  it('falls back to the session device when the header is missing', () => {
+    // iOS 0.9.9 and earlier send no x-mizar-client-id on /connect. `/me` marks
+    // the session's own device current; using it keeps one token per device.
+    expect(callerDeviceId(null, user)).toBe('phone-2')
+  })
+
+  it('returns null when neither a header nor a current device is known', () => {
+    expect(callerDeviceId(null, { devices: [] })).toBeNull()
+    expect(callerDeviceId(null, { devices: [{ id: 'mac-1', current: false }] })).toBeNull()
   })
 })

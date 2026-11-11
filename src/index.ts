@@ -34,7 +34,7 @@ import { AccountApi } from './accounts/api.js'
 import { AdminApi } from './accounts/admin.js'
 import { Enforcement } from './accounts/enforcement.js'
 import { PaidGate, isGateExempt, type GateDecision } from './accounts/gate.js'
-import { identityFor, isPrivateHeader } from './accounts/identity.js'
+import { callerDeviceId, identityFor, isPrivateHeader } from './accounts/identity.js'
 import { parseHash } from './accounts/passwords.js'
 import { DataQuota, type QuotaDecision } from './accounts/quota.js'
 import { AccountStore } from './accounts/store.js'
@@ -1092,7 +1092,12 @@ export async function startRelay(
       writeJson(response, 409, { error: 'DESKTOP_OFFLINE', message: 'that computer is not connected' })
       return
     }
-    const phoneId = clientIdOf(request) ?? 'phone'
+    // The caller id is the token slot the computer revokes and re-issues. A
+    // request without the header (iOS 0.9.9 and earlier) must not collapse
+    // every phone on the account into one slot: this relay verifies the
+    // session upstream, and `/me` marks the session's own device `current`
+    // when the request names none.
+    const phoneId = callerDeviceId(clientIdOf(request), user) ?? 'phone'
     const phone = (user.devices ?? []).find((device) => device.id === phoneId)
     const engine = typeof body?.engine === 'string' ? body.engine : undefined
     const requestedPeer = body?.kind === 'peer'

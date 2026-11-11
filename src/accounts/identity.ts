@@ -36,6 +36,29 @@ export const SESSION_HEADER = 'x-mizar-session'
 /** The headers the relay consumes and never forwards. */
 export const PRIVATE_HEADERS: readonly string[] = [CLIENT_ID_HEADER, ACCOUNT_HEADER, SESSION_HEADER]
 
+/**
+ * The device a caller speaks for.
+ *
+ * The header is the explicit answer, and the one an up-to-date client sends.
+ * A client that omits it (iOS 0.9.9 and earlier) has no header, and falling
+ * back to one literal `phone` makes a computer keep a single token per account:
+ * a second phone's `/connect` revokes the first phone's token, and the two take
+ * turns being disconnected. The account session records the device that signed
+ * in, and `/me` marks that device `current` when the request names none, so it
+ * is the identity to mint against.
+ *
+ * @param header - the request's `x-mizar-client-id`, when it is valid.
+ * @param user - the session's account, as `/me` projects it.
+ * @returns the device id to mint a token for, or null when neither is known.
+ */
+export function callerDeviceId(
+  header: string | null,
+  user: { readonly devices: readonly { readonly id: string; readonly current: boolean }[] },
+): string | null {
+  if (header !== null) return header
+  return user.devices.find((device) => device.current)?.id ?? null
+}
+
 /** The identity of one request. */
 export type RelayIdentity =
   | { readonly kind: 'account'; readonly hash: string; readonly key: string }

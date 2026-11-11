@@ -188,9 +188,15 @@ describe('registration and login', () => {
       socket.once('error', reject)
     })
     const room = String(welcome['room'])
+    const provisionedFor: string[] = []
     socket.on('message', (data: Buffer) => {
-      const frame = JSON.parse(data.toString('utf8')) as { t?: string; id?: string }
+      const frame = JSON.parse(data.toString('utf8')) as {
+        t?: string
+        id?: string
+        phoneDeviceId?: string
+      }
       if (frame.t === 'provision' && typeof frame.id === 'string') {
+        if (typeof frame.phoneDeviceId === 'string') provisionedFor.push(frame.phoneDeviceId)
         socket.send(JSON.stringify({ t: 'provision-result', id: frame.id, token: 'mz_issued_for_phone' }))
       }
     })
@@ -218,6 +224,9 @@ describe('registration and login', () => {
     expect(connect.status).toBe(200)
     expect(connect.body['token']).toBe('mz_issued_for_phone')
     expect(connect.body['room']).toBe(room)
+    // The call carried no x-mizar-client-id (the shape iOS 0.9.9 sends). The
+    // session's own device id must name the token slot, not a shared "phone".
+    expect(provisionedFor.at(-1)).toBe('device-0001')
 
     // A desktop peer is a paid capability; this account is still free.
     const peerOnFree = await fetch(`${base}/account/v1/connect`, {

@@ -15,6 +15,7 @@ import { normalizeEmail } from './avatar.js'
 import type { MailClient } from '../mail/client.js'
 import type { AccountStore } from './store.js'
 import { hashToken, validateDevice, validateEmail, validatePassword, validateUsername } from './store.js'
+import { callerDeviceId } from './identity.js'
 import { AccountError, type DeviceInput, type GitHubIdentity } from './types.js'
 import type { SurveyClient } from '../surveys/client.js'
 import type { VerificationCodes } from './verification.js'
@@ -667,7 +668,8 @@ export class AccountApi {
     if (body === null) return
     const deviceId = requireString(body, 'deviceId')
     const token = bearer(context.request)
-    const user = await this.#store.me(token, deviceIdOf(context.request))
+    const presented = deviceIdOf(context.request)
+    const user = await this.#store.me(token, presented)
     if (!this.#connectWindow.check(user.id)) {
       this.#tooMany(context, 'too many connection attempts')
       return
@@ -676,7 +678,11 @@ export class AccountApi {
     if (desktop === undefined || desktop.platform === 'ios') {
       throw new AccountError('NO_SUCH_DESKTOP', 'that computer is not on this account', 404)
     }
-    const phoneId = deviceIdOf(context.request) ?? 'phone'
+    // The caller id is the token slot the computer revokes and re-issues. A
+    // request without the header (iOS 0.9.9 and earlier) must not collapse
+    // every phone on the account into one slot: the session names the device
+    // that signed in, and the computer keeps one token per device.
+    const phoneId = callerDeviceId(presented, user) ?? 'phone'
     const phone = user.devices.find((device) => device.id === phoneId)
     const engine = typeof body.engine === 'string' ? body.engine : ''
     const requestedPeer = body['kind'] === 'peer'

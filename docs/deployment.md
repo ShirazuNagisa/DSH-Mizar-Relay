@@ -912,6 +912,27 @@ to. One relay therefore serves a computer with a TestFlight phone and an Xcode p
 time, with nothing to configure. `MIZAR_APNS_ENV` is kept so existing config files keep loading, and
 leaving it set either way changes nothing.
 
+**The app's answer is a claim, and the relay checks it instead of believing it.** The app reads the
+environment from its build configuration, and one ordinary build gets that wrong: a Release build
+installed from Xcode is optimised (so not `DEBUG`) but signed for development, and therefore holds
+sandbox tokens while reporting `production`. Every push for that install used to earn
+`BadDeviceToken`, which the relay read as "dead token" — it deleted the registration, the phone went
+silent, and a Live Activity that had already appeared could never be updated or ended. That is a
+finished session still counting on the Lock Screen.
+
+The relay therefore asks the other APNs host once when Apple answers `BadDeviceToken`. A token that
+is genuinely retired is `410 Unregistered` on both hosts, so it is still deleted; a token that names
+the other Apple is accepted there, and the corrected environment is kept on the registration. The
+cost of a misreporting build is one rejected push, not silence:
+
+```
+push: <device> in room <room> is sandbox, not production — corrected from Apple's answer
+```
+
+The app-side fix is `Distribution.apsEnvironment` in the iOS repository: it reads
+`aps-environment` out of the `embedded.mobileprovision` that signed the build, so a
+development-signed Release build reports `sandbox` in the first place.
+
 **`timeSensitive` is off by default** because it is only honoured when the app carries the
 time-sensitive-notifications entitlement, and asking for a capability an app was not provisioned for
 is not a decision the relay should make on an operator's behalf.

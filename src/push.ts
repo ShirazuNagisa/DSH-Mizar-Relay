@@ -328,6 +328,30 @@ export class PushRegistry {
   }
 
   /**
+   * Record which Apple this device's tokens actually came from.
+   *
+   * The app answers this question from its own build, and the build that gets
+   * it wrong is the ordinary one: a Release build installed from Xcode is
+   * optimised (`DEBUG` off) but signed for development, so it says production
+   * while every token it holds is a sandbox token. Apple's answer names the
+   * fact -- `BadDeviceToken` -- and this is where it is written down, so the
+   * next notification does not have to discover it again.
+   *
+   * @param room - the room.
+   * @param deviceId - the device.
+   * @param environment - the Apple that accepted one of its tokens.
+   * @returns whether this changed anything.
+   */
+  setEnvironment(room: string, deviceId: string, environment: ApnsEnvironment): boolean {
+    const devices = this.#rooms.get(room)
+    const device = devices?.get(deviceId)
+    if (devices === undefined || device === undefined) return false
+    if (device.environment === environment) return false
+    devices.set(deviceId, { ...device, environment })
+    return true
+  }
+
+  /**
    * Forget one device.
    * @param room - the room.
    * @param deviceId - the device.
@@ -484,6 +508,74 @@ export class PushRegistry {
 }
 
 /**
+ * Whether Apple's answer says "not this Apple" rather than "not this token".
+ *
+ * `BadDeviceToken` is what a token from the other host gets: Apple checks the
+ * token against the environment the request names, and a sandbox token sent to
+ * production is not a token that Apple knows. It is also what a genuinely
+ * malformed token gets, which is why the other host is asked before the token
+ * is believed dead -- and why the answer to the second question decides.
+ *
+ * @param result - what Apple said.
+ * @returns whether the other Apple should be asked.
+ */
+function looksLikeTheOtherApple(result: ApnsResult): boolean {
+  return result.status === 400 && result.reason === 'BadDeviceToken'
+}
+
+/** One device, and the registry its corrected environment is written to. */
+interface AppleOfADevice {
+  readonly registry: PushRegistry
+  readonly room: string
+  readonly device: PushDevice
+  readonly log: (message: string) => void
+}
+
+/**
+ * Send one push to the device's Apple, and to the other Apple if it turns out
+ * not to be the device's Apple.
+ *
+ * Nothing in a token says which of the two Apples minted it, so the app has to
+ * say, and the app's answer comes from its build configuration rather than from
+ * the signature that produced the token. Those disagree for a Release build
+ * installed from Xcode: optimised (`DEBUG` off) and signed for development, so
+ * it reports production for a sandbox token. Every push is then refused with
+ * `BadDeviceToken`, and the old handling believed Apple and deleted the
+ * registration -- the phone went quiet while the computer still reported a
+ * card on it, which is how a finished session stayed on the Lock Screen.
+ *
+ * Asking the other Apple costs one request, and only on the answer that names
+ * this exact mistake. A token that is really dead is unregistered on both
+ * hosts, so the token is still retired; a token that is really this phone's is
+ * accepted, and the environment is remembered so the next send starts there.
+ *
+ * @param device - the device, the room it is in, and where to record the fix.
+ * @param send - one send, in a named environment.
+ * @returns what the Apple that knows the token said, or the first answer when
+ *   neither does.
+ */
+async function sendToTheRightApple(
+  device: AppleOfADevice,
+  send: (environment: ApnsEnvironment) => Promise<ApnsResult>,
+): Promise<ApnsResult> {
+  const reported = device.device.environment ?? 'production'
+  const first = await send(reported)
+  if (!looksLikeTheOtherApple(first)) return first
+  const other: ApnsEnvironment = reported === 'production' ? 'sandbox' : 'production'
+  const second = await send(other)
+  // `unregistered` on the second answer is an answer too: it means this Apple
+  // did issue the token, and has since retired it. That is a dead token, not a
+  // wrong environment.
+  if (!second.delivered && !second.unregistered) return first
+  if (device.registry.setEnvironment(device.room, device.device.deviceId, other)) {
+    device.log(
+      `push: ${device.device.deviceId} in room ${device.room} is ${other}, not ${reported} — corrected from Apple's answer`,
+    )
+  }
+  return second
+}
+
+/**
  * Deliver one notification to every device in a room.
  *
  * The room's devices are sent to together rather than in sequence. Sequencing
@@ -572,11 +664,9 @@ export async function deliver(
               tally.failed += 1
               return
             }
-            const notification: ApnsNotification = {
+            const apnsClient = options.apns
+            const notification = {
               deviceToken: device.token,
-              // Each device's own environment, because one room holds phones that
-              // disagree about which Apple minted their token.
-              environment: device.environment ?? 'production',
               title: request.title,
               body: request.body,
               threadId: request.threadId,
@@ -584,8 +674,14 @@ export async function deliver(
               urgent,
               sessionId: request.sessionId,
               kind: request.kind,
-            }
-            result = await options.apns.send(notification)
+            } satisfies Omit<ApnsNotification, 'environment'>
+            // Each device's own environment, because one room holds phones that
+            // disagree about which Apple minted their token -- and the one
+            // question the device's own answer can get wrong.
+            result = await sendToTheRightApple(
+              { registry: options.registry, room, device, log: options.log },
+              (environment) => apnsClient.send({ ...notification, environment }),
+            )
           }
 
           if (result.delivered) {
@@ -633,10 +729,10 @@ export async function deliver(
         // ending twice is idempotent, and whichever one works wins while the
         // card is on screen.
         options.registry.forgetLiveActivityStart(room, device.deviceId)
-        const wake = await apnsClient.sendSilentActivityEnd({
-          token: device.token,
-          environment: device.environment ?? 'production',
-        })
+        const where = { registry: options.registry, room, device, log: options.log }
+        const wake = await sendToTheRightApple(where, (environment) =>
+          apnsClient.sendSilentActivityEnd({ token: device.token, environment }),
+        )
         if (!wake.delivered) {
           options.log(
             `push: silent live-activity end for ${device.deviceId} in room ${room} failed (${wake.status} ${wake.reason ?? 'no reason'})`,
@@ -644,10 +740,9 @@ export async function deliver(
         }
         const token = device.liveActivityToken
         if (typeof token !== 'string' || token === '') return
-        const result = await apnsClient.sendLiveActivityEnd({
-          token,
-          environment: device.environment ?? 'production',
-        })
+        const result = await sendToTheRightApple(where, (environment) =>
+          apnsClient.sendLiveActivityEnd({ token, environment }),
+        )
         if (result.delivered) {
           options.log(`push: ended live activity for ${device.deviceId} in room ${room}`)
           return
@@ -888,7 +983,7 @@ export async function deliverActivity(
       // Android has no Live Activity, and a phone whose app is looking at the
       // app is drawing a card from its own state.
       if (device.platform !== 'ios' || excluded.has(device.deviceId)) return
-      const environment = device.environment ?? 'production'
+      const where = { registry: options.registry, room, device, log: options.log }
 
       // A reported card is where this event goes, whatever its age. "Is there a
       // card" is Apple's answer -- `410 Unregistered` when it has ended -- and
@@ -897,12 +992,14 @@ export async function deliverActivity(
       // second one beside the first.
       const reported = device.liveActivityToken
       if (reported !== null) {
-        const result = await apns.sendLiveActivityUpdate({
-          token: reported,
-          environment,
-          rows: request.rows,
-          approvals: request.approvals,
-        })
+        const result = await sendToTheRightApple(where, (environment) =>
+          apns.sendLiveActivityUpdate({
+            token: reported,
+            environment,
+            rows: request.rows,
+            approvals: request.approvals,
+          }),
+        )
         if (result.delivered) {
           tally.sent += 1
           return
@@ -944,16 +1041,18 @@ export async function deliverActivity(
       }
       const startToken = device.liveActivityStartToken
       if (startToken === null) return
-      const result = await apns.sendLiveActivityStart({
-        token: startToken,
-        environment,
-        rows: request.rows,
-        approvals: request.approvals,
-        alert: {
-          title: 'DSH-Mizar',
-          body: request.rows[0]?.title ?? '',
-        },
-      })
+      const result = await sendToTheRightApple(where, (environment) =>
+        apns.sendLiveActivityStart({
+          token: startToken,
+          environment,
+          rows: request.rows,
+          approvals: request.approvals,
+          alert: {
+            title: 'DSH-Mizar',
+            body: request.rows[0]?.title ?? '',
+          },
+        }),
+      )
       if (result.delivered) {
         options.registry.markLiveActivityStart(room, device.deviceId)
         tally.sent += 1

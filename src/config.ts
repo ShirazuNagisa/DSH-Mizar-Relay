@@ -144,6 +144,59 @@ export interface RelayConfig {
   readonly internal?: InternalConfig | null
   /** The survey store, or `null` when this relay takes no part in surveys. */
   readonly surveys?: SurveysConfig | null
+  /**
+   * Self-hosting support: the desktop directory, the setup page and updates.
+   *
+   * Absent on the official deployment, which has accounts instead. A relay that
+   * runs on a user's own server has no account service to tell a phone which
+   * computers are online -- so the relay itself keeps a directory of the rooms
+   * that are currently connected, guarded by one server PIN.
+   */
+  readonly selfHost?: SelfHostConfig | null
+}
+
+/**
+ * What a self-hosted relay needs beyond the tunnel itself.
+ *
+ * One PIN and one update token, both stored as scrypt hashes: the installer
+ * prints each once, and the server never keeps the plaintext. The setup page and
+ * the update endpoint are the only things they guard, so a compromised PIN
+ * reveals the computer list, not the computers themselves -- pairing still needs
+ * the code each computer shows.
+ */
+export interface SelfHostConfig {
+  /**
+   * Hash of the server PIN, or `''` to leave the computer list open.
+   *
+   * Empty is a deliberate choice rather than a missing value: a relay on a
+   * private network may be happy to show its room list, and the pairing code is
+   * what actually authorises a phone.
+   */
+  readonly pinHash: string
+  /**
+   * Hash of the token that may trigger an update from the setup page, or `''`
+   * when the page must not be able to start one.
+   *
+   * The update itself runs as root, so this is the one credential on the relay
+   * that is worth guessing at: an empty value turns the endpoint off rather than
+   * leaving it open.
+   */
+  readonly updateTokenHash: string
+  /** The public origin the page prints and the update check reports. */
+  readonly publicURL: string
+  /** Whether the daily timer may install a release without being asked. */
+  readonly autoUpdate: boolean
+  /**
+   * The updater script installed beside the app, or `''` when there is none.
+   *
+   * The setup page can only start an update when this is a path the service is
+   * allowed to execute; the installer writes it.
+   */
+  readonly updateScript: string
+  /** The GitHub repository releases are published to, `owner/name`. */
+  readonly githubRepo: string
+  /** Where `update-state.json` lives; the app's data directory. */
+  readonly dataDir: string
 }
 
 /** What this relay does with mail. */
@@ -672,6 +725,49 @@ export function loadConfig(
     mail: readMail(env, (file.mail ?? null) as MailFileConfig | null),
     internal: readInternal(env, (file.internal ?? null) as InternalFileConfig | null),
     surveys: readSurveys(env, (file.surveys ?? null) as SurveysFileConfig | null),
+    selfHost: readSelfHost(env, (file.selfHost ?? null) as SelfHostFileConfig | null),
+  }
+}
+
+/** The `selfHost` block as it appears in the config file; every field optional. */
+interface SelfHostFileConfig {
+  readonly pinHash?: string
+  readonly updateTokenHash?: string
+  readonly publicURL?: string
+  readonly autoUpdate?: boolean
+  readonly updateScript?: string
+  readonly githubRepo?: string
+  readonly dataDir?: string
+}
+
+/** The repository the official bundle publishes its releases to. */
+export const DEFAULT_GITHUB_REPO = 'ShirazuNagisa/DSH-Mizar-Relay'
+
+/**
+ * Resolve the self-hosting block.
+ *
+ * A block in the file turns it on; so does `MIZAR_SELF_HOST=1`, which a
+ * container can set without a writable config. No block and no flag means the
+ * relay behaves exactly as it did before this existed, which is what the official
+ * deployment needs: its accounts already answer "which computers are online",
+ * and its operators do not want a public room list as a side effect.
+ */
+function readSelfHost(
+  env: NodeJS.ProcessEnv,
+  file: SelfHostFileConfig | null,
+): SelfHostConfig | null {
+  const pick = <T>(fromEnv: string | undefined, fromFile: T | undefined, fallback: T): T =>
+    fromEnv !== undefined && fromEnv !== '' ? (fromEnv as unknown as T) : (fromFile ?? fallback)
+  const enabled = flag(pick(env['MIZAR_SELF_HOST'], file === null ? undefined : true, false))
+  if (!enabled) return null
+  return {
+    pinHash: pick(env['MIZAR_SELF_HOST_PIN_HASH'], file?.pinHash, ''),
+    updateTokenHash: pick(env['MIZAR_SELF_HOST_UPDATE_TOKEN_HASH'], file?.updateTokenHash, ''),
+    publicURL: pick(env['MIZAR_SELF_HOST_PUBLIC_URL'], file?.publicURL, '').replace(/\/+$/, ''),
+    autoUpdate: flag(pick(env['MIZAR_SELF_HOST_AUTO_UPDATE'], file?.autoUpdate, false)),
+    updateScript: pick(env['MIZAR_SELF_HOST_UPDATE_SCRIPT'], file?.updateScript, ''),
+    githubRepo: pick(env['MIZAR_SELF_HOST_GITHUB_REPO'], file?.githubRepo, DEFAULT_GITHUB_REPO),
+    dataDir: pick(env['MIZAR_SELF_HOST_DATA_DIR'], file?.dataDir, './data'),
   }
 }
 

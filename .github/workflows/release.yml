@@ -1,0 +1,61 @@
+name: release
+
+# One tag, one bundle, one release. The tag is what the installer and the
+# updater resolve through the GitHub API, so a release that exists without a
+# tarball (or a tarball without a checksum) is worse than no release at all --
+# every step here is a precondition for the next.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (must match package.json)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: The tag and the package agree
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          case "$tag" in v*) ;; *) echo "tag '$tag' does not start with v"; exit 1 ;; esac
+          if [ "v$version" != "$tag" ]; then
+            echo "package.json says $version but the tag is $tag"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Pack the bundle
+        run: |
+          mkdir -p out
+          MIZAR_RELEASE_DIR="$PWD/out" npm run pack
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+          files: |
+            out/dsh-mizar-relay-*.tar.gz
+            out/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

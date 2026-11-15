@@ -55,7 +55,7 @@ import { SurveyClient } from './surveys/client.js'
 import { handleDatasetIngest } from './dataset/ingest.js'
 import { lanCaFromEnvironment, type LanCA } from './accounts/lan.js'
 import { handleDatasetReceive } from './dataset/receive.js'
-import { parseJsonObject, readBody, writeJson } from './http.js'
+import { parseJsonObject, readBody, writeHtml, writeJson } from './http.js'
 import { handleMailRequest, MAIL_PATH } from './mail/api.js'
 import { MailClient } from './mail/client.js'
 import { MailService } from './mail/service.js'
@@ -64,15 +64,15 @@ import { TencentMailTransport } from './mail/tencent.js'
 import { deliver, deliverActivity, PushRegistry, readActivity, readDevice, readNotification } from './push.js'
 import { deriveRoom, secretsEqual } from './room.js'
 import { RoomRegistry, Tunnel, saneCloseCode, type TunnelStream } from './tunnel.js'
+import { createSelfHostApi, DesktopDirectory, UpdateMonitor, readDeviceHeaders } from './selfhost.js'
+import { renderSetupPage, SETUP_CSP } from './setup.js'
+import { RELAY_VERSION } from './version.js'
 import {
   ROOM_PREFIX,
   TUNNEL_PATH,
   TUNNEL_PROTOCOL_VERSION,
   splitRoomPath,
 } from './protocol.js'
-
-/** The relay's own version, for the admin settings page. */
-const RELAY_VERSION = '0.3.5'
 
 /** Path prefix of the push API. */
 const PUSH_PREFIX = '/push/v1/'
@@ -1239,6 +1239,61 @@ export async function startRelay(
           ...(deps.now === undefined ? {} : { now: deps.now }),
         })
 
+  /**
+   * The self-hosting surface: a computer directory, a setup page and updates.
+   *
+   * `null` on the official deployment, whose accounts answer "which computers are
+   * online". A self-hosted relay has no accounts by design, so the relay keeps the
+   * directory itself. Both secrets arrive as scrypt hashes; a plaintext one is a
+   * configuration mistake that would be silently unusable, so it is refused at
+   * start-up.
+   */
+  const clock = deps.now ?? Date.now
+  const selfHost = config.selfHost ?? null
+  if (selfHost !== null && selfHost.pinHash !== '' && parseHash(selfHost.pinHash) === null) {
+    throw new Error(
+      'selfHost.pinHash is not a scrypt hash; regenerate it with the installer or the self-host CLI',
+    )
+  }
+  if (
+    selfHost !== null &&
+    selfHost.updateTokenHash !== '' &&
+    parseHash(selfHost.updateTokenHash) === null
+  ) {
+    throw new Error(
+      'selfHost.updateTokenHash is not a scrypt hash; regenerate it with the installer or the self-host CLI',
+    )
+  }
+  const desktops = new DesktopDirectory()
+  const updateMonitor =
+    selfHost === null
+      ? null
+      : new UpdateMonitor({
+          repo: selfHost.githubRepo,
+          dataDir: selfHost.dataDir,
+          ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          updateScript: selfHost.updateScript,
+        })
+  const selfHostApi =
+    selfHost === null || updateMonitor === null
+      ? null
+      : createSelfHostApi({
+          config: selfHost,
+          directory: desktops,
+          isLive: (room) => rooms.get(room)?.alive === true,
+          trustProxy: config.trustProxy !== false,
+          monitor: updateMonitor,
+          now: clock,
+          log,
+        })
+  if (selfHost !== null) {
+    log(
+      `relay: self-hosted mode — setup page on /, ${selfHost.pinHash === '' ? 'open computer list' : 'computer list needs the server PIN'}` +
+        (selfHost.updateTokenHash === '' ? ', page updates off' : ', page updates need the update token'),
+    )
+  }
+
   const server: Server = createServer((request, response) => {
     void handleHttp(request, response).catch(() => {
       if (!response.headersSent) response.writeHead(500)
@@ -1261,6 +1316,17 @@ export async function startRelay(
         push: pushEnabled,
         fcm: fcm !== null,
         version: TUNNEL_PROTOCOL_VERSION,
+        // The build this relay runs, distinct from the tunnel protocol above.
+        // An update check compares this with the published release tag.
+        product: 'dsh-mizar-relay',
+        relayVersion: RELAY_VERSION,
+        // The self-hosting surface. A client's "verify connectivity" step reads
+        // `product` and `pinRequired` to decide what to ask for; the official
+        // deployment reports zeroes here and keeps its own account discovery.
+        selfHost: selfHost !== null,
+        pinRequired: selfHost !== null && selfHost.pinHash !== '',
+        setupPage: selfHost !== null,
+        updateEnabled: selfHost !== null && selfHost.updateTokenHash !== '',
         role: config.role,
         accounts: accountStore !== null,
         // `off` when this relay carries anybody, which is every free relay and
@@ -1301,6 +1367,27 @@ export async function startRelay(
         // that neither sends nor asks the other one to.
         mail: mailService?.status ?? (mailClient === null ? null : { role: 'client' }),
       })
+      return
+    }
+
+    // The self-hosted surface. Both paths are reserved on every deployment: the
+    // official relay answers 404 rather than letting `/` or `/selfhost/v1/...`
+    // fall through to a room and disappear into a computer that never asked for
+    // it.
+    if (url === '/' || url === '/setup' || url.startsWith('/setup?')) {
+      if (selfHost === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      writeHtml(response, 200, renderSetupPage(selfHost), SETUP_CSP)
+      return
+    }
+    if (url.startsWith('/selfhost/v1/')) {
+      if (selfHostApi === null) {
+        writeJson(response, 404, { error: 'not found' })
+        return
+      }
+      await selfHostApi(request, response, new URL(url, 'http://relay.invalid').pathname)
       return
     }
 
@@ -2196,6 +2283,17 @@ export async function startRelay(
       const displaced = rooms.register(room, tunnel)
       displaced?.close(4000, 'replaced by a newer tunnel')
 
+      // The self-hosted computer directory. Registered before the account half
+      // because a self-hosted relay has no account half at all: the headers the
+      // computer sent on the upgrade are the whole of what a phone's list knows
+      // about it.
+      let desktopTicket: number | null = null
+      if (selfHost !== null) {
+        const entry = readDeviceHeaders(request.headers, room, clock())
+        desktopTicket = desktops.register(entry)
+        log(`relay: ${room} is listed as "${entry.name}" (${entry.platform})`)
+      }
+
       // The account half of this tunnel: optional today, required by the relay
       // that has no anonymous traffic. A rejected session closes the socket so a
       // signed-out desktop cannot linger as an online-but-unreachable device.
@@ -2238,6 +2336,9 @@ export async function startRelay(
         }
         const wasCurrent = rooms.remove(room, tunnel)
         if (hostPresence.get(room)?.tunnel === tunnel) hostPresence.delete(room)
+        // Only the ticket this tunnel registered may remove the row: a room
+        // that was displaced by a newer tunnel must keep showing the newer one.
+        if (desktopTicket !== null) desktops.unregister(room, desktopTicket)
         if (wasCurrent) log(`relay: tunnel for room ${room} disconnected`)
       })
 

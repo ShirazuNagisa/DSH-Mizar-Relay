@@ -62,6 +62,8 @@ cp -R "$ROOT/node_modules/ws" "$STAGE/app/node_modules/ws"
 
 cp "$HERE/README.md" "$STAGE/README.md"
 cp "$HERE/install.sh" "$STAGE/install.sh"
+cp "$HERE/get.sh" "$STAGE/get.sh"
+cp "$HERE/update.sh" "$STAGE/update.sh"
 cp "$HERE/nginx-websocket.conf" "$STAGE/nginx-websocket.conf"
 cp "$HERE/nginx-dataset.conf" "$STAGE/nginx-dataset.conf"
 cp "$HERE/dataset-flush.sh" "$STAGE/dataset-flush.sh"
@@ -72,7 +74,7 @@ cp "$DOC" "$STAGE/DEPLOYMENT-FULL.md"
 sed "s/v[0-9][0-9.]* — 文件说明/v$VERSION — 文件说明/" "$HERE/文件说明.txt" > "$STAGE/文件说明.txt"
 
 chmod 600 "$STAGE/app/relay.config.json"
-chmod +x "$STAGE/install.sh" "$STAGE/dataset-flush.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/get.sh" "$STAGE/update.sh" "$STAGE/dataset-flush.sh"
 
 mkdir -p "$OUT"
 rm -f "$OUT/dsh-mizar-relay-$VERSION.tar.gz"
@@ -84,5 +86,14 @@ rm -rf "$(dirname "$STAGE")"
 
 printf '\n'
 say "wrote $OUT/dsh-mizar-relay-$VERSION.tar.gz"
-say "sha256 $(shasum -a 256 "$OUT/dsh-mizar-relay-$VERSION.tar.gz" | cut -d' ' -f1)"
+
+# The checksum the installer and the updater verify. Written beside the tarball
+# with a bare file name, because that is the shape `sha256sum -c` expects in a
+# release's asset directory. The release workflow packs into an empty directory,
+# so this file lists exactly the one bundle it is published with.
+CHECKSUM_TOOL=sha256sum
+command -v sha256sum >/dev/null 2>&1 || CHECKSUM_TOOL='shasum -a 256'
+( cd "$OUT" && $CHECKSUM_TOOL "dsh-mizar-relay-$VERSION.tar.gz" > SHA256SUMS )
+say "wrote $OUT/SHA256SUMS"
+say "sha256 $($CHECKSUM_TOOL "$OUT/dsh-mizar-relay-$VERSION.tar.gz" | cut -d' ' -f1)"
 printf '\n'

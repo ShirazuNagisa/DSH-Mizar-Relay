@@ -1,5 +1,9 @@
 # Deploying the DSH-Mizar relay
 
+> **自建一条命令**：如果你的目标是「自己的域名 + 自己的服务器 + 不依赖官方」，先看
+> [self-hosting.md](self-hosting.md)。它是 `get.sh` 一键安装、自动证书、服务器 PIN、
+> 教程页与自动更新的完整说明。本文是手动部署（宝塔 + nginx + 账户服务）的参考。
+
 The relay is the third answer to "how does the phone reach the computer", after the two in
 This document: a small Node service you run on a server with a public
 address, which lets a computer that **cannot accept inbound connections at all** still be reachable.

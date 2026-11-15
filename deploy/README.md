@@ -1,6 +1,6 @@
 # DSH-Mizar 中继服务器
 
-当前版本 **0.3.8**。
+当前版本 **0.5.0**。
 
 **让手机从任何网络连上你的电脑**，即使电脑所在的网络封禁入站连接（校园网、公司网、
 运营商 CGNAT 都是这样）。
@@ -14,6 +14,21 @@ AGI Mizar 桌面端 ──出站 wss──▶ 这台服务器 ◀──https─�
    /tunnel                    │        /r/<房间号>/...
                               └─ 转给电脑上的 127.0.0.1:19390
 ```
+
+---
+
+## 自建：一条命令
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ShirazuNagisa/DSH-Mizar-Relay/main/deploy/get.sh \
+  | sudo bash -s -- --domain relay.example.com
+```
+
+安装器会装 Node 与 Caddy、生成服务器 PIN 与更新 token（只打印一次）、写 systemd 服务与
+每日自动更新 timer，并把教程页挂在 `https://<域名>/`。不需要宝塔。
+完整说明见仓库的 `docs/self-hosting.md`。
+
+不想一键安装（例如已有宝塔/nginx）时用下面的手动流程。
 
 ---
 

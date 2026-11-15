@@ -1,6 +1,6 @@
 {
   "name": "dsh-mizar-relay",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Reverse tunnel that lets the DSH-Mizar iOS app reach a computer from any network, with no inbound port.",
   "private": true,
   "license": "GPL-3.0-only",
@@ -10,7 +10,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp src/setup.html lib/setup.html",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "start": "node lib/index.js",

@@ -41,14 +41,22 @@ export function writeJson(response: ServerResponse, status: number, body: unknow
   response.end(payload)
 }
 
+/** The CSP every server-rendered page gets unless it says otherwise. */
+const DEFAULT_HTML_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; form-action 'self'; base-uri 'none'"
+
 /** Write an HTML response with the headers the admin UI needs. */
-export function writeHtml(response: ServerResponse, status: number, html: string): void {
+export function writeHtml(
+  response: ServerResponse,
+  status: number,
+  html: string,
+  contentSecurityPolicy: string = DEFAULT_HTML_CSP,
+): void {
   response.writeHead(status, {
     'content-type': 'text/html; charset=utf-8',
     'content-length': Buffer.byteLength(html),
     'cache-control': 'no-store',
-    'content-security-policy':
-      "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; form-action 'self'; base-uri 'none'",
+    'content-security-policy': contentSecurityPolicy,
     'x-frame-options': 'DENY',
     'referrer-policy': 'no-referrer',
   })

@@ -1,6 +1,6 @@
 # DSH-Mizar 中继服务器
 
-当前版本 **0.3.8**。
+当前版本 **0.5.0**。
 
 **让手机从任何网络连上你的电脑**，即使电脑所在的网络封禁入站连接（校园网、公司网、
 运营商 CGNAT 都是这样）。同一个中继也负责把推送转给 Apple。
@@ -15,6 +15,27 @@ AGI Mizar 桌面端 ──出站 wss──▶ 这台服务器 ◀──https─�
                               ├─ 转给电脑上的 127.0.0.1:19390
                               └─ 推送：/push/v1/notify ──▶ Apple (APNs) ──▶ 手机
 ```
+
+## 自建：一条命令
+
+不依赖官方服务器的人用自己的域名和机器跑一份中继。装好之后手机与电脑都走它，
+**没有账户、没有付费门禁、没有每日额度**：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ShirazuNagisa/DSH-Mizar-Relay/main/deploy/get.sh \
+  | sudo bash -s -- --domain relay.example.com
+```
+
+安装器会装 Node（缺省时下载官方 LTS）与 Caddy（自动申请证书），生成服务器 PIN 和更新
+token（各只打印一次），写 systemd 服务与每日自动更新 timer，然后把教程页挂在
+`https://<域名>/`：状态、连接步骤、更新、排错都在那一页。
+
+- 客户端在「服务器」里选自建，填域名 + PIN；手机再从在线电脑列表里选电脑，输入电脑上
+  显示的 6 位配对码。
+- 更新来自 GitHub Releases：校验 `SHA256SUMS`、失败自动回滚、永远不动配置与数据。
+- 完整参数、配置块、端点、轮换与排错：[docs/self-hosting.md](docs/self-hosting.md)。
+
+不想要一键安装（例如已有宝塔/nginx）时用下面的手动流程。
 
 ## 账户服务、角色与 App Store 订阅
 
@@ -72,7 +93,7 @@ AGI Mizar 桌面端 ──出站 wss──▶ 这台服务器 ◀──https─�
 [docs/deployment.md](docs/deployment.md) 11.11，起因见工作区
 `docs/relay-free-tier-abuse-risk-2026-10-26.md`。
 
-## 部署
+## 手动部署（宝塔 / nginx）
 
 打包成一个自包含的 bundle，然后在服务器上装：
 

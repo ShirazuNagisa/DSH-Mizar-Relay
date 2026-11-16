@@ -33,7 +33,7 @@ import {
   MAX_PAYLOAD_BYTES,
   type ApnsConfig,
 } from '../src/apns.js'
-import { deliver, PushRegistry, readDevice, readNotification } from '../src/push.js'
+import { deliver, PushRegistry, readActivity, readDevice, readNotification } from '../src/push.js'
 
 /** A throwaway P-256 key, in the shape Apple hands out. */
 function testKey(): { pem: string; privateKey: KeyObject; publicKey: KeyObject } {
@@ -278,6 +278,20 @@ describe('starting a Live Activity from the computer', () => {
   const rows = [
     { sessionId: 'session-1', title: 'Refactor the parser', runningSince: 1_700_000_000_000 },
   ]
+
+  it('encodes an optional waiting instant with the Swift reference epoch', () => {
+    const payload = buildLiveActivityUpdatePayload({
+      token: 'activity1', environment: 'sandbox', rows: [{
+        sessionId: 'session-1', title: 'Waiting', runningSince: 1_700_000_000_000,
+        waitingSince: 1_700_000_050_000,
+      }],
+    }, 1_700_000_060_000)
+    const state = (payload.aps['content-state'] as { rows: Array<Record<string, unknown>> })
+    expect(state.rows[0]).toMatchObject({
+      countingSince: 1_700_000_000 - 978_307_200,
+      waitingSince: 1_700_000_050 - 978_307_200,
+    })
+  })
 
   it('carries attributes, content state, and the alert a start needs', () => {
     const payload = buildLiveActivityStartPayload(
@@ -702,6 +716,32 @@ describe('delivery', () => {
     await apple.close()
   })
 
+  it('refuses an oversized full Live Activity payload without asking Apple', async () => {
+    const apple = await fakeApple(() => ({ status: 200 }))
+    const key = testKey()
+    const client = new ApnsClient(
+      { key: key.pem, keyId: 'K', teamId: 'T', topic: 'b', production: true, authority: apple.origin },
+      () => {},
+    )
+    clients.push(client)
+
+    const result = await client.sendLiveActivityUpdate({
+      token: 'activity-token',
+      environment: 'production',
+      rows: [],
+      contentState: {
+        rows: [{
+          id: 's', prompt: '', title: '界'.repeat(MAX_PAYLOAD_BYTES), elapsed: 0,
+          countingSince: 0, hostId: 'h', hostName: 'host', status: 'running',
+        }],
+        approvals: [], totalCount: 1, deviceCount: 1, approvalCount: 0, revision: 1,
+      },
+    })
+    expect(result).toMatchObject({ delivered: false, status: 413, reason: 'PayloadTooLarge' })
+    expect(apple.seen).toHaveLength(0)
+    await apple.close()
+  })
+
   it('says so, once, when no key is configured', async () => {
     const registry = new PushRegistry()
     registry.register('room-a', {
@@ -1038,6 +1078,64 @@ describe('the registry', () => {
     expect(registry.devices('a')[0]?.deviceId).toBe('p2')
   })
 
+  it('uses the newest observed card token across rooms, including a newer clear', () => {
+    const registry = new PushRegistry()
+    const base = {
+      token: 'alert-token',
+      platform: 'ios' as const,
+      environment: 'sandbox' as const,
+      locale: 'en',
+    }
+    registry.register('room-a', {
+      ...base, deviceId: 'device-a', liveActivityToken: 'old-card', liveActivityTokenObservedAt: 100,
+    })
+    registry.register('room-b', {
+      ...base, deviceId: 'device-b', liveActivityToken: 'new-card', liveActivityTokenObservedAt: 200,
+    })
+    // A later roster replay is newer as a registration, but its token observation is older.
+    registry.register('room-a', {
+      ...base, deviceId: 'device-a', liveActivityToken: 'old-card', liveActivityTokenObservedAt: 100,
+    })
+    expect(registry.devices('room-a')[0]).toMatchObject({
+      liveActivityToken: 'new-card', liveActivityTokenObservedAt: 200,
+    })
+
+    registry.register('room-b', {
+      ...base, deviceId: 'device-b', liveActivityToken: null, liveActivityTokenObservedAt: 300,
+    })
+    registry.register('room-a', {
+      ...base, deviceId: 'device-a', liveActivityToken: 'old-card', liveActivityTokenObservedAt: 100,
+    })
+    expect(registry.devicesForActivityToken('alert-token', 'sandbox').map(({ device }) => [
+      device.liveActivityToken,
+      device.liveActivityTokenObservedAt,
+    ])).toEqual([[null, 300], [null, 300]])
+  })
+
+  it('retires only a matching old card token without clearing the start guard or allowing roster replay', () => {
+    const registry = new PushRegistry()
+    const base = {
+      deviceId: 'phone', token: 'alert-token', platform: 'ios' as const,
+      environment: 'sandbox' as const, locale: 'en',
+    }
+    registry.register('room-a', {
+      ...base, liveActivityToken: 'old-card', liveActivityTokenObservedAt: 100,
+    })
+    registry.register('room-a', {
+      ...base, liveActivityToken: 'new-card', liveActivityTokenObservedAt: 200,
+    })
+    registry.markLiveActivityStartForToken('alert-token', 'sandbox')
+
+    expect(registry.clearLiveActivityToken('room-a', 'phone', 'old-card')).toBe(false)
+    expect(registry.hasLiveActivityStartForToken('alert-token', 'sandbox')).toBe(true)
+    registry.register('room-a', {
+      ...base, liveActivityToken: 'old-card', liveActivityTokenObservedAt: 100,
+    })
+    expect(registry.devices('room-a')[0]).toMatchObject({
+      liveActivityToken: 'new-card', liveActivityTokenObservedAt: 200,
+    })
+  })
+
   it('clears one device\'s activity token, and only while it is still the current one', () => {
     const registry = new PushRegistry()
     registry.register('a', {
@@ -1116,6 +1214,35 @@ describe('request validation', () => {
     ).toBeNull()
   })
 
+  it('defaults Live Activity registrations to v1 and reads v2 explicitly', () => {
+    expect(readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox' }))
+      .toMatchObject({ liveActivityVersion: 1, liveActivityTokenObservedAt: 0 })
+    expect(readDevice({ deviceId: 'p', token: 'aa', environment: 'sandbox', liveActivityVersion: 2 }))
+      .toMatchObject({ liveActivityVersion: 2 })
+    expect(readDevice({
+      deviceId: 'p', token: 'aa', environment: 'sandbox', liveActivityTokenObservedAt: 1_800_000_000_000,
+    })).toMatchObject({ liveActivityTokenObservedAt: 1_800_000_000_000 })
+    expect(readDevice({ deviceId: 'p', token: 'aa', liveActivityTokenObservedAt: -1 })).toBeNull()
+  })
+
+  it('accepts complete empty v2 snapshots but rejects wrong protocol versions and oversized ids', () => {
+    const empty = {
+      phase: 'update', hostId: 'host', hostName: 'Host', snapshotVersion: 2,
+      revision: 0, sentAt: 1_800_000_000_000, rows: [], approvals: [],
+    }
+    expect(readActivity(empty)).toMatchObject({ hostId: 'host', rows: [], approvals: [] })
+    expect(readActivity({ ...empty, revision: undefined })).toMatchObject({ hostId: 'host', rows: [] })
+    expect(readActivity({ ...empty, snapshotVersion: 3 })).toBeNull()
+    expect(readActivity({
+      ...empty,
+      rows: [{ sessionId: 's'.repeat(201), title: 't', runningSince: 1 }],
+    })).toBeNull()
+    expect(readActivity({
+      ...empty,
+      approvals: [{ requestId: 'r'.repeat(201), sessionId: 's', tool: 't', detail: 'd' }],
+    })).toBeNull()
+  })
+
   it('reads endLiveActivity as a strict true, defaulting to false', () => {
     expect(readNotification({ title: 't', body: 'b' })?.endLiveActivity).toBe(false)
     expect(readNotification({ title: 't', body: 'b', endLiveActivity: true })?.endLiveActivity).toBe(true)
@@ -1157,4 +1284,23 @@ describe('request validation', () => {
         ?.exceptDeviceIds[0],
     ).toHaveLength(200)
   })
+})
+
+it('keeps the full start envelope under APNs 4KB even with a large alert and a near-budget state', () => {
+  const contentState = { rows: [], approvals: [], totalCount: 4, note: 'x'.repeat(3300) }
+  const payload = buildLiveActivityStartPayload({ token: 'aaaa', environment: 'sandbox', rows: [], contentState,
+    alert: { title: '很长的标题'.repeat(200), body: '中文会话标题'.repeat(200) } }, 1_800_000_000_000)
+  expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(4096)
+  expect((payload['aps'] as Record<string, unknown>)['content-state']).toEqual(contentState)
+})
+
+it('omits a legacy approval that cannot fit rather than sending a clipped actionable command', () => {
+  const payload = buildLiveActivityStartPayload({ token: 'aaaa', environment: 'sandbox',
+    rows: [{ sessionId: 'session', title: 'Task', runningSince: 1_800_000_000_000 }],
+    approvals: [{ requestId: 'exact-request', sessionId: 'session', tool: 'Bash', detail: 'command '.repeat(1000) }],
+    alert: { title: 'Mizar', body: 'Task' } }, 1_800_000_000_000)
+  expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(4096)
+  const state = (payload['aps'] as Record<string, unknown>)['content-state'] as { rows: unknown[]; approvals: unknown[] }
+  expect(state.rows).toHaveLength(1)
+  expect(state.approvals).toHaveLength(0)
 })

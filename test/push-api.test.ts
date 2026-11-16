@@ -14,6 +14,7 @@ import { createServer, type Server } from 'node:http'
 import { createServer as createHttp2Server, type Http2Server } from 'node:http2'
 import { generateKeyPairSync } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
+import WebSocket from 'ws'
 import { startRelay, type Relay } from '../src/index.js'
 import type { RelayConfig } from '../src/config.js'
 import type { FcmConfig } from '../src/fcm.js'
@@ -270,6 +271,47 @@ const notification = {
   timeSensitive: false,
 }
 
+function v2Snapshot(
+  hostId: string,
+  phase: 'start' | 'update',
+  rows: Array<Record<string, unknown>>,
+  revision: number,
+): Record<string, unknown> {
+  return {
+    phase,
+    hostId,
+    hostName: `Host ${hostId}`,
+    snapshotVersion: 2,
+    revision,
+    sentAt: Date.now() + revision,
+    rows,
+    approvals: [],
+  }
+}
+
+async function connectTunnel(base: string, credential: string): Promise<WebSocket> {
+  const socket = new WebSocket(`${base.replace(/^http/, 'ws')}/tunnel`, {
+    headers: { authorization: `Bearer ${credential}` },
+  })
+  await new Promise<void>((resolve, reject) => {
+    socket.once('message', (data: Buffer) => {
+      const frame = JSON.parse(data.toString('utf8')) as Record<string, unknown>
+      if (frame['t'] === 'welcome') resolve()
+      else reject(new Error(`expected welcome, got ${String(frame['t'])}`))
+    })
+    socket.once('error', reject)
+  })
+  return socket
+}
+
+async function waitForReceivedCount(count: number): Promise<void> {
+  const deadline = Date.now() + 2_000
+  while (received.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(received.length).toBeGreaterThanOrEqual(count)
+}
+
 describe('registering a device', () => {
   it('stores it against the room the credential derives', async () => {
     const base = await boot(null)
@@ -280,7 +322,16 @@ describe('registering a device', () => {
       locale: 'zh-Hans',
     })
     expect(reply.status).toBe(200)
-    expect(reply.json).toMatchObject({ ok: true, devices: 1, enabled: false })
+    expect(reply.json).toMatchObject({ ok: true, devices: 1, enabled: false, activitySnapshotNeeded: true })
+
+    const snapshotReply = await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'session-a', title: 'Current task', runningSince: Date.now() },
+    ], 1))
+    expect(snapshotReply.status).toBe(200)
+    const registeredAgain = await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-1', token: 'deadbeef', environment: 'sandbox', locale: 'zh-Hans',
+    })
+    expect(registeredAgain.json).toMatchObject({ activitySnapshotNeeded: false })
 
     const status = await fetch(`${base}/push/v1/status`, {
       headers: { authorization: `Bearer ${MAC_A}` },
@@ -453,6 +504,137 @@ describe('registering a device', () => {
       platform: 'ios',
       environment: 'sandbox',
     })
+  })
+})
+
+describe('v2 activity snapshot aggregation', () => {
+  it('retains four rows and four pending approvals from one host in the APNs state and counts', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    const rows = Array.from({ length: 4 }, (_, index) => ({
+      sessionId: `session-${index}`, title: `Task ${index}`, runningSince: Date.now() - index * 1_000,
+    }))
+    const approvals = rows.map((row, index) => ({
+      requestId: `approval-${index}`, sessionId: row.sessionId, tool: 'Shell', detail: `Confirm ${index}`,
+    }))
+    const reply = await post(base, '/push/v1/activity', MAC_A, {
+      ...v2Snapshot('host-a', 'update', rows, 1), approvals,
+    })
+    expect(reply.status).toBe(200)
+    const body = JSON.parse(received.at(-1)?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<Record<string, unknown>>; approvals: Array<Record<string, unknown>>; totalCount: number; deviceCount: number; approvalCount: number } }
+    }
+    expect(body.aps['content-state'].rows).toHaveLength(4)
+    expect(body.aps['content-state'].approvals).toHaveLength(4)
+    expect(body.aps['content-state']).toMatchObject({ totalCount: 4, deviceCount: 1, approvalCount: 4 })
+  })
+
+  it('reports true aggregate counts when two hosts contribute more than four rows', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    for (const credential of [MAC_A, MAC_B]) {
+      await post(base, '/push/v1/register', credential, {
+        deviceId: 'same-phone', token: 'aaaa', environment: 'sandbox',
+        liveActivityVersion: 2, liveActivityToken: '1111',
+      })
+    }
+    for (const [host, credential] of [['host-a', MAC_A], ['host-b', MAC_B]] as const) {
+      const rows = Array.from({ length: 4 }, (_, index) => ({
+        sessionId: `${host}-session-${index}`, title: `${host} task ${index}`, runningSince: Date.now() - index * 1_000,
+      }))
+      const reply = await post(base, '/push/v1/activity', credential, v2Snapshot(host, 'update', rows, 1))
+      expect(reply.status).toBe(200)
+    }
+    const body = JSON.parse(received.at(-1)?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<Record<string, unknown>>; totalCount: number; deviceCount: number; approvalCount: number } }
+    }
+    expect(body.aps['content-state'].rows).toHaveLength(4)
+    expect(body.aps['content-state']).toMatchObject({ totalCount: 8, deviceCount: 2, approvalCount: 0 })
+  })
+
+  it('retries an aggregate end after a transient APNs failure', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'session-a', title: 'Task', runningSince: Date.now() },
+    ], 1))
+    received = []
+    answers = [{ status: 500 }, { status: 200 }]
+    const empty = v2Snapshot('host-a', 'update', [], 2)
+    await post(base, '/push/v1/activity', MAC_A, empty)
+    await post(base, '/push/v1/activity', MAC_A, empty)
+    expect(received.filter((entry) => entry.headers['apns-push-type'] === 'liveactivity')).toHaveLength(2)
+  })
+
+  it('retries a v2 notify end after a transient APNs failure', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    let activityEnds = 0
+    answerFor = (request) => {
+      if (request.headers['apns-push-type'] === 'liveactivity') {
+        activityEnds += 1
+        return { status: activityEnds === 1 ? 500 : 200 }
+      }
+      return { status: 200 }
+    }
+    const end = {
+      ...notification,
+      endLiveActivity: true,
+      snapshotVersion: 2,
+      sentAt: Date.now(),
+      revision: 0,
+    }
+    await post(base, '/push/v1/notify', MAC_A, end)
+    await post(base, '/push/v1/notify', MAC_A, end)
+    expect(activityEnds).toBe(2)
+  })
+
+  it('sends offline only when the current tunnel closes, not when a displaced tunnel closes', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    const first = await connectTunnel(base, MAC_A)
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'session-a', title: 'Current task', runningSince: Date.now() },
+    ], 1))
+
+    const firstClosed = new Promise<void>((resolve) => first.once('close', () => resolve()))
+    const second = await connectTunnel(base, MAC_A)
+    await firstClosed
+    received = []
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'session-a', title: 'Current task', runningSince: Date.now() },
+    ], 2))
+    const online = JSON.parse(received.at(-1)?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<{ status: string }> } }
+    }
+    expect(online.aps['content-state'].rows[0]?.status).toBe('running')
+
+    received = []
+    const secondClosed = new Promise<void>((resolve) => second.once('close', () => resolve()))
+    second.close()
+    await secondClosed
+    await waitForReceivedCount(1)
+    const offline = JSON.parse(received[0]?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<{ status: string }> } }
+    }
+    expect(offline.aps['content-state'].rows[0]?.status).toBe('offline')
+    first.terminate()
   })
 })
 
@@ -791,6 +973,183 @@ describe('notifying a room', () => {
         rows: [{ title: 't', runningSince: 1 }],
       })).status,
     ).toBe(400)
+  })
+
+  it('validates an optional waiting age but accepts old snapshots that omit it', async () => {
+    const base = await boot(null)
+    const legacy = await post(base, '/push/v1/activity', MAC_A, {
+      phase: 'start', rows: [{ sessionId: 'legacy', title: 'Old', runningSince: Date.now() }],
+    })
+    expect(legacy.status).toBe(200)
+    const malformed = await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'bad-wait', title: 'Bad', runningSince: Date.now(), waitingSince: 'yesterday' },
+    ], 1))
+    expect(malformed.status).toBe(400)
+  })
+
+  it('aggregates registered rooms for one v2 phone and keeps duplicate session ids isolated by host', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    for (const credential of [MAC_A, MAC_B]) {
+      await post(base, '/push/v1/register', credential, {
+        deviceId: 'same-phone', token: 'aaaa', environment: 'sandbox',
+        liveActivityVersion: 2, liveActivityToken: '1111',
+      })
+    }
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'shared-session', title: 'From A', runningSince: Date.now(), status: 'running' },
+    ], 1))
+    const waitingSince = Date.now() - 17_000
+    await post(base, '/push/v1/activity', MAC_B, v2Snapshot('host-b', 'update', [
+      {
+        sessionId: 'shared-session', title: 'From B', runningSince: Date.now() - 5_000,
+        waitingSince, status: 'waitingAnswer',
+      },
+    ], 1))
+
+    const pushes = received.filter((entry) => entry.path === '/3/device/1111')
+    expect(pushes).toHaveLength(2)
+    const last = JSON.parse(pushes[1]?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<Record<string, unknown>> } }
+    }
+    expect(last.aps['content-state'].rows.map((row) => [row.id, row.hostId])).toEqual([
+      ['shared-session', 'host-b'], ['shared-session', 'host-a'],
+    ])
+    expect(last.aps['content-state'].rows[0]?.waitingSince).toBe(waitingSince / 1000 - 978_307_200)
+
+    received = []
+    await post(base, '/push/v1/activity', MAC_B, v2Snapshot('host-b', 'update', [], 2))
+    const retained = JSON.parse(received[0]?.body ?? '{}') as {
+      aps: { event: string; 'content-state': { rows: Array<Record<string, unknown>> } }
+    }
+    expect(retained.aps.event).toBe('update')
+    expect(retained.aps['content-state'].rows.map((row) => row.hostId)).toEqual(['host-a'])
+  })
+
+  it('excludes snapshots from rooms where the phone has no registration', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    await post(base, '/push/v1/activity', MAC_B, v2Snapshot('unregistered-host', 'update', [
+      { sessionId: 'secret-session', title: 'Not authorized', runningSince: Date.now() },
+    ], 1))
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('authorized-host', 'update', [
+      { sessionId: 'visible-session', title: 'Visible', runningSince: Date.now() },
+    ], 1))
+
+    const body = JSON.parse(received[0]?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<Record<string, unknown>> } }
+    }
+    expect(body.aps['content-state'].rows.map((row) => row.hostId)).toEqual(['authorized-host'])
+    expect(JSON.stringify(body)).not.toContain('secret-session')
+  })
+
+  it('filters each room snapshot against that room’s registered device id', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'device-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    await post(base, '/push/v1/register', MAC_B, {
+      deviceId: 'device-b', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'a-visible', title: 'A', runningSince: Date.now(), allowedDeviceIds: ['device-a'] },
+    ], 1))
+    await post(base, '/push/v1/activity', MAC_B, {
+      ...v2Snapshot('host-b', 'update', [
+        { sessionId: 'b-visible', title: 'B', runningSince: Date.now(), allowedDeviceIds: ['device-b'] },
+        { sessionId: 'b-hidden', title: 'Hidden', runningSince: Date.now(), allowedDeviceIds: ['device-a'] },
+        { sessionId: 'b-private', title: 'Private', runningSince: Date.now(), allowedDeviceIds: [] },
+      ], 1),
+      approvals: [{
+        requestId: 'approval-hidden', sessionId: 'b-visible', tool: 'Bash', detail: 'private',
+        allowedDeviceIds: ['device-a'],
+      }],
+    })
+
+    const body = JSON.parse(received.at(-1)?.body ?? '{}') as {
+      aps: { 'content-state': { rows: Array<Record<string, unknown>>; approvals: Array<Record<string, unknown>> } }
+    }
+    expect(body.aps['content-state'].rows.map((row) => row.id).sort()).toEqual(['a-visible', 'b-visible'])
+    expect(body.aps['content-state'].approvals).toEqual([])
+  })
+
+  it('serializes concurrent v2 starts across registered rooms for the same phone', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    for (const credential of [MAC_A, MAC_B]) {
+      await post(base, '/push/v1/register', credential, {
+        deviceId: 'same-phone', token: 'aaaa', environment: 'sandbox',
+        liveActivityVersion: 2, liveActivityStartToken: '9999',
+      })
+    }
+    const [a, b] = await Promise.all([
+      post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'start', [
+        { sessionId: 'a', title: 'A', runningSince: Date.now() },
+      ], 1)),
+      post(base, '/push/v1/activity', MAC_B, v2Snapshot('host-b', 'start', [
+        { sessionId: 'b', title: 'B', runningSince: Date.now() },
+      ], 1)),
+    ])
+    expect(a.status).toBe(200)
+    expect(b.status).toBe(200)
+    expect(received.filter((entry) => entry.path === '/3/device/9999')).toHaveLength(1)
+  })
+
+  it('ends an existing v2 card when the complete aggregate becomes empty', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'session-a', title: 'A', runningSince: Date.now() },
+    ], 1))
+    received = []
+    const reply = await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [], 2))
+    expect(reply.status).toBe(200)
+    expect(received).toHaveLength(1)
+    expect(received[0]?.headers['apns-push-type']).toBe('liveactivity')
+    const body = JSON.parse(received[0]?.body ?? '{}') as { aps: { event: string; 'content-state': unknown } }
+    expect(body.aps.event).toBe('end')
+    expect(body.aps['content-state']).toEqual({ rows: [] })
+  })
+
+  it('does not let a delayed v2 end notification erase a newer host snapshot', async () => {
+    const authority = await startFakeApple()
+    const base = await boot(authority)
+    await post(base, '/push/v1/register', MAC_A, {
+      deviceId: 'phone-a', token: 'aaaa', environment: 'sandbox',
+      liveActivityVersion: 2, liveActivityToken: '1111',
+    })
+    await post(base, '/push/v1/activity', MAC_A, v2Snapshot('host-a', 'update', [
+      { sessionId: 'new-turn', title: 'Current turn', runningSince: Date.now() },
+    ], 20))
+
+    received = []
+    const reply = await post(base, '/push/v1/notify', MAC_A, {
+      ...notification,
+      endLiveActivity: true,
+      snapshotVersion: 2,
+      sentAt: Date.now() - 10_000,
+      revision: 19,
+    })
+    expect(reply.status).toBe(200)
+    const activityPushes = received.filter((entry) => entry.headers['apns-push-type'] === 'liveactivity')
+    expect(activityPushes).toHaveLength(1)
+    const body = JSON.parse(activityPushes[0]?.body ?? '{}') as {
+      aps: { event: string; 'content-state': { rows: Array<Record<string, unknown>> } }
+    }
+    expect(body.aps.event).toBe('update')
+    expect(body.aps['content-state'].rows.map((row) => row.id)).toEqual(['new-turn'])
   })
 
   it('sends no end push when endLiveActivity is false or absent', async () => {

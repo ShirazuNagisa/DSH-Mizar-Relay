@@ -61,7 +61,7 @@ import { MailClient } from './mail/client.js'
 import { MailService } from './mail/service.js'
 import { SmtpMailTransport } from './mail/smtp.js'
 import { TencentMailTransport } from './mail/tencent.js'
-import { deliver, deliverActivity, PushRegistry, readActivity, readDevice, readNotification } from './push.js'
+import { deliver, deliverActivity, deliverActivityPresence, PushRegistry, readActivity, readDevice, readNotification } from './push.js'
 import { deriveRoom, secretsEqual } from './room.js'
 import { RoomRegistry, Tunnel, saneCloseCode, type TunnelStream } from './tunnel.js'
 import { createSelfHostApi, DesktopDirectory, UpdateMonitor, readDeviceHeaders } from './selfhost.js'
@@ -1779,6 +1779,7 @@ export async function startRelay(
           ok: true,
           devices: pushRegistry.devices(room).length,
           enabled: pushEnabled,
+          activitySnapshotNeeded: pushRegistry.needsActivitySnapshot(room),
         })
         return
       }
@@ -2281,6 +2282,7 @@ export async function startRelay(
       )
 
       const displaced = rooms.register(room, tunnel)
+      pushRegistry.setRoomAvailable(room, false)
       displaced?.close(4000, 'replaced by a newer tunnel')
 
       // The self-hosted computer directory. Registered before the account half
@@ -2339,7 +2341,12 @@ export async function startRelay(
         // Only the ticket this tunnel registered may remove the row: a room
         // that was displaced by a newer tunnel must keep showing the newer one.
         if (desktopTicket !== null) desktops.unregister(room, desktopTicket)
-        if (wasCurrent) log(`relay: tunnel for room ${room} disconnected`)
+        if (wasCurrent) {
+          pushRegistry.setRoomAvailable(room, false)
+          void deliverActivityPresence({ registry: pushRegistry, apns, log }, room)
+            .catch(() => log(`push: could not update unavailable room ${room}`))
+          log(`relay: tunnel for room ${room} disconnected`)
+        }
       })
 
       host.send(

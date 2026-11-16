@@ -26,6 +26,7 @@
  */
 import type { ApnsClient, ApnsEnvironment, ApnsNotification, ApnsResult } from './apns.js'
 import type { FcmClient, FcmNotification, FcmResult } from './fcm.js'
+import { aggregateActivity, type ActivityHostSnapshot, type AggregatedActivityContentState } from './activity-aggregate.js'
 
 /** Which push service a device's token belongs to. */
 export type PushPlatform = 'ios' | 'android'
@@ -54,6 +55,8 @@ export interface PushDevice {
    * is retired with the activity rather than with the install.
    */
   readonly liveActivityToken: string | null
+  /** When ActivityKit last changed this token, including a transition to null. */
+  readonly liveActivityTokenObservedAt?: number
   /**
    * The token that can *start* a Live Activity, for an iOS device.
    *
@@ -62,6 +65,8 @@ export interface PushDevice {
    * yet. `null` until the app has reported one, and on Android always.
    */
   readonly liveActivityStartToken: string | null
+  /** Live Activity wire version. Missing registrations continue to mean v1. */
+  readonly liveActivityVersion?: 1 | 2
   readonly locale: string
   readonly registeredAt: number
 }
@@ -85,6 +90,10 @@ export interface PushRequest {
    * one that is still running.
    */
   readonly endLiveActivity: boolean
+  /** Snapshot ordering metadata used to distinguish v2 end notifications. */
+  readonly snapshotVersion?: 2
+  readonly sentAt?: number
+  readonly revision?: number
   /**
    * Devices the plugin has already decided are looking at the app.
    *
@@ -138,6 +147,20 @@ const MAX_DEVICE_ID_LENGTH = 200
 /** Devices one room may register. Generous for a household, bounded for a script. */
 const MAX_DEVICES_PER_ROOM = 16
 
+interface StoredActivitySnapshot {
+  readonly snapshot: ActivityHostSnapshot
+  readonly revision?: number
+  readonly sentAt: number
+}
+
+function activityTokenKey(token: string, environment: ApnsEnvironment): string {
+  return JSON.stringify([token, environment])
+}
+
+function activityDisplay(value: string, limit: number): string {
+  return Array.from(value).slice(0, limit).join('')
+}
+
 /**
  * Narrow a registration body.
  *
@@ -185,6 +208,10 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
   if (token.length > MAX_IOS_TOKEN_LENGTH || !IOS_TOKEN.test(token)) return null
   const liveActivityToken = readLiveActivityToken(record['liveActivityToken'])
   if (liveActivityToken === undefined) return null
+  const observedAtValue = record['liveActivityTokenObservedAt']
+  if (observedAtValue !== undefined &&
+    (!Number.isSafeInteger(observedAtValue) || (observedAtValue as number) < 0)) return null
+  const liveActivityTokenObservedAt = typeof observedAtValue === 'number' ? observedAtValue : 0
   const liveActivityStartToken = readLiveActivityToken(record['liveActivityStartToken'])
   if (liveActivityStartToken === undefined) return null
   return {
@@ -196,7 +223,9 @@ export function readDevice(value: unknown): Omit<PushDevice, 'registeredAt'> | n
     // real device sent.
     environment: record['environment'] === 'sandbox' ? 'sandbox' : 'production',
     liveActivityToken,
+    liveActivityTokenObservedAt,
     liveActivityStartToken,
+    liveActivityVersion: record['liveActivityVersion'] === 2 ? 2 : 1,
     locale: typeof record['locale'] === 'string' ? record['locale'].slice(0, 32) : 'en',
   }
 }
@@ -237,6 +266,14 @@ export function readNotification(value: unknown): PushRequest | null {
   const body = record['body']
   if (typeof title !== 'string' || title === '') return null
   if (typeof body !== 'string') return null
+  const snapshotVersion = record['snapshotVersion']
+  const sentAt = record['sentAt']
+  const revision = record['revision']
+  const isV2End = snapshotVersion !== undefined
+  if (isV2End && snapshotVersion !== 2) return null
+  if (isV2End && (typeof sentAt !== 'number' || !Number.isFinite(sentAt) || sentAt <= 0)) return null
+  if (isV2End && revision !== undefined &&
+    (!Number.isSafeInteger(revision) || (revision as number) < 0)) return null
   const sessionId = record['sessionId']
   return {
     kind: typeof record['kind'] === 'string' ? record['kind'].slice(0, 32) : 'unknown',
@@ -247,6 +284,11 @@ export function readNotification(value: unknown): PushRequest | null {
     collapseId: typeof record['collapseId'] === 'string' ? record['collapseId'].slice(0, 64) : '',
     timeSensitive: record['timeSensitive'] === true,
     endLiveActivity: record['endLiveActivity'] === true,
+    ...(isV2End ? {
+      snapshotVersion: 2 as const,
+      sentAt: sentAt as number,
+      ...(typeof revision === 'number' ? { revision } : {}),
+    } : {}),
     exceptDeviceIds: readExceptDeviceIds(record['exceptDeviceIds']),
   }
 }
@@ -276,9 +318,26 @@ function readExceptDeviceIds(value: unknown): readonly string[] {
   return [...ids]
 }
 
+function readAllowedDeviceIds(value: unknown): readonly string[] | undefined | null {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) return null
+  const ids = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry === '' || entry.length > MAX_DEVICE_ID_LENGTH) return null
+    ids.add(entry)
+    if (ids.size > MAX_DEVICES_PER_ROOM) return null
+  }
+  return [...ids]
+}
+
 /** Every room's registered devices. */
 export class PushRegistry {
   readonly #rooms = new Map<string, Map<string, PushDevice>>()
+  readonly #roomAvailable = new Map<string, boolean>()
+  readonly #activitySnapshots = new Map<string, StoredActivitySnapshot>()
+  readonly #activityTokenObservations = new Map<string, { readonly observedAt: number; readonly token: string | null }>()
+  readonly #retiredActivityTokens = new Map<string, Set<string>>()
+  #activityRevision = 0
   /**
    * When this device was last sent a push-to-start that Apple accepted.
    *
@@ -288,6 +347,9 @@ export class PushRegistry {
    * those publishes became another start -- the duplicate islands.
    */
   readonly #startedAt = new Map<string, Map<string, number>>()
+  readonly #startedAtByToken = new Map<string, number>()
+  readonly #endedAtByToken = new Map<string, number>()
+  readonly #activityQueues = new Map<string, Promise<unknown>>()
 
   /**
    * Record one device.
@@ -310,6 +372,31 @@ export class PushRegistry {
     for (const [id, existing] of [...devices]) {
       if (id !== device.deviceId && existing.token === device.token) devices.delete(id)
     }
+    const environment = device.environment ?? 'production'
+    const key = activityTokenKey(device.token, environment)
+    const observedAt = device.liveActivityTokenObservedAt ?? 0
+    let observation = this.#activityTokenObservations.get(key)
+    const retired = device.liveActivityToken !== null && this.#retiredActivityTokens.get(key)?.has(device.liveActivityToken)
+    let observationChanged = false
+    if (retired) {
+      // A persisted roster can replay a token Apple already retired. Keep the
+      // high-water mark and represent that dead card as absent.
+      if (observation === undefined || observedAt > observation.observedAt) {
+        observation = { observedAt, token: null }
+        this.#activityTokenObservations.set(key, observation)
+      }
+    } else if (observation === undefined || observedAt > observation.observedAt || (observedAt === 0 && observation.observedAt === 0)) {
+      observation = { observedAt, token: device.liveActivityToken }
+      this.#activityTokenObservations.set(key, observation)
+      observationChanged = true
+    }
+    observation ??= { observedAt, token: device.liveActivityToken }
+    const normalizedDevice = {
+      ...device,
+      liveActivityToken: observation.token,
+      liveActivityTokenObservedAt: observation.observedAt,
+      liveActivityVersion: device.liveActivityVersion ?? 1,
+    }
     // A reported activity token is proof that a card exists; a fresh
     // push-to-start token means this install can create one again. Either way
     // the next start is not the duplicate this guard exists to stop. A plain
@@ -317,14 +404,211 @@ export class PushRegistry {
     // mark, which is the case that was producing a second card.
     const previous = devices.get(device.deviceId)
     if (
-      device.liveActivityToken !== null ||
+      observationChanged || normalizedDevice.liveActivityToken !== null ||
       previous === undefined ||
-      previous.liveActivityStartToken !== device.liveActivityStartToken
+      previous.liveActivityStartToken !== normalizedDevice.liveActivityStartToken
     ) {
       this.forgetLiveActivityStart(room, device.deviceId)
     }
-    devices.set(device.deviceId, { ...device, registeredAt: Date.now() })
+    devices.set(device.deviceId, {
+      ...normalizedDevice,
+      registeredAt: Date.now(),
+    })
+    if (observationChanged || normalizedDevice.liveActivityToken !== null) {
+      this.forgetLiveActivityStartForToken(device.token, environment)
+      this.forgetLiveActivityEndForToken(device.token, environment)
+    }
     return true
+  }
+
+  /** Store the latest snapshot for one host in one authorized room. */
+  setActivitySnapshot(
+    room: string,
+    snapshot: ActivityHostSnapshot,
+    revision: number | undefined,
+    sentAt: number,
+  ): boolean {
+    const previous = this.#activitySnapshots.get(room)
+    if (previous !== undefined && sentAt < previous.sentAt) return false
+    if (previous !== undefined && sentAt === previous.sentAt) {
+      // A matching timestamp is only ordered when both snapshots carry an
+      // explicit revision. Missing metadata cannot prove that this is newer.
+      if (revision === undefined || previous.revision === undefined || revision <= previous.revision) return false
+    }
+    this.#activitySnapshots.set(room, { snapshot, revision, sentAt })
+    this.#roomAvailable.set(room, true)
+    this.#activityRevision += 1
+    return true
+  }
+
+  needsActivitySnapshot(room: string): boolean {
+    return !this.#activitySnapshots.has(room) || this.#roomAvailable.get(room) === false
+  }
+
+  setRoomAvailable(room: string, available: boolean): void {
+    if (this.#roomAvailable.get(room) === available) return
+    this.#roomAvailable.set(room, available)
+    this.#activityRevision += 1
+  }
+
+  /** Remove every cached host snapshot published by one room. */
+  clearActivitySnapshots(room: string): void {
+    if (this.#activitySnapshots.delete(room)) this.#activityRevision += 1
+  }
+
+  /** Snapshots filtered to device ids registered for this token, within each room. */
+  activitySnapshotsForDevice(token: string, environment: ApnsEnvironment): ActivityHostSnapshot[] {
+    const snapshots: ActivityHostSnapshot[] = []
+    for (const [room, devices] of this.#rooms) {
+      const deviceIds = new Set(
+        [...devices.values()]
+          .filter((device) => device.platform === 'ios' && device.token === token && device.environment === environment)
+          .map((device) => device.deviceId),
+      )
+      if (deviceIds.size === 0) continue
+      const snapshot = this.#activitySnapshots.get(room)?.snapshot
+      if (snapshot === undefined) continue
+      const allows = (allowedDeviceIds: readonly string[] | undefined): boolean =>
+        allowedDeviceIds === undefined || allowedDeviceIds.some((deviceId) => deviceIds.has(deviceId))
+      snapshots.push({
+        ...snapshot,
+        rows: snapshot.rows.filter((row) => allows(row.allowedDeviceIds)).map((row) =>
+          this.#roomAvailable.get(room) === false ? { ...row, status: 'offline' as const } : row),
+        approvals: snapshot.approvals.filter((approval) => allows(approval.allowedDeviceIds)),
+      })
+    }
+    return snapshots
+  }
+
+  activityRevision(): number {
+    return this.#activityRevision
+  }
+
+  clearLiveActivityTokenForGroup(
+    token: string,
+    environment: ApnsEnvironment,
+    activityToken: string,
+  ): number {
+    return this.retireLiveActivityToken(token, environment, activityToken)
+  }
+
+  retireLiveActivityToken(
+    token: string,
+    environment: ApnsEnvironment,
+    activityToken: string,
+  ): number {
+    const key = activityTokenKey(token, environment)
+    let retired = this.#retiredActivityTokens.get(key)
+    if (retired === undefined) {
+      retired = new Set()
+      this.#retiredActivityTokens.set(key, retired)
+    }
+    retired.add(activityToken)
+    const observation = this.#activityTokenObservations.get(key)
+    const isCurrent = observation?.token === activityToken
+    let cleared = 0
+    for (const devices of this.#rooms.values()) {
+      for (const [deviceId, device] of devices) {
+        if (device.platform !== 'ios' || device.token !== token || device.environment !== environment) continue
+        if (isCurrent || device.liveActivityToken === activityToken) {
+          devices.set(deviceId, {
+            ...device,
+            liveActivityToken: null,
+            liveActivityTokenObservedAt: observation?.observedAt ?? device.liveActivityTokenObservedAt ?? 0,
+          })
+          cleared += 1
+        }
+      }
+    }
+    if (isCurrent && observation !== undefined) {
+      this.#activityTokenObservations.set(key, { observedAt: observation.observedAt, token: null })
+      if (cleared === 0) cleared = 1
+    }
+    return cleared
+  }
+
+  /** Registered iOS rooms sharing the same alert token and APNs environment. */
+  roomsForActivityDevice(token: string, environment: ApnsEnvironment): string[] {
+    const rooms: string[] = []
+    for (const [room, devices] of this.#rooms) {
+      if ([...devices.values()].some(
+        (device) => device.platform === 'ios' && device.token === token && device.environment === environment,
+      )) {
+        rooms.push(room)
+      }
+    }
+    return rooms
+  }
+
+  /** Matching registration records, including their authorized room. */
+  devicesForActivityToken(
+    token: string,
+    environment: ApnsEnvironment,
+  ): Array<{ readonly room: string; readonly device: PushDevice }> {
+    const matches: Array<{ room: string; device: PushDevice }> = []
+    for (const [room, devices] of this.#rooms) {
+      for (const device of devices.values()) {
+        if (device.platform === 'ios' && device.token === token && device.environment === environment) {
+          matches.push({ room, device: this.#effectiveActivityToken(device) })
+        }
+      }
+    }
+    return matches
+  }
+
+  /** Serialize async activity publishes for one physical phone and Apple. */
+  enqueueActivity<T>(
+    token: string,
+    environment: ApnsEnvironment,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const key = activityTokenKey(token, environment)
+    const previous = this.#activityQueues.get(key) ?? Promise.resolve()
+    const current = previous.catch(() => undefined).then(operation)
+    this.#activityQueues.set(key, current)
+    const clean = (): void => {
+      if (this.#activityQueues.get(key) === current) this.#activityQueues.delete(key)
+    }
+    void current.then(clean, clean)
+    return current
+  }
+
+  hasLiveActivityStartForToken(token: string, environment: ApnsEnvironment): boolean {
+    const key = activityTokenKey(token, environment)
+    const at = this.#startedAtByToken.get(key)
+    if (at === undefined) return false
+    if (Date.now() - at <= 10 * 60_000) return true
+    this.#startedAtByToken.delete(key)
+    return false
+  }
+
+  markLiveActivityStartForToken(token: string, environment: ApnsEnvironment): void {
+    const key = activityTokenKey(token, environment)
+    this.#startedAtByToken.set(key, Date.now())
+    this.#endedAtByToken.delete(key)
+  }
+
+  forgetLiveActivityStartForToken(token: string, environment: ApnsEnvironment): void {
+    this.#startedAtByToken.delete(activityTokenKey(token, environment))
+  }
+
+  forgetLiveActivityEndForToken(token: string, environment: ApnsEnvironment): void {
+    this.#endedAtByToken.delete(activityTokenKey(token, environment))
+  }
+
+  hasLiveActivityEndForToken(token: string, environment: ApnsEnvironment): boolean {
+    const key = activityTokenKey(token, environment)
+    const at = this.#endedAtByToken.get(key)
+    if (at === undefined) return false
+    if (Date.now() - at <= 10 * 60_000) return true
+    this.#endedAtByToken.delete(key)
+    return false
+  }
+
+  markLiveActivityEndForToken(token: string, environment: ApnsEnvironment): void {
+    const key = activityTokenKey(token, environment)
+    this.#endedAtByToken.set(key, Date.now())
+    this.#startedAtByToken.delete(key)
   }
 
   /**
@@ -452,10 +736,11 @@ export class PushRegistry {
     const devices = this.#rooms.get(room)
     const device = devices?.get(deviceId)
     if (devices === undefined || device === undefined) return false
-    if (device.liveActivityToken !== token) return false
-    devices.set(deviceId, { ...device, liveActivityToken: null })
-    this.forgetLiveActivityStart(room, deviceId)
-    return true
+    const environment = device.environment ?? 'production'
+    const current = this.#activityTokenObservations.get(activityTokenKey(device.token, environment))
+    const matched = device.liveActivityToken === token || current?.token === token
+    this.retireLiveActivityToken(device.token, environment, token)
+    return matched
   }
 
   /**
@@ -482,7 +767,7 @@ export class PushRegistry {
 
   /** Whether a room has any devices registered. */
   has(room: string): boolean {
-    return this.#rooms.has(room)
+    return this.#rooms.has(room) || this.#activitySnapshots.has(room)
   }
 
   /**
@@ -491,12 +776,26 @@ export class PushRegistry {
    * @returns the devices.
    */
   devices(room: string): PushDevice[] {
-    return [...(this.#rooms.get(room)?.values() ?? [])]
+    return [...(this.#rooms.get(room)?.values() ?? [])].map((device) => this.#effectiveActivityToken(device))
+  }
+
+  #effectiveActivityToken(device: PushDevice): PushDevice {
+    if (device.platform !== 'ios') return device
+    const observation = this.#activityTokenObservations.get(
+      activityTokenKey(device.token, device.environment ?? 'production'),
+    )
+    return observation === undefined
+      ? { ...device, liveActivityTokenObservedAt: device.liveActivityTokenObservedAt ?? 0 }
+      : {
+          ...device,
+          liveActivityToken: observation.token,
+          liveActivityTokenObservedAt: observation.observedAt,
+        }
   }
 
   /** How many rooms have at least one device. */
   get roomCount(): number {
-    return this.#rooms.size
+    return new Set([...this.#rooms.keys(), ...this.#activitySnapshots.keys()]).size
   }
 
   /** Total registered devices, for the health endpoint. */
@@ -720,9 +1019,72 @@ export async function deliver(
   async function deliverLiveActivityEnds(): Promise<void> {
     const apnsClient = options.apns
     if (!request.endLiveActivity || apnsClient === null) return
+    // Legacy ends clear this room's cached contribution. A v2 end is only a
+    // signal to reconcile the authoritative snapshot that was already sent;
+    // clearing here could erase a newer turn after a delayed notification.
+    if (request.snapshotVersion !== 2 && devices.some((device) => device.liveActivityVersion === 2)) {
+      options.registry.clearActivitySnapshots(room)
+    }
     await Promise.all(
       devices.map(async (device): Promise<void> => {
         if (device.platform !== 'ios') return
+        if (device.liveActivityVersion === 2) {
+          const environment = device.environment ?? 'production'
+          await options.registry.enqueueActivity(device.token, environment, async () => {
+            const registrations = options.registry.devicesForActivityToken(device.token, environment)
+            const recipient = registrations.find(({ device: registered }) => registered.liveActivityToken !== null)
+              ?? registrations[0]
+            if (recipient === undefined) return
+            const snapshots = options.registry.activitySnapshotsForDevice(device.token, environment)
+            const state = aggregateActivity(snapshots, Date.now(), options.registry.activityRevision())
+            const where = {
+              registry: options.registry,
+              room: recipient.room,
+              device: recipient.device,
+              log: options.log,
+            }
+            if (state.totalCount > 0) {
+              const token = recipient.device.liveActivityToken
+              if (token === null) return
+              const update = await sendToTheRightApple(where, (actualEnvironment) =>
+                apnsClient.sendLiveActivityUpdate({
+                  token,
+                  environment: actualEnvironment,
+                  rows: [],
+                  approvals: [],
+                  contentState: state,
+                }),
+              )
+              if (!update.delivered) {
+                options.log(`push: kept nonempty aggregate activity but update failed for ${device.deviceId}`)
+              }
+              return
+            }
+
+            const startPending = options.registry.hasLiveActivityStartForToken(device.token, environment)
+            options.registry.forgetLiveActivityStartForToken(device.token, environment)
+            if (options.registry.hasLiveActivityEndForToken(device.token, environment)) return
+            const activityToken = recipient.device.liveActivityToken
+            if (activityToken === null && !startPending && recipient.device.liveActivityStartToken === null) return
+            options.registry.markLiveActivityEndForToken(device.token, environment)
+            const result = activityToken !== null
+              ? await sendToTheRightApple(where, (actualEnvironment) =>
+                  apnsClient.sendLiveActivityEnd({ token: activityToken, environment: actualEnvironment }),
+                )
+              : await sendToTheRightApple(where, (actualEnvironment) =>
+                  apnsClient.sendSilentActivityEnd({ token: device.token, environment: actualEnvironment }),
+                )
+            if (result.unregistered && activityToken !== null) {
+              options.registry.clearLiveActivityTokenForGroup(device.token, environment, activityToken)
+            } else if (!result.delivered) {
+              // Only a delivered end or a 410 for this activity token should
+              // suppress later reconciliations. Transient failures must retry.
+              options.registry.forgetLiveActivityEndForToken(device.token, environment)
+              options.log(`push: aggregate activity end failed for ${device.deviceId} (${result.status})`)
+            }
+          })
+          return
+        }
         // The token-free wake is the only end path for a card started by
         // push-to-start whose activity token has not reached the host yet. It
         // also runs beside an activity-token end rather than instead of it:
@@ -811,6 +1173,9 @@ export interface ActivityRequest {
     readonly sessionId: string
     readonly title: string
     readonly runningSince: number
+    readonly waitingSince?: number
+    readonly status?: 'running' | 'waitingApproval' | 'waitingAnswer' | 'offline'
+    readonly allowedDeviceIds?: readonly string[]
   }[]
   /**
    * The approvals waiting on the operator, oldest first.
@@ -825,6 +1190,9 @@ export interface ActivityRequest {
     readonly sessionId: string
     readonly tool: string
     readonly detail: string
+    readonly requestedAt?: number
+    readonly requiresDetail?: boolean
+    readonly allowedDeviceIds?: readonly string[]
   }[]
   /**
    * Devices whose app is on screen, and which started a card of their own.
@@ -834,6 +1202,12 @@ export interface ActivityRequest {
    * plugin knows which phone that is.
    */
   readonly exceptDeviceIds: readonly string[]
+  /** Host snapshot metadata, present only for v2 publishers. */
+  readonly hostId?: string
+  readonly hostName?: string
+  readonly snapshotVersion?: number
+  readonly revision?: number
+  readonly sentAt?: number
 }
 
 /** How many rows a card may carry. Mirrors the app's own cap. */
@@ -841,6 +1215,8 @@ const MAX_ACTIVITY_ROWS = 2
 
 /** How many approvals a card may carry. One is ordinary; two is a batch. */
 const MAX_ACTIVITY_APPROVALS = 2
+const MAX_V2_ACTIVITY_ITEMS = 32
+const MAX_ACTIVITY_ID_LENGTH = 200
 
 /**
  * Narrow an activity body.
@@ -858,39 +1234,88 @@ export function readActivity(value: unknown): ActivityRequest | null {
   const record = value as Record<string, unknown>
   const phase = record['phase']
   if (phase !== 'start' && phase !== 'update') return null
+  const isV2 = ['hostId', 'hostName', 'snapshotVersion', 'sentAt'].some((key) => key in record)
+  let hostId: string | undefined
+  let hostName: string | undefined
+  let snapshotVersion: number | undefined
+  let sentAt: number | undefined
+  if (isV2) {
+    const rawHostId = record['hostId']
+    const rawHostName = record['hostName']
+    const rawVersion = record['snapshotVersion']
+    const rawSentAt = record['sentAt']
+    if (typeof rawHostId !== 'string' || rawHostId === '' || rawHostId.length > MAX_ACTIVITY_ID_LENGTH) return null
+    if (typeof rawHostName !== 'string') return null
+    if (rawVersion !== 2) return null
+    if (typeof rawSentAt !== 'number' || !Number.isFinite(rawSentAt) || rawSentAt <= 0) return null
+    const rawRevision = record['revision']
+    if (rawRevision !== undefined &&
+      (!Number.isSafeInteger(rawRevision) || (rawRevision as number) < 0)) return null
+    hostId = rawHostId
+    hostName = activityDisplay(rawHostName, 140)
+    snapshotVersion = rawVersion as number
+    sentAt = rawSentAt
+  }
   const raw = record['rows']
   if (!Array.isArray(raw)) return null
   const rows: {
     sessionId: string
     title: string
     runningSince: number
+    waitingSince?: number
+    status?: 'running' | 'waitingApproval' | 'waitingAnswer' | 'offline'
+    allowedDeviceIds?: readonly string[]
   }[] = []
   for (const entry of raw) {
-    if (rows.length >= MAX_ACTIVITY_ROWS) break
+    if (rows.length >= (isV2 ? MAX_V2_ACTIVITY_ITEMS : MAX_ACTIVITY_ROWS)) break
     if (typeof entry !== 'object' || entry === null) return null
     const row = entry as Record<string, unknown>
     const sessionId = row['sessionId']
     const runningSince = row['runningSince']
+    const waitingSince = row['waitingSince']
     if (typeof sessionId !== 'string' || sessionId === '') return null
+    if (isV2 && sessionId.length > MAX_ACTIVITY_ID_LENGTH) return null
     if (typeof runningSince !== 'number' || !Number.isFinite(runningSince) || runningSince <= 0) {
       return null
     }
+    if (waitingSince !== undefined &&
+      (typeof waitingSince !== 'number' || !Number.isFinite(waitingSince) || waitingSince <= 0)) return null
+    const status = row['status']
+    if (
+      isV2 && status !== undefined &&
+      status !== 'running' && status !== 'waitingApproval' && status !== 'waitingAnswer' && status !== 'offline'
+    ) return null
+    const allowedDeviceIds = isV2 ? readAllowedDeviceIds(row['allowedDeviceIds']) : undefined
+    if (allowedDeviceIds === null) return null
     rows.push({
-      sessionId: sessionId.slice(0, 200),
-      title: typeof row['title'] === 'string' ? row['title'].slice(0, 140) : '',
+      sessionId: isV2 ? sessionId : sessionId.slice(0, MAX_ACTIVITY_ID_LENGTH),
+      title: typeof row['title'] === 'string'
+        ? (isV2 ? activityDisplay(row['title'], 140) : row['title'].slice(0, 140))
+        : '',
       runningSince,
+      ...(waitingSince === undefined ? {} : { waitingSince }),
+      ...(status === undefined ? {} : { status: status as NonNullable<(typeof rows)[number]['status']> }),
+      ...(allowedDeviceIds === undefined ? {} : { allowedDeviceIds }),
     })
   }
-  const approvals = readApprovals(record['approvals'])
+  const approvals = readApprovals(record['approvals'], isV2)
+  if (approvals === null) return null
   // A card with nothing on it is not an update, it is an end -- and that has its
   // own request. Rows alone are the ordinary case; approvals alone happen when a
   // turn is blocked but its engine does not call that "running".
-  if (rows.length === 0 && approvals.length === 0) return null
+  if (!isV2 && rows.length === 0 && approvals.length === 0) return null
   return {
     phase,
     rows,
     approvals,
     exceptDeviceIds: readExceptDeviceIds(record['exceptDeviceIds']),
+    ...(isV2 ? {
+      hostId,
+      hostName,
+      snapshotVersion,
+      sentAt,
+      ...(typeof record['revision'] === 'number' ? { revision: record['revision'] } : {}),
+    } : {}),
   }
 }
 
@@ -906,26 +1331,52 @@ export function readActivity(value: unknown): ActivityRequest | null {
  * @param value - the `approvals` field, or anything else.
  * @returns the approvals, at most {@link MAX_ACTIVITY_APPROVALS}.
  */
-function readApprovals(value: unknown): ActivityRequest['approvals'] {
+function readApprovals(value: unknown, isV2 = false): ActivityRequest['approvals'] | null {
   if (value === undefined || value === null) return []
-  if (!Array.isArray(value)) return []
+  if (!Array.isArray(value)) return isV2 ? null : []
   const approvals: {
     requestId: string
     sessionId: string
     tool: string
     detail: string
+    allowedDeviceIds?: readonly string[]
   }[] = []
   for (const entry of value) {
-    if (approvals.length >= MAX_ACTIVITY_APPROVALS) break
-    if (typeof entry !== 'object' || entry === null) continue
+    if (approvals.length >= (isV2 ? MAX_V2_ACTIVITY_ITEMS : MAX_ACTIVITY_APPROVALS)) break
+    if (typeof entry !== 'object' || entry === null) {
+      if (isV2) return null
+      continue
+    }
     const approval = entry as Record<string, unknown>
     const requestId = approval['requestId']
-    if (typeof requestId !== 'string' || requestId === '') continue
+    if (typeof requestId !== 'string' || requestId === '') {
+      if (isV2) return null
+      continue
+    }
+    const sessionId = approval['sessionId']
+    if (isV2 && (
+      requestId.length > MAX_ACTIVITY_ID_LENGTH ||
+      typeof sessionId !== 'string' || sessionId === '' || sessionId.length > MAX_ACTIVITY_ID_LENGTH
+    )) return null
+    const requestedAt = approval['requestedAt']
+    if (isV2 && requestedAt !== undefined &&
+      (typeof requestedAt !== 'number' || !Number.isFinite(requestedAt) || requestedAt <= 0)) return null
+    const allowedDeviceIds = isV2 ? readAllowedDeviceIds(approval['allowedDeviceIds']) : undefined
+    if (allowedDeviceIds === null) return null
     approvals.push({
-      requestId: requestId.slice(0, 200),
-      sessionId: typeof approval['sessionId'] === 'string' ? approval['sessionId'].slice(0, 200) : '',
-      tool: typeof approval['tool'] === 'string' ? approval['tool'].slice(0, 120) : '',
-      detail: typeof approval['detail'] === 'string' ? approval['detail'].slice(0, 400) : '',
+      requestId: isV2 ? requestId : requestId.slice(0, MAX_ACTIVITY_ID_LENGTH),
+      sessionId: typeof sessionId === 'string'
+        ? (isV2 ? sessionId : sessionId.slice(0, MAX_ACTIVITY_ID_LENGTH))
+        : '',
+      tool: typeof approval['tool'] === 'string'
+        ? (isV2 ? approval['tool'] : approval['tool'].slice(0, 120))
+        : '',
+      detail: typeof approval['detail'] === 'string'
+        ? (isV2 ? approval['detail'] : approval['detail'].slice(0, 400))
+        : '',
+      ...(typeof requestedAt === 'number' ? { requestedAt } : {}),
+      ...(approval['requiresDetail'] === true ? { requiresDetail: true } : {}),
+      ...(allowedDeviceIds === undefined ? {} : { allowedDeviceIds }),
     })
   }
   return approvals
@@ -946,13 +1397,10 @@ function readApprovals(value: unknown): ActivityRequest['approvals'] {
  * and the relay must stop addressing a token Apple has retired rather than pay a
  * round trip every session.
  *
- * **A card started here cannot be ended here.** Ending an activity addresses its
- * own token, and that token is only ever learned by the app -- which is not
- * running when the card is created. So the end half of the contract still covers
- * only cards the app started itself; a card this function created comes down
- * when the app next runs (its own refresh ends it) or when the system's lifetime
- * limit is reached. That is a property of ActivityKit's model, not a missing
- * branch: there is no token the relay could have held instead.
+ * A push-to-start token does not reveal the resulting activity token. Once the
+ * app reports that activity token, ends address the card directly. Until then,
+ * the relay can ask the app to end it with a silent wake to the install's alert
+ * token; the start token itself is never an end token.
  *
  * @param options - the registry and the APNs client.
  * @param room - the room the credential derives.
@@ -970,6 +1418,27 @@ export async function deliverActivity(
 ): Promise<PushOutcome> {
   const enabled = options.apns !== null
   const apns = options.apns
+  if (
+    request.hostId !== undefined &&
+    request.hostName !== undefined &&
+    request.snapshotVersion !== undefined &&
+    request.sentAt !== undefined
+  ) {
+    options.registry.setActivitySnapshot(
+      room,
+      {
+        hostId: request.hostId,
+        hostName: request.hostName,
+        // readActivity already bounds v2 snapshots to MAX_V2_ACTIVITY_ITEMS.
+        // Keep the complete validated host snapshot for later aggregation;
+        // legacy APNs payloads remain independently limited to two below.
+        rows: request.rows,
+        approvals: request.approvals,
+      },
+      request.revision,
+      request.sentAt,
+    )
+  }
   const devices = options.registry.devices(room)
   if (apns === null || devices.length === 0) {
     return { sent: 0, failed: 0, dropped: 0, enabled }
@@ -983,6 +1452,16 @@ export async function deliverActivity(
       // Android has no Live Activity, and a phone whose app is looking at the
       // app is drawing a card from its own state.
       if (device.platform !== 'ios' || excluded.has(device.deviceId)) return
+      const groupHasV2 = options.registry
+        .devicesForActivityToken(device.token, device.environment ?? 'production')
+        .some(({ device: member }) => member.liveActivityVersion === 2)
+      if (device.liveActivityVersion === 2 || groupHasV2) {
+        const result = await deliverAggregatedActivity({ ...options, apns }, room, device, request)
+        tally.sent += result.sent
+        tally.failed += result.failed
+        tally.dropped += result.dropped
+        return
+      }
       const where = { registry: options.registry, room, device, log: options.log }
 
       // A reported card is where this event goes, whatever its age. "Is there a
@@ -996,8 +1475,8 @@ export async function deliverActivity(
           apns.sendLiveActivityUpdate({
             token: reported,
             environment,
-            rows: request.rows,
-            approvals: request.approvals,
+            rows: request.rows.slice(0, 2),
+            approvals: request.approvals.slice(0, 2),
           }),
         )
         if (result.delivered) {
@@ -1045,8 +1524,8 @@ export async function deliverActivity(
         apns.sendLiveActivityStart({
           token: startToken,
           environment,
-          rows: request.rows,
-          approvals: request.approvals,
+          rows: request.rows.slice(0, 2),
+          approvals: request.approvals.slice(0, 2),
           alert: {
             title: 'DSH-Mizar',
             body: request.rows[0]?.title ?? '',
@@ -1078,4 +1557,146 @@ export async function deliverActivity(
   )
 
   return { ...tally, enabled }
+}
+
+/** Publish the current authorized multi-room state to one v2 phone. */
+async function deliverAggregatedActivity(
+  options: {
+    readonly registry: PushRegistry
+    readonly apns: ApnsClient
+    readonly log: (message: string) => void
+  },
+  room: string,
+  device: PushDevice,
+  request: ActivityRequest,
+): Promise<{ readonly sent: number; readonly failed: number; readonly dropped: number }> {
+  const environment = device.environment ?? 'production'
+  return await options.registry.enqueueActivity(device.token, environment, async () => {
+    const registrations = options.registry.devicesForActivityToken(device.token, environment)
+    const recipient = [...registrations].sort((a, b) => {
+      const tokenDifference = Number(b.device.liveActivityToken !== null) - Number(a.device.liveActivityToken !== null)
+      return tokenDifference || b.device.registeredAt - a.device.registeredAt
+    })[0]
+    if (recipient === undefined) return { sent: 0, failed: 0, dropped: 0 }
+
+    const snapshots = options.registry.activitySnapshotsForDevice(device.token, environment)
+    if (snapshots.length === 0) return { sent: 0, failed: 0, dropped: 0 }
+    const contentState: AggregatedActivityContentState = aggregateActivity(
+      snapshots,
+      Date.now(),
+      options.registry.activityRevision(),
+    )
+    const where = {
+      registry: options.registry,
+      room: recipient.room,
+      device: recipient.device,
+      log: options.log,
+    }
+    const activityToken = recipient.device.liveActivityToken
+    if (contentState.totalCount === 0) {
+      const startWasPending = options.registry.hasLiveActivityStartForToken(device.token, environment)
+      options.registry.forgetLiveActivityStartForToken(device.token, environment)
+      if (options.registry.hasLiveActivityEndForToken(device.token, environment)) {
+        return { sent: 0, failed: 0, dropped: 0 }
+      }
+      if (activityToken === null && !startWasPending && recipient.device.liveActivityStartToken === null) {
+        return { sent: 0, failed: 0, dropped: 0 }
+      }
+      options.registry.markLiveActivityEndForToken(device.token, environment)
+      const result = activityToken !== null
+        ? await sendToTheRightApple(where, (actualEnvironment) =>
+            options.apns.sendLiveActivityEnd({ token: activityToken, environment: actualEnvironment }),
+          )
+        : await sendToTheRightApple(where, (actualEnvironment) =>
+            options.apns.sendSilentActivityEnd({ token: device.token, environment: actualEnvironment }),
+          )
+      if (result.delivered) return { sent: 1, failed: 0, dropped: 0 }
+      if (result.unregistered && activityToken !== null) {
+        options.registry.clearLiveActivityTokenForGroup(device.token, environment, activityToken)
+        return { sent: 0, failed: 0, dropped: 1 }
+      }
+      options.registry.forgetLiveActivityEndForToken(device.token, environment)
+      options.log(
+        `push: empty aggregate live-activity end for ${device.deviceId} failed (${result.status} ${result.reason ?? 'no reason'})`,
+      )
+      return { sent: 0, failed: 1, dropped: 0 }
+    }
+
+    if (activityToken !== null) {
+      const result = await sendToTheRightApple(where, (actualEnvironment) =>
+        options.apns.sendLiveActivityUpdate({
+          token: activityToken,
+          environment: actualEnvironment,
+          rows: request.rows,
+          approvals: request.approvals,
+          contentState,
+        }),
+      )
+      if (result.delivered) return { sent: 1, failed: 0, dropped: 0 }
+      if (!result.unregistered) {
+        options.log(
+          `push: aggregate live-activity update for ${recipient.device.deviceId} failed (${result.status} ${result.reason ?? 'no reason'})`,
+        )
+        return { sent: 0, failed: 1, dropped: 0 }
+      }
+      options.registry.clearLiveActivityTokenForGroup(device.token, environment, activityToken)
+      options.log(
+        `push: retired aggregate live-activity token for ${recipient.device.deviceId} (${result.status} ${result.reason ?? ''})`.trim(),
+      )
+      if (request.phase !== 'start') return { sent: 0, failed: 0, dropped: 1 }
+    } else if (request.phase !== 'start') {
+      return { sent: 0, failed: 0, dropped: 0 }
+    }
+
+    if (options.registry.hasLiveActivityStartForToken(device.token, environment)) {
+      options.log(`push: suppressed duplicate aggregate live-activity start for ${device.deviceId}`)
+      return { sent: 1, failed: 0, dropped: 0 }
+    }
+    const startRegistration = registrations.find(({ device: registered }) => registered.liveActivityStartToken !== null)
+    if (startRegistration === undefined) return { sent: 0, failed: 0, dropped: 0 }
+    const startToken = startRegistration?.device.liveActivityStartToken
+    if (startToken === undefined || startToken === null) return { sent: 0, failed: 0, dropped: 0 }
+    const startWhere = {
+      registry: options.registry,
+      room: startRegistration.room,
+      device: startRegistration.device,
+      log: options.log,
+    }
+    const result = await sendToTheRightApple(startWhere, (actualEnvironment) =>
+      options.apns.sendLiveActivityStart({
+        token: startToken,
+        environment: actualEnvironment,
+        rows: request.rows,
+        approvals: request.approvals,
+        contentState,
+        alert: { title: 'DSH-Mizar', body: contentState.rows[0]?.title ?? '' },
+      }),
+    )
+    if (result.delivered) {
+      options.registry.markLiveActivityStartForToken(device.token, environment)
+      return { sent: 1, failed: 0, dropped: 0 }
+    }
+    if (result.unregistered) {
+      options.registry.clearLiveActivityStartToken(startRegistration.room, startRegistration.device.deviceId, startToken)
+      options.log(
+        `push: retired aggregate live-activity start token for ${device.deviceId} (${result.status} ${result.reason ?? ''})`.trim(),
+      )
+      return { sent: 0, failed: 0, dropped: 1 }
+    }
+    options.log(
+      `push: aggregate live-activity start for ${device.deviceId} failed (${result.status} ${result.reason ?? 'no reason'})`,
+    )
+    return { sent: 0, failed: 1, dropped: 0 }
+  })
+}
+
+/** Repaint a known card when its source tunnel becomes unavailable. */
+export async function deliverActivityPresence(
+  options: { readonly registry: PushRegistry; readonly apns: ApnsClient | null; readonly log: (message: string) => void },
+  room: string,
+): Promise<void> {
+  if (options.apns === null) return
+  const request: ActivityRequest = { phase: 'update', rows: [], approvals: [], exceptDeviceIds: [] }
+  await Promise.all(options.registry.devices(room).filter((device) => device.platform === 'ios' && device.liveActivityVersion === 2)
+    .map((device) => deliverAggregatedActivity(options as { registry: PushRegistry; apns: ApnsClient; log: (message: string) => void }, room, device, request)))
 }

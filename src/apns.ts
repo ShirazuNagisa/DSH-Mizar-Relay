@@ -34,6 +34,7 @@
  */
 import { connect, constants, type ClientHttp2Session } from 'node:http2'
 import { createPrivateKey, sign, type KeyObject } from 'node:crypto'
+import type { AggregatedActivityContentState } from './activity-aggregate.js'
 
 /** Which APNs a token belongs to. The two do not accept each other's tokens. */
 export type ApnsEnvironment = 'sandbox' | 'production'
@@ -151,6 +152,8 @@ export interface ApnsActivityRow {
   readonly title: string
   /** When the work this row counts began, in epoch milliseconds. */
   readonly runningSince: number
+  /** When the row began waiting, in epoch milliseconds, if known. */
+  readonly waitingSince?: number
 }
 
 /**
@@ -192,6 +195,8 @@ export interface ApnsLiveActivityStart {
   readonly rows: readonly ApnsActivityRow[]
   /** The approvals waiting on the operator. */
   readonly approvals?: readonly ApnsActivityApproval[]
+  /** A pre-aggregated content state for multi-host devices. */
+  readonly contentState?: AggregatedActivityContentState
   /** The banner that accompanies the start. */
   readonly alert: { readonly title: string; readonly body: string }
 }
@@ -204,6 +209,8 @@ export interface ApnsLiveActivityUpdate {
   readonly rows: readonly ApnsActivityRow[]
   /** The approvals waiting on the operator. */
   readonly approvals?: readonly ApnsActivityApproval[]
+  /** A pre-aggregated content state for multi-host devices. */
+  readonly contentState?: AggregatedActivityContentState
 }
 
 /** How long a signed JWT is reused before it is minted again. */
@@ -409,7 +416,7 @@ export function buildLiveActivityContentState(
   now: number,
   approvals: readonly ApnsActivityApproval[] = [],
 ): Record<string, unknown> {
-  return {
+  const state = {
     rows: rows.map((row) => ({
       id: row.sessionId,
       // The title is what the card says; the instruction is deliberately not
@@ -419,6 +426,9 @@ export function buildLiveActivityContentState(
       title: row.title,
       elapsed: Math.max(0, (now - row.runningSince) / 1000),
       countingSince: row.runningSince / 1000 - SWIFT_REFERENCE_EPOCH,
+      ...(row.waitingSince === undefined
+        ? {}
+        : { waitingSince: row.waitingSince / 1000 - SWIFT_REFERENCE_EPOCH }),
     })),
     // Always present, even when empty: a card whose state has no approvals is a
     // card with nothing to answer, and a missing key would be a decode failure in
@@ -430,6 +440,16 @@ export function buildLiveActivityContentState(
       detail: approval.detail,
     })),
   }
+  // Old clients cannot signal that a clipped command needs full review. Omit
+  // an oversized approval rather than handing them a partial actionable one.
+  while (Buffer.byteLength(JSON.stringify(state), 'utf8') > 3500 && state.approvals.length > 0) {
+    state.approvals.pop()
+  }
+  while (Buffer.byteLength(JSON.stringify(state), 'utf8') > 3500 && state.rows.length > 1) {
+    state.rows.pop()
+  }
+  return state
+
 }
 
 /**
@@ -451,6 +471,18 @@ export function buildLiveActivityContentState(
  * @param now - the current time, in epoch milliseconds.
  * @returns the payload object, ready to serialize.
  */
+function activityAlertText(value: string, maxBytes: number): string {
+  let result = ''
+  let bytes = 0
+  for (const point of value) {
+    const width = Buffer.byteLength(point, 'utf8')
+    if (bytes + width > maxBytes) break
+    result += point
+    bytes += width
+  }
+  return result
+}
+
 export function buildLiveActivityStartPayload(
   start: ApnsLiveActivityStart,
   now: number,
@@ -461,8 +493,8 @@ export function buildLiveActivityStartPayload(
       event: 'start',
       'attributes-type': 'DSHMizarActivityAttributes',
       attributes: {},
-      'content-state': buildLiveActivityContentState(start.rows, now, start.approvals ?? []),
-      alert: { title: start.alert.title, body: start.alert.body },
+      'content-state': start.contentState ?? buildLiveActivityContentState(start.rows, now, start.approvals ?? []),
+      alert: { title: activityAlertText(start.alert.title, 64), body: activityAlertText(start.alert.body, 128) },
     },
   }
 }
@@ -485,7 +517,7 @@ export function buildLiveActivityUpdatePayload(
     aps: {
       timestamp: Math.floor(now / 1000),
       event: 'update',
-      'content-state': buildLiveActivityContentState(update.rows, now, update.approvals ?? []),
+      'content-state': update.contentState ?? buildLiveActivityContentState(update.rows, now, update.approvals ?? []),
     },
   }
 }
@@ -778,6 +810,9 @@ export class ApnsClient {
     payload: string,
     headers: (freshToken: boolean) => Record<string, string | number>,
   ): Promise<ApnsResult> {
+    if (Buffer.byteLength(payload, 'utf8') > MAX_PAYLOAD_BYTES) {
+      return { delivered: false, unregistered: false, status: 413, reason: 'PayloadTooLarge' }
+    }
     let result: ApnsResult = { delivered: false, unregistered: false, status: 0, reason: 'TransportError' }
     for (let attempt = 0; attempt < 3; attempt += 1) {
       result = await this.#deliver(target, payload, headers)

@@ -161,7 +161,20 @@ export class PaidGate {
     this.#allowUnaccounted = options.allowUnaccounted
     this.#allowFreeAccounts = options.allowFreeAccounts ?? false
     this.#cacheTtlMs = Math.max(0, options.cacheTtlMs)
-    this.#now = options.now ?? Date.now
+    // Entitlement timestamps are stamped by the store's clock, so the gate has
+    // to judge them with that same clock. Defaulting to `Date.now` here splits
+    // the two time domains whenever a clock is injected (tests, simulations,
+    // a host whose wall clock moved): a live grant is then compared against an
+    // unrelated "now" and can look expired, which throws away every cache hit
+    // and sends the gate back to the store on each request. The store's clock
+    // is `Date.now` unless one was injected, so production is unchanged. A
+    // hand-built store in a unit test need not expose the clock; fall back.
+    this.#now =
+      options.now ??
+      (() => {
+        const storeNow = options.store.currentTime
+        return Number.isFinite(storeNow) ? storeNow : Date.now()
+      })
     this.#log = options.log ?? (() => undefined)
     this.#maxCacheEntries = Math.max(1, options.maxCacheEntries ?? 20_000)
     // Registered here rather than by the caller: a gate that is built without

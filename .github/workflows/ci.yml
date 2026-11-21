@@ -35,12 +35,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - run: npm ci
       - run: npm run typecheck
-      # The APNs tests each start a local HTTP/2 server and budget 5 s. On a
-      # two-core runner, 29 files in parallel starved them into timeouts that
-      # never reproduce on a workstation. Serial files keep the suite honest.
-      - run: npm test -- --no-file-parallelism
+      - run: npm test
